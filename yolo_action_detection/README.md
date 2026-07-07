@@ -1,27 +1,26 @@
 # YOLO OBB 动作检测程序
 
-## 功能
+这是主程序目录。完整项目介绍请查看仓库根目录 README。
 
-- 使用 ONNX YOLO OBB 模型直接识别动作类别。
-- 按配置的 1号 到 5号 类别顺序进行 PASS/NG 判定。
-- 错序 NG 时播放 FAIL 声音，并可保存证据图片。
-- 整轮 PASS 时播放 PASS 声音。
-- 主界面显示产能、OK、NG、良率。
-- 配置页支持生产统计归零并保存记录。
-- 支持源码运行和 PyInstaller 便携打包。
-
-## 源码启动
+## 启动
 
     cd yolo_action_detection
     ..\.venv\Scripts\python.exe src\main.py
 
-## 便携打包
+## 打包
 
     cd yolo_action_detection
     .\packaging\build_yolo.bat
 
-打包输出目录：
+## 关键目录
 
-    yolo_action_detection/dist/YOLOActionDetection
-
-目标电脑需要相机驱动。复制打包目录后可双击 YOLOActionDetection.exe 或 start.bat 启动。
+| 路径 | 说明 |
+| --- | --- |
+| src/ui | PySide6 主界面和配置页 |
+| src/yolo_runtime | ONNX OBB 推理 |
+| src/step_sequence | 动作顺序状态机 |
+| src/camera | 相机采集与 SDK 封装 |
+| src/detection_logging | 声音、证据和生产统计记录 |
+| config | 模型和配置 |
+| assets | 声音与 README 截图 |
+| packaging | 打包脚本 |

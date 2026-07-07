@@ -35,6 +35,7 @@ yolo_action_detection/outputs/
 *.avi
 !docs/**/*.png
 !docs/**/*.jpg
+!yolo_action_detection/assets/screenshots/*.png
 
 # Data and datasets
 data/
