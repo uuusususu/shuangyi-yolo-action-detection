@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Temporary images and media
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.mp4
+*.avi
+!docs/**/*.png
+!docs/**/*.jpg
+!opencv/Pass.wav
+
+# Data and datasets
+data/
+datasets/
+
+# Agent and tool directories
+.agent/
+.dotnet/
+.superpowers/
+graphify-out/
+
+# YOLO action detection (not on this branch)
+yolo_action_detection/
+
+# Preview/temp files
+*.html
+*.css
+*.js
+!docs/**/*.html
+
+# PyInstaller output
+*.spec.bak
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# YOLO action detection runtime config
+yolo_action_detection/config/config.json

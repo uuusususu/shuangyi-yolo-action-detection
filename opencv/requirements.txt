@@ -1,0 +1,24 @@
+# 手部动作识别桌面应用依赖
+
+# UI 框架
+PySide6==6.10.1
+
+# 视频采集
+opencv-python==4.11.0.86
+opencv-contrib-python==4.11.0.86
+
+# 手势识别 (Google MediaPipe task)
+mediapipe==0.10.14
+numpy==1.26.4
+protobuf==4.25.9
+jax==0.4.34
+jaxlib==0.4.34
+scipy==1.17.1
+cffi==1.17.1
+
+# 测试框架
+pytest>=7.0.0
+hypothesis>=6.0.0
+
+# 打包工具
+pyinstaller>=6.0.0
