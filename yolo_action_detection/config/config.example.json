@@ -1,0 +1,30 @@
+{
+  "model_task": "ultralytics_obb",
+  "yolo_model_path": "../models/best.pt",
+  "yolo_conf_threshold": 0.7,
+  "yolo_iou_threshold": 0.5,
+  "ultralytics_device": "",
+  "ultralytics_half": false,
+  "ultralytics_tracker": "bytetrack.yaml",
+  "ultralytics_max_det": 300,
+  "ultralytics_track_persist": true,
+  "category_names": [
+    "1号",
+    "2号",
+    "3号",
+    "4号",
+    "5号",
+    ""
+  ],
+  "camera_index": 0,
+  "mvsdk_friendly_name": "",
+  "action_pass_stable_frames": 1,
+  "action_ng_stable_frames": 2,
+  "action_order_constraint_enabled": true,
+  "round_cooldown_seconds": 2.0,
+  "today_target_capacity": 300,
+  "show_confidence_overlay": true,
+  "show_track_id_overlay": true,
+  "sound_feedback_enabled": true,
+  "fail_evidence_enabled": true
+}

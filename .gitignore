@@ -1,0 +1,89 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+yolo_action_detection/logs/coordinate_sessions/
+yolo_action_detection/outputs/
+
+# Temporary images and media
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.mp4
+*.avi
+!docs/**/*.png
+!docs/**/*.jpg
+
+# Data and datasets
+data/
+datasets/
+
+# Agent and tool directories
+.agent/
+.dotnet/
+.superpowers/
+graphify-out/
+
+# Google/MediaPipe legacy (not on this branch)
+opencv/
+python_demo/
+
+# Legacy files (not on this branch)
+progress.md
+task_plan.md
+findings.md
+config.json
+chatou.ndjson
+test-small.txt
+torch_importtime.txt
+ultralytics_importtime.txt
+pencil-new.pen
+.graphify_detect.json
+
+# Models (kept in yolo_action_detection/config/)
+models/
+
+# Third-party source
+mediapipe-master/
+mediapipe-samples-main/
+mediapipe_object_detection_test/
+mediapipe_quick_task/
+mediapipe_runtime_test/
+
+# Preview/temp files
+*.html
+*.css
+*.js
+!docs/**/*.html
+
+# PyInstaller output
+*.spec.bak
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# YOLO runtime config (not example)
+yolo_action_detection/config/config.json
