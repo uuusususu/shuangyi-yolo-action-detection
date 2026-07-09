@@ -36,6 +36,7 @@ yolo_action_detection/outputs/
 !docs/**/*.png
 !docs/**/*.jpg
 !yolo_action_detection/assets/screenshots/*.png
+!yolo_action_detection/assets/demo/*.mp4
 
 # Data and datasets
 data/
