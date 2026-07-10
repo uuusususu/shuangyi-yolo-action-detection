@@ -96,6 +96,13 @@ class ConfigPage(QWidget):
         operator_layout.setVerticalSpacing(10)
 
         row = 0
+        operator_layout.addWidget(self._section_label("检查模式"), row, 0, 1, 3)
+        row += 1
+        self._pcb_enabled_cb = QCheckBox("启用 PCB 多板元器件检查模式（不勾选则使用动作顺序模式）")
+        self._pcb_enabled_cb.stateChanged.connect(self._on_mode_changed)
+        operator_layout.addWidget(self._pcb_enabled_cb, row, 0, 1, 3)
+
+        row += 1
         operator_layout.addWidget(self._section_label("模型与阈值"), row, 0, 1, 3)
         row += 1
         operator_layout.addWidget(self._label("YOLO 模型路径:"), row, 0)
@@ -201,6 +208,57 @@ class ConfigPage(QWidget):
 
         layout.addWidget(self._operator_group)
 
+        # PCB 元器件类别配置（仅 PCB 模式显示）
+        self._pcb_group = QGroupBox("PCB 元器件类别")
+        self._pcb_group.setStyleSheet(group_box_style())
+        pcb_layout = QGridLayout(self._pcb_group)
+        pcb_layout.setContentsMargins(14, 18, 14, 14)
+        pcb_layout.setHorizontalSpacing(12)
+        pcb_layout.setVerticalSpacing(10)
+
+        prow = 0
+        pcb_layout.addWidget(self._label("PCB 类别:"), prow, 0)
+        self._pcb_class_input = QLineEdit()
+        self._pcb_class_input.setPlaceholderText("如 pcb")
+        pcb_layout.addWidget(self._pcb_class_input, prow, 1)
+
+        self._pcb_component_inputs = []
+        for i in range(4):
+            prow += 1
+            pcb_layout.addWidget(self._label(f"元器件 {i+1} 类别:"), prow, 0)
+            inp = QLineEdit()
+            inp.setPlaceholderText("如 R1")
+            pcb_layout.addWidget(inp, prow, 1)
+            self._pcb_component_inputs.append(inp)
+
+        prow += 1
+        pcb_layout.addWidget(self._label("FAIL 连续帧:"), prow, 0)
+        self._pcb_fail_frames_input = QSpinBox()
+        self._pcb_fail_frames_input.setRange(1, 30)
+        self._pcb_fail_frames_input.setValue(3)
+        self._pcb_fail_frames_input.setFixedWidth(100)
+        pcb_layout.addWidget(self._pcb_fail_frames_input, prow, 1)
+
+        prow += 1
+        pcb_layout.addWidget(self._label("轮次间隔(秒):"), prow, 0)
+        self._pcb_interval_input = QDoubleSpinBox()
+        self._pcb_interval_input.setRange(0.0, 60.0)
+        self._pcb_interval_input.setSingleStep(0.5)
+        self._pcb_interval_input.setFixedWidth(100)
+        pcb_layout.addWidget(self._pcb_interval_input, prow, 1)
+
+        prow += 1
+        pcb_layout.addWidget(self._label("归属容差:"), prow, 0)
+        self._pcb_margin_input = QDoubleSpinBox()
+        self._pcb_margin_input.setRange(0.0, 1.0)
+        self._pcb_margin_input.setSingleStep(0.05)
+        self._pcb_margin_input.setValue(0.15)
+        self._pcb_margin_input.setFixedWidth(100)
+        pcb_layout.addWidget(self._pcb_margin_input, prow, 1)
+
+        self._pcb_group.setVisible(False)
+        layout.addWidget(self._pcb_group)
+
         self._advanced_toggle = QPushButton("▶ 展开高级配置")
         self._advanced_toggle.setStyleSheet(
             f"QPushButton {{ background: transparent; border: none; color: {TEXT_ACCENT}; "
@@ -274,53 +332,6 @@ class ConfigPage(QWidget):
         self._show_tid_cb = QCheckBox("显示 Track ID")
         advanced_layout.addWidget(self._show_tid_cb, row, 1)
 
-        row += 1
-        advanced_layout.addWidget(self._section_label("PCB 多板元器件检查"), row, 0, 1, 3)
-
-        row += 1
-        self._pcb_enabled_cb = QCheckBox("启用 PCB 检查模式")
-        advanced_layout.addWidget(self._pcb_enabled_cb, row, 0, 1, 2)
-
-        row += 1
-        advanced_layout.addWidget(self._label("PCB 类别:"), row, 0)
-        self._pcb_class_input = QLineEdit()
-        self._pcb_class_input.setPlaceholderText("如 pcb")
-        advanced_layout.addWidget(self._pcb_class_input, row, 1)
-
-        self._pcb_component_inputs = []
-        for i in range(4):
-            row += 1
-            advanced_layout.addWidget(self._label(f"元器件 {i+1} 类别:"), row, 0)
-            inp = QLineEdit()
-            inp.setPlaceholderText("如 R1")
-            advanced_layout.addWidget(inp, row, 1)
-            self._pcb_component_inputs.append(inp)
-
-        row += 1
-        advanced_layout.addWidget(self._label("FAIL 连续帧:"), row, 0)
-        self._pcb_fail_frames_input = QSpinBox()
-        self._pcb_fail_frames_input.setRange(1, 30)
-        self._pcb_fail_frames_input.setValue(3)
-        self._pcb_fail_frames_input.setFixedWidth(100)
-        advanced_layout.addWidget(self._pcb_fail_frames_input, row, 1)
-
-        row += 1
-        advanced_layout.addWidget(self._label("轮次间隔(秒):"), row, 0)
-        self._pcb_interval_input = QDoubleSpinBox()
-        self._pcb_interval_input.setRange(0.0, 60.0)
-        self._pcb_interval_input.setSingleStep(0.5)
-        self._pcb_interval_input.setFixedWidth(100)
-        advanced_layout.addWidget(self._pcb_interval_input, row, 1)
-
-        row += 1
-        advanced_layout.addWidget(self._label("归属容差:"), row, 0)
-        self._pcb_margin_input = QDoubleSpinBox()
-        self._pcb_margin_input.setRange(0.0, 1.0)
-        self._pcb_margin_input.setSingleStep(0.05)
-        self._pcb_margin_input.setValue(0.15)
-        self._pcb_margin_input.setFixedWidth(100)
-        advanced_layout.addWidget(self._pcb_margin_input, row, 1)
-
         self._advanced_group.setVisible(False)
         layout.addWidget(self._advanced_group)
 
@@ -363,6 +374,27 @@ class ConfigPage(QWidget):
         visible = not self._advanced_group.isVisible()
         self._advanced_group.setVisible(visible)
         self._advanced_toggle.setText("▼ 收起高级配置" if visible else "▶ 展开高级配置")
+
+    def _on_mode_changed(self) -> None:
+        """PCB 模式开关切换：显示对应类别配置，隐藏另一个。"""
+        pcb_mode = self._pcb_enabled_cb.isChecked()
+        self._pcb_group.setVisible(pcb_mode)
+        # 动作类别序列区域在 operator_group 内，PCB 模式时隐藏
+        # 通过隐藏 section_label 和步骤输入来切换
+        for inp in self._step_inputs:
+            inp.setVisible(not pcb_mode)
+        for inp in self._step_count_inputs:
+            inp.setVisible(not pcb_mode)
+        # 隐藏步骤相关的 label
+        for i in range(self._operator_group.layout().count()):
+            item = self._operator_group.layout().itemAt(i)
+            if item and item.widget():
+                w = item.widget()
+                text = w.text() if hasattr(w, "text") else ""
+                if pcb_mode and ("步骤" in text or "类别名称" in text or "数量" in text or "动作类别序列" in text):
+                    w.setVisible(False)
+                elif not pcb_mode and ("步骤" in text or "类别名称" in text or "数量" in text or "动作类别序列" in text):
+                    w.setVisible(True)
 
     def _load_values(self) -> None:
         c = self.config

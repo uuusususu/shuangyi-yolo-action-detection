@@ -1,6 +1,6 @@
 {
   "model_task": "ultralytics_obb",
-  "yolo_model_path": "config/best.onnx",
+  "yolo_model_path": "E:/双翼科技项目/动作检测/yolo_action_detection/dist/YOLOActionDetection/config/jiaodian.onnx",
   "yolo_conf_threshold": 0.3,
   "yolo_iou_threshold": 0.5,
   "ultralytics_device": "",
@@ -9,12 +9,20 @@
   "ultralytics_max_det": 300,
   "ultralytics_track_persist": true,
   "category_names": [
-    "1号",
-    "2号",
-    "3号",
-    "4号",
-    "5号",
+    "脚垫",
+    "",
+    "",
+    "",
+    "",
     ""
+  ],
+  "category_counts": [
+    4,
+    1,
+    1,
+    1,
+    1,
+    1
   ],
   "tool_class_name": "扭力枪",
   "camera_index": 0,
@@ -64,5 +72,16 @@
   "show_track_id_overlay": true,
   "display_result_max_age_ms": 250,
   "sound_feedback_enabled": false,
-  "fail_evidence_enabled": false
+  "fail_evidence_enabled": false,
+  "pcb_inspection_enabled": false,
+  "pcb_class_name": "pcb",
+  "pcb_component_class_names": [
+    "",
+    "",
+    "",
+    ""
+  ],
+  "pcb_fail_stable_frames": 3,
+  "pcb_round_interval_seconds": 2.0,
+  "pcb_assignment_margin_ratio": 0.15
 }
