@@ -245,6 +245,8 @@ def main():
         step_engine,
         resource_dir=paths.resource_dir,
         evidence_base_dir=base_dir / "outputs" / "evidence",
+        processor_factory=create_yolo_processor,
+        app_base_dir=base_dir,
     )
     window.show()
     app.processEvents()

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import cv2
 import numpy as np
@@ -67,12 +67,22 @@ class MainWindow(QMainWindow):
         fail_evidence_saver=None,
         resource_dir=None,
         evidence_base_dir=None,
+        processor_factory: Optional[Callable] = None,
+        app_base_dir=None,
     ) -> None:
         super().__init__()
         self.config = config
         self.state = state
         self.processor = processor
         self.step_engine = step_engine
+        self._processor_factory = processor_factory
+        self._app_base_dir = (
+            Path(app_base_dir)
+            if app_base_dir is not None
+            else Path(__file__).resolve().parents[2]
+        )
+        self._runtime_model_signature = self._model_runtime_signature(config)
+        self._last_model_reload_error = ""
 
         self.setWindowTitle("双翼科技视觉行为引导系统")
         self.setMinimumSize(1200, 760)
@@ -837,6 +847,7 @@ class MainWindow(QMainWindow):
             self._config_page = ConfigPage(self.config, stats_manager=self._stats_manager)
             self._config_page.back_clicked.connect(self._on_config_back)
             self._config_page.stats_changed.connect(self._on_stats_changed)
+            self._config_page.config_saved.connect(self._on_config_saved)
             self._stacked.addWidget(self._config_page)
         self._config_page.refresh_stats_display()
         self._stacked.setCurrentWidget(self._config_page)
@@ -858,6 +869,87 @@ class MainWindow(QMainWindow):
         self._update_kpi()
         if self._config_page is not None:
             self._config_page.refresh_stats_display()
+
+    def _on_config_saved(self) -> None:
+        """配置页保存后立即应用运行时配置。"""
+        self._apply_feedback_config()
+        model_ok = self._apply_runtime_model_config()
+        self._rebuild_step_engine()
+        self._refresh_steps()
+        self._sync_button_states()
+        self._update_kpi()
+        if not model_ok:
+            self._status_label.setText(self._last_model_reload_error or "模型加载失败")
+            self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+        elif not self.state.inference_on:
+            self._status_label.setText("配置已应用")
+            self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+
+    def _apply_feedback_config(self) -> None:
+        """同步保存后可立即生效的反馈配置。"""
+        self._sound_feedback.enabled = bool(getattr(self.config, "sound_feedback_enabled", True))
+        self._fail_evidence_saver.enabled = bool(getattr(self.config, "fail_evidence_enabled", True))
+
+    @staticmethod
+    def _model_runtime_signature(config) -> tuple:
+        """影响推理处理器实例的配置签名。"""
+        return (
+            str(getattr(config, "yolo_model_path", "")),
+            float(getattr(config, "yolo_conf_threshold", 0.0)),
+            float(getattr(config, "yolo_iou_threshold", 0.0)),
+            str(getattr(config, "ultralytics_device", "")),
+            bool(getattr(config, "ultralytics_half", False)),
+            str(getattr(config, "ultralytics_tracker", "")),
+            int(getattr(config, "ultralytics_max_det", 0)),
+            bool(getattr(config, "ultralytics_track_persist", True)),
+        )
+
+    def _create_processor_from_config(self):
+        """创建新处理器。测试可注入 factory，生产路径复用 main.create_yolo_processor。"""
+        if self._processor_factory is not None:
+            return self._processor_factory(self.config, app_base_dir=self._app_base_dir)
+        from main import create_yolo_processor
+
+        return create_yolo_processor(self.config, app_base_dir=self._app_base_dir)
+
+    def _apply_runtime_model_config(self) -> bool:
+        """模型相关配置变化时重载处理器，失败时保留旧处理器。"""
+        new_signature = self._model_runtime_signature(self.config)
+        needs_reload = new_signature != self._runtime_model_signature or self.processor is None
+        if not needs_reload:
+            return True
+
+        was_inference_on = bool(self.state.inference_on)
+        if was_inference_on:
+            self.worker.stop_inference()
+
+        self._status_label.setText("模型加载中...")
+        self._status_label.setStyleSheet(text_style(TEXT_SECONDARY, size=14, weight=700))
+
+        try:
+            new_processor = self._create_processor_from_config()
+        except Exception as exc:
+            self._last_model_reload_error = f"模型加载失败: {exc}"
+            if was_inference_on and self.processor is not None and self.state.camera_on:
+                self.worker.start_inference()
+            self._status_label.setText(self._last_model_reload_error)
+            self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+            self._sync_button_states()
+            return False
+
+        self.processor = new_processor
+        self.worker.set_frame_processor(new_processor)
+        self._runtime_model_signature = new_signature
+        self._last_model_reload_error = ""
+        self._last_overlay_data = {}
+
+        if was_inference_on and self.state.camera_on:
+            self.worker.start_inference()
+            self._status_label.setText("检测中")
+        else:
+            self._status_label.setText("模型已加载")
+        self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+        return True
 
     def _rebuild_step_engine(self) -> None:
         """根据最新配置重建步骤引擎，保证 UI 卡片和判定顺序一致。"""

@@ -28,6 +28,7 @@ class ConfigPage(QWidget):
 
     back_clicked = Signal()
     stats_changed = Signal()
+    config_saved = Signal()
 
     def __init__(self, config, stats_manager=None) -> None:
         super().__init__()
@@ -415,6 +416,11 @@ class ConfigPage(QWidget):
         c.fail_evidence_enabled = self._fail_evidence_cb.isChecked()
         try:
             c.validate()
+            config_path = c.get_config_path()
+            if not config_path:
+                raise ValueError("配置路径不存在，无法保存。")
+            c.save(config_path)
+            self.config_saved.emit()
             QMessageBox.information(self, "保存成功", "配置已保存。")
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "配置错误", str(exc))
