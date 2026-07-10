@@ -178,11 +178,15 @@ class ConfigPage(QWidget):
         row += 1
         operator_layout.addWidget(self._section_label("动作类别序列"), row, 0, 1, 3)
 
+        row += 1
+        operator_layout.addWidget(self._label("类别名称"), row, 1)
+        operator_layout.addWidget(self._label("数量"), row, 2)
+
         self._step_inputs = []
         self._step_count_inputs = []
         for i in range(6):
             row += 1
-            operator_layout.addWidget(self._label(f"步骤{i+1} 类别:"), row, 0)
+            operator_layout.addWidget(self._label(f"步骤{i+1}:"), row, 0)
             inp = QLineEdit()
             inp.setPlaceholderText("留空表示未配置")
             operator_layout.addWidget(inp, row, 1)
