@@ -36,6 +36,8 @@ class StepState:
     passed_at: float = 0.0
     ng_at: float = 0.0
     ng_reason: str = ""
+    required_count: int = 1
+    current_count: int = 0
 
 
 @dataclass
@@ -63,6 +65,7 @@ class StepSequenceEngine:
         self,
         tool_class_name: str = "扭力枪",
         step_class_names: Optional[List[str]] = None,
+        step_counts: Optional[List[int]] = None,
         enter_threshold: float = 0.18,
         enter_stable_frames: int = 1,
         leave_stable_frames: int = 4,
@@ -75,6 +78,7 @@ class StepSequenceEngine:
         # 以下 legacy 参数保留构造兼容，但生产判定不再依赖扭力枪或 OBB 接触。
         self._tool_class = tool_class_name
         self._step_classes = step_class_names or []
+        self._step_counts = step_counts or []
         self._enter_stable = enter_stable_frames
         self._leave_stable = leave_stable_frames
         self._out_of_order_frames = out_of_order_frames
@@ -96,11 +100,15 @@ class StepSequenceEngine:
         for i, name in enumerate(self._step_classes):
             configured = bool(name and name.strip())
             status = StepStatus.READY if configured else StepStatus.NOT_CONFIGURED
+            required = 1
+            if i < len(self._step_counts):
+                required = max(1, int(self._step_counts[i]))
             self._steps.append(StepState(
                 index=i,
                 class_name=name,
                 configured=configured,
                 status=status,
+                required_count=required,
             ))
         self._advance_to_next_waiting()
 
@@ -195,10 +203,13 @@ class StepSequenceEngine:
             return self.get_state()
 
         expected_step = self._steps[expected_idx]
-        detected_labels = {str(d.label) for d in detections if getattr(d, "label", "")}
+        from collections import Counter
+        label_counts = Counter(str(d.label) for d in detections if getattr(d, "label", ""))
 
         # 当前类别命中优先，不在同一帧判未来步骤 NG。
-        current_step_hit = expected_step.class_name in detected_labels
+        current_count = label_counts.get(expected_step.class_name, 0)
+        expected_step.current_count = current_count
+        current_step_hit = current_count == expected_step.required_count
         if current_step_hit:
             expected_step.enter_count += 1
             expected_step.leave_count = 0
@@ -242,7 +253,9 @@ class StepSequenceEngine:
                     continue
                 if step.status in (StepStatus.PASS, StepStatus.NG):
                     continue
-                if step.class_name in detected_labels:
+                step_count = label_counts.get(step.class_name, 0)
+                step.current_count = step_count
+                if step_count == step.required_count:
                     step.wrong_order_count += 1
                     if step.wrong_order_count >= self._out_of_order_frames:
                         self._round_result = RoundResult.ACTION_NG

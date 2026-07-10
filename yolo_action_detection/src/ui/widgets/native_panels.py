@@ -305,6 +305,11 @@ class StepCard(QFrame):
         )
         self._status_label.setText(status_text)
 
+    def set_quantity_progress(self, current: int, required: int) -> None:
+        """显示当前帧数量进度，如 3/4。"""
+        if required > 1:
+            self._hint_label.setText(f"{current}/{required}")
+
 
 class KpiRow(QFrame):
     """单行 KPI 显示：今日产能、良率、OK、NG。"""

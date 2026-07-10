@@ -25,6 +25,7 @@ class ConfigManager:
     ultralytics_track_persist: bool = True
 
     category_names: List[str] = field(default_factory=lambda: ["1号", "2号", "3号", "4号", "5号", ""])
+    category_counts: List[int] = field(default_factory=lambda: [1, 1, 1, 1, 1, 1])
     # 旧版扭力枪/交集判定字段仅用于兼容历史配置和坐标诊断日志，不参与生产步骤判定。
     tool_class_name: str = "扭力枪"
 
@@ -131,6 +132,20 @@ class ConfigManager:
         self.pcb_assignment_margin_ratio = max(0.0, min(1.0, float(self.pcb_assignment_margin_ratio)))
         if self.pcb_inspection_enabled:
             self._validate_pcb_config()
+        self._normalize_category_counts()
+
+    def _normalize_category_counts(self) -> None:
+        """确保 category_counts 与 category_names 下标对齐，且每个值 >= 1。"""
+        names_len = len(self.category_names)
+        counts = list(self.category_counts)
+        # 补齐到与 names 相同长度
+        while len(counts) < names_len:
+            counts.append(1)
+        # 裁剪到相同长度
+        counts = counts[:names_len]
+        # 每个值至少为 1
+        counts = [max(1, int(c)) for c in counts]
+        self.category_counts = counts
 
     def load(self, path: Path | str) -> None:
         """从 JSON 文件加载配置。"""

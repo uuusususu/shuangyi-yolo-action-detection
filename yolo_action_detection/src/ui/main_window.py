@@ -567,6 +567,12 @@ class MainWindow(QMainWindow):
             else:
                 card.set_step_state("waiting")
 
+            # 显示数量进度
+            if state is not None and 0 <= engine_idx < len(state.steps):
+                ss = state.steps[engine_idx]
+                if ss.required_count > 1 and step_state == StepStatus.WAITING:
+                    card.set_quantity_progress(ss.current_count, ss.required_count)
+
         # KPI 与结果标签
         if state is not None:
             if state.round_result == RoundResult.PASS:
@@ -1086,6 +1092,7 @@ class MainWindow(QMainWindow):
             return
         self.step_engine = StepSequenceEngine(
             step_class_names=self.config.category_names,
+            step_counts=getattr(self.config, "category_counts", None),
             enter_stable_frames=self.config.action_pass_stable_frames,
             out_of_order_frames=self.config.action_ng_stable_frames,
             leave_stable_frames=getattr(self.config, "action_leave_stable_frames", 4),

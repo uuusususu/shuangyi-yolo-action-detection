@@ -179,13 +179,21 @@ class ConfigPage(QWidget):
         operator_layout.addWidget(self._section_label("动作类别序列"), row, 0, 1, 3)
 
         self._step_inputs = []
+        self._step_count_inputs = []
         for i in range(6):
             row += 1
             operator_layout.addWidget(self._label(f"步骤{i+1} 类别:"), row, 0)
             inp = QLineEdit()
             inp.setPlaceholderText("留空表示未配置")
-            operator_layout.addWidget(inp, row, 1, 1, 2)
+            operator_layout.addWidget(inp, row, 1)
+            cnt = QSpinBox()
+            cnt.setRange(1, 999)
+            cnt.setValue(1)
+            cnt.setFixedWidth(80)
+            cnt.setToolTip(f"步骤{i+1} 目标数量")
+            operator_layout.addWidget(cnt, row, 2)
             self._step_inputs.append(inp)
+            self._step_count_inputs.append(cnt)
 
         layout.addWidget(self._operator_group)
 
@@ -366,6 +374,11 @@ class ConfigPage(QWidget):
         for i, name in enumerate(c.category_names):
             if i < 6:
                 self._step_inputs[i].setText(name)
+        # 步骤数量
+        counts = getattr(c, "category_counts", [1, 1, 1, 1, 1, 1])
+        for i in range(6):
+            val = counts[i] if i < len(counts) else 1
+            self._step_count_inputs[i].setValue(val)
         # 相机参数
         idx = self._cam_mode_input.findText(getattr(c, "camera_parameter_mode", "preserve"))
         if idx >= 0:
@@ -456,6 +469,7 @@ class ConfigPage(QWidget):
         c.ultralytics_max_det = self._max_det_input.value()
         c.ultralytics_track_persist = self._track_persist_cb.isChecked()
         c.category_names = [inp.text() for inp in self._step_inputs]
+        c.category_counts = [inp.value() for inp in self._step_count_inputs]
         # 相机参数
         c.camera_parameter_mode = self._cam_mode_input.currentText()
         c.camera_parameter_group = self._cam_group_input.value()
