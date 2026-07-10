@@ -29,6 +29,8 @@ from detection_logging.coordinate_logger import (
 from detection_logging.audio_feedback import SoundFeedback
 from detection_logging.fail_evidence import FailEvidenceContext, FailEvidenceSaver
 from detection_logging.production_stats import ProductionStatsManager
+from pcb_inspection.models import PcbInspectionConfig, PcbResult
+from pcb_inspection.engine import MultiPcbInspectionEngine
 from step_sequence.step_sequence_engine import StepSequenceEngine, RoundResult, StepStatus
 from ui.runtime_ui_tokens import (
     FONT_TITLE,
@@ -98,6 +100,9 @@ class MainWindow(QMainWindow):
         self._last_counted_pass_round = -1
         self._last_counted_ng_key: Optional[tuple] = None
         self._round_start_time = 0.0
+        # PCB 多板检查引擎（按需创建）
+        self._pcb_engine: Optional[MultiPcbInspectionEngine] = None
+        self._init_pcb_engine()
         # PASS 文案展示定时器；只负责清理 UI 文案，不阻塞下一轮检测。
         self._round_pass_timer = QTimer(self)
         self._round_pass_timer.setSingleShot(True)
@@ -141,6 +146,14 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._refresh_steps()
         self._sync_button_states()
+
+    def _init_pcb_engine(self) -> None:
+        """根据配置创建或销毁 PCB 检查引擎。"""
+        if getattr(self.config, "pcb_inspection_enabled", False):
+            pcb_config = PcbInspectionConfig.from_config(self.config)
+            self._pcb_engine = MultiPcbInspectionEngine(pcb_config)
+        else:
+            self._pcb_engine = None
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -586,6 +599,30 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _handle_pcb_ng_feedback(self, result, frame_id: int) -> None:
+        """PCB FAIL 时播放声音和保存证据。"""
+        if getattr(self.config, "sound_feedback_enabled", True):
+            try:
+                self._sound_feedback.play_fail()
+            except Exception:
+                pass
+        if getattr(self.config, "fail_evidence_enabled", True):
+            try:
+                frame, _ = self._get_feedback_frame()
+                data = self._last_overlay_data or {}
+                context = FailEvidenceContext(
+                    round_id=int(result.track_id),
+                    action_ng_step=-1,
+                    step_name=f"PCB #{result.track_id} 缺: {'/'.join(result.missing_classes)}",
+                    source_frame_id=int(frame_id),
+                    detections=list(data.get("detections", []) or []),
+                    model_path=str(data.get("model_path", "")),
+                    timestamp=float(result.timestamp or time.time()),
+                )
+                self._fail_evidence_saver.save_fail_event(frame, context)
+            except Exception:
+                pass
+
     def _get_feedback_frame(self):
         try:
             frame, frame_id = self.worker.get_display_frame()
@@ -733,8 +770,14 @@ class MainWindow(QMainWindow):
                 box=tuple(d.get("box", (0, 0, 0, 0))),
                 center=tuple(d.get("center", d.get("center_px", (0, 0)))),
             ))
+
         state = None
-        if self.step_engine:
+        if self._pcb_engine is not None:
+            # PCB 多板检查模式
+            image_size = data.get("image_size")
+            pcb_results = self._pcb_engine.update(obb_dets, image_size=image_size)
+            self._handle_pcb_results(pcb_results, data.get("source_frame_id", 0))
+        elif self.step_engine:
             try:
                 state = self.step_engine.update(obb_dets, frame_id=data.get("source_frame_id", 0))
             except TypeError:
@@ -754,6 +797,23 @@ class MainWindow(QMainWindow):
         )
         self._record_coordinate_log(overlay, state)
         self._update_display()
+
+    def _handle_pcb_results(self, results: list, frame_id: int) -> None:
+        """处理 PCB 检查结果，接入声音/证据/统计。"""
+        for result in results:
+            if result.result == PcbResult.PASS:
+                self._stats_manager.record_pass()
+                self._play_pass_feedback()
+                self._set_result_label("PASS", "#4CAF50")
+                self._status_label.setText(f"PCB #{result.track_id} PASS")
+            elif result.result == PcbResult.FAIL:
+                self._stats_manager.record_ng()
+                self._handle_pcb_ng_feedback(result, frame_id)
+                self._set_result_label("NG", "#F44336")
+                self._status_label.setText(
+                    f"PCB #{result.track_id} NG 缺: {'/'.join(result.missing_classes)}"
+                )
+            self._update_kpi()
 
     @Slot(dict)
     def _on_stats_updated(self, stats: dict) -> None:
@@ -855,9 +915,10 @@ class MainWindow(QMainWindow):
         self._status_label.setStyleSheet("color: #9C27B0; font-weight: bold;")
 
     def _on_config_back(self) -> None:
-        """从配置页返回主界面：刷新动态步骤卡片。"""
+        """从配置页返回主界面：刷新动态步骤卡片和 PCB 引擎。"""
         self._stacked.setCurrentWidget(self._main_page)
         self._rebuild_step_engine()
+        self._init_pcb_engine()
         self._refresh_steps()
         self._sync_button_states()
         self._update_kpi()

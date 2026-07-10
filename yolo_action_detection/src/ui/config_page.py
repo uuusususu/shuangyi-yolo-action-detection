@@ -262,6 +262,53 @@ class ConfigPage(QWidget):
         self._show_tid_cb = QCheckBox("显示 Track ID")
         advanced_layout.addWidget(self._show_tid_cb, row, 1)
 
+        row += 1
+        advanced_layout.addWidget(self._section_label("PCB 多板元器件检查"), row, 0, 1, 3)
+
+        row += 1
+        self._pcb_enabled_cb = QCheckBox("启用 PCB 检查模式")
+        advanced_layout.addWidget(self._pcb_enabled_cb, row, 0, 1, 2)
+
+        row += 1
+        advanced_layout.addWidget(self._label("PCB 类别:"), row, 0)
+        self._pcb_class_input = QLineEdit()
+        self._pcb_class_input.setPlaceholderText("如 pcb")
+        advanced_layout.addWidget(self._pcb_class_input, row, 1)
+
+        self._pcb_component_inputs = []
+        for i in range(4):
+            row += 1
+            advanced_layout.addWidget(self._label(f"元器件 {i+1} 类别:"), row, 0)
+            inp = QLineEdit()
+            inp.setPlaceholderText("如 R1")
+            advanced_layout.addWidget(inp, row, 1)
+            self._pcb_component_inputs.append(inp)
+
+        row += 1
+        advanced_layout.addWidget(self._label("FAIL 连续帧:"), row, 0)
+        self._pcb_fail_frames_input = QSpinBox()
+        self._pcb_fail_frames_input.setRange(1, 30)
+        self._pcb_fail_frames_input.setValue(3)
+        self._pcb_fail_frames_input.setFixedWidth(100)
+        advanced_layout.addWidget(self._pcb_fail_frames_input, row, 1)
+
+        row += 1
+        advanced_layout.addWidget(self._label("轮次间隔(秒):"), row, 0)
+        self._pcb_interval_input = QDoubleSpinBox()
+        self._pcb_interval_input.setRange(0.0, 60.0)
+        self._pcb_interval_input.setSingleStep(0.5)
+        self._pcb_interval_input.setFixedWidth(100)
+        advanced_layout.addWidget(self._pcb_interval_input, row, 1)
+
+        row += 1
+        advanced_layout.addWidget(self._label("归属容差:"), row, 0)
+        self._pcb_margin_input = QDoubleSpinBox()
+        self._pcb_margin_input.setRange(0.0, 1.0)
+        self._pcb_margin_input.setSingleStep(0.05)
+        self._pcb_margin_input.setValue(0.15)
+        self._pcb_margin_input.setFixedWidth(100)
+        advanced_layout.addWidget(self._pcb_margin_input, row, 1)
+
         self._advanced_group.setVisible(False)
         layout.addWidget(self._advanced_group)
 
@@ -336,6 +383,16 @@ class ConfigPage(QWidget):
         self._show_tid_cb.setChecked(c.show_track_id_overlay)
         self._sound_feedback_cb.setChecked(getattr(c, "sound_feedback_enabled", True))
         self._fail_evidence_cb.setChecked(getattr(c, "fail_evidence_enabled", True))
+        # PCB 检查
+        self._pcb_enabled_cb.setChecked(getattr(c, "pcb_inspection_enabled", False))
+        self._pcb_class_input.setText(getattr(c, "pcb_class_name", "pcb"))
+        comp_names = getattr(c, "pcb_component_class_names", ["", "", "", ""])
+        for i, name in enumerate(comp_names):
+            if i < 4:
+                self._pcb_component_inputs[i].setText(name)
+        self._pcb_fail_frames_input.setValue(getattr(c, "pcb_fail_stable_frames", 3))
+        self._pcb_interval_input.setValue(getattr(c, "pcb_round_interval_seconds", 0.0))
+        self._pcb_margin_input.setValue(getattr(c, "pcb_assignment_margin_ratio", 0.15))
 
     def _on_select_model(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -414,6 +471,13 @@ class ConfigPage(QWidget):
         c.show_track_id_overlay = self._show_tid_cb.isChecked()
         c.sound_feedback_enabled = self._sound_feedback_cb.isChecked()
         c.fail_evidence_enabled = self._fail_evidence_cb.isChecked()
+        # PCB 检查
+        c.pcb_inspection_enabled = self._pcb_enabled_cb.isChecked()
+        c.pcb_class_name = self._pcb_class_input.text()
+        c.pcb_component_class_names = [inp.text() for inp in self._pcb_component_inputs]
+        c.pcb_fail_stable_frames = self._pcb_fail_frames_input.value()
+        c.pcb_round_interval_seconds = self._pcb_interval_input.value()
+        c.pcb_assignment_margin_ratio = self._pcb_margin_input.value()
         try:
             c.validate()
             config_path = c.get_config_path()

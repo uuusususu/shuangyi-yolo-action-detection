@@ -95,6 +95,14 @@ class ConfigManager:
     sound_feedback_enabled: bool = True
     fail_evidence_enabled: bool = True
 
+    # PCB 多板元器件检查模式
+    pcb_inspection_enabled: bool = False
+    pcb_class_name: str = "pcb"
+    pcb_component_class_names: List[str] = field(default_factory=lambda: ["", "", "", ""])
+    pcb_fail_stable_frames: int = 3
+    pcb_round_interval_seconds: float = 0.0
+    pcb_assignment_margin_ratio: float = 0.15
+
     _config_path: Optional[str] = field(default=None, repr=False)
 
     def validate(self) -> None:
@@ -117,6 +125,12 @@ class ConfigManager:
         self.display_result_max_age_ms = max(0, int(self.display_result_max_age_ms))
         self.sound_feedback_enabled = _coerce_bool(self.sound_feedback_enabled)
         self.fail_evidence_enabled = _coerce_bool(self.fail_evidence_enabled)
+        self.pcb_inspection_enabled = _coerce_bool(self.pcb_inspection_enabled)
+        self.pcb_fail_stable_frames = max(1, int(self.pcb_fail_stable_frames))
+        self.pcb_round_interval_seconds = max(0.0, float(self.pcb_round_interval_seconds))
+        self.pcb_assignment_margin_ratio = max(0.0, min(1.0, float(self.pcb_assignment_margin_ratio)))
+        if self.pcb_inspection_enabled:
+            self._validate_pcb_config()
 
     def load(self, path: Path | str) -> None:
         """从 JSON 文件加载配置。"""
@@ -160,6 +174,21 @@ class ConfigManager:
     def get_step_class_names(self) -> List[str]:
         """返回有效步骤类别（非空）。"""
         return [c for c in self.category_names if c and c.strip()]
+
+    def _validate_pcb_config(self) -> None:
+        """校验 PCB 检查模式配置。"""
+        if not self.pcb_class_name or not self.pcb_class_name.strip():
+            raise ValueError("PCB 检查模式已启用，但 PCB 类别名称为空")
+        pcb_class = self.pcb_class_name.strip()
+        comps = [c.strip() for c in self.pcb_component_class_names if c and c.strip()]
+        if len(comps) != 4:
+            raise ValueError(
+                f"PCB 检查模式需要恰好 4 个非空元器件类别，当前有 {len(comps)} 个"
+            )
+        if len(set(comps)) != 4:
+            raise ValueError("PCB 元器件类别存在重复，必须 4 个互不相同")
+        if pcb_class in comps:
+            raise ValueError(f"PCB 类别 '{pcb_class}' 不能与元器件类别相同")
 
 
 def _coerce_bool(value) -> bool:
