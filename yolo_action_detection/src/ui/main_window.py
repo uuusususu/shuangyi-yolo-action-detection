@@ -383,6 +383,74 @@ class MainWindow(QMainWindow):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 1)
 
         frame = self._draw_tip_and_holes(frame, overlay)
+
+        # PCB 模式：在画面上绘制 PCB ID、元器件归属标注和连续 FAIL 帧
+        if self._pcb_engine is not None:
+            frame = self._draw_pcb_overlay(frame, overlay)
+
+        return frame
+
+    def _draw_pcb_overlay(self, frame: np.ndarray, overlay) -> np.ndarray:
+        """在画面上绘制 PCB ID、已识别元器件、连续 FAIL 帧和最终结果。"""
+        if not self._pcb_engine:
+            return frame
+        pcb_class = getattr(self.config, "pcb_class_name", "pcb")
+        comp_names = [n for n in getattr(self.config, "pcb_component_class_names", []) if n]
+
+        # 找到画面中的 PCB 检测
+        for det in overlay.detections:
+            if det.label != pcb_class or det.track_id is None:
+                continue
+            tid = det.track_id
+            state = self._pcb_engine.pcb_states.get(tid)
+            if state is None:
+                continue
+
+            # 在 PCB OBB 中心上方绘制 PCB ID 和状态
+            cx, cy = int(det.center[0]), int(det.center[1])
+            label_y = cy - 30
+
+            # 状态颜色
+            if state.result.value == "pass":
+                color = (0, 200, 0)   # 绿色
+            elif state.result.value == "fail":
+                color = (0, 0, 255)   # 红色
+            else:
+                color = (255, 200, 0) # 橙色
+
+            # PCB ID
+            cv2.putText(frame, f"PCB #{tid}", (cx - 40, label_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            # 结果标签
+            if state.result.value == "pass":
+                cv2.putText(frame, "PASS", (cx - 25, label_y + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            elif state.result.value == "fail":
+                missing = "/".join(state.missing_classes[:3])
+                cv2.putText(frame, f"NG 缺:{missing}", (cx - 60, label_y + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            else:
+                # 显示连续 FAIL 帧数和已识别槽位
+                identified = sum(
+                    1 for s in state.last_slot_states.values() if s.present
+                )
+                total = len(comp_names)
+                cv2.putText(frame, f"{identified}/{total} FAIL:{state.consecutive_fail}",
+                            (cx - 50, label_y + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            # 在每个已识别元器件旁标注其所属 PCB ID
+            for comp_name in comp_names:
+                for cd in overlay.detections:
+                    if cd.label != comp_name:
+                        continue
+                    # 简单标注：在元器件旁边写上 PCB ID
+                    comp_cx = int(cd.center[0])
+                    comp_cy = int(cd.center[1])
+                    cv2.putText(frame, f"#{tid}", (comp_cx + 15, comp_cy),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
         return frame
 
     def _draw_tip_and_holes(self, frame: np.ndarray, overlay) -> np.ndarray:
