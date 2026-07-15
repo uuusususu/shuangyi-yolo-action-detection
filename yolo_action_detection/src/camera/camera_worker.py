@@ -10,7 +10,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
 
-from camera.mvsdk_camera import MvSdkCamera, MvSdkCapture
+from camera.mvsdk_camera import MvSdkCamera, MvSdkCapture, MvSdkDevice
 from yolo_runtime.yolo_result_models import DetectionOverlayState, PipelineStats
 
 
@@ -36,6 +36,7 @@ class CameraWorker(QObject):
         self._mvsdk_camera: Optional[MvSdkCamera] = None
         self._capture_thread: Optional[threading.Thread] = None
         self._inference_thread: Optional[threading.Thread] = None
+        self._session_generation = 0
 
         self._preview_lock = threading.Lock()
         self._infer_lock = threading.Lock()
@@ -66,53 +67,77 @@ class CameraWorker(QObject):
     def set_frame_processor(self, processor) -> None:
         self.frame_processor = processor
 
-    def open_camera(self) -> bool:
-        """Open camera using MvSdk or fallback to cv2."""
-        try:
-            mvsdk_name = getattr(self.config, "mvsdk_friendly_name", "")
-            if not mvsdk_name:
-                devices = MvSdkCamera.enumerate_devices()
-                if devices:
-                    mvsdk_name = devices[0].friendly_name
+    @staticmethod
+    def enumerate_devices() -> list[MvSdkDevice]:
+        return MvSdkCamera.enumerate_devices()
 
-            if mvsdk_name:
-                self._mvsdk_camera = MvSdkCamera()
-                param_mode = getattr(self.config, "camera_parameter_mode", "preserve")
-                param_group = getattr(self.config, "camera_parameter_group", 0)
-                param_file = getattr(self.config, "camera_parameter_file", "")
-                opened = self._mvsdk_camera.open(
-                    friendly_name=mvsdk_name,
-                    parameter_mode=param_mode,
-                    parameter_group=param_group,
-                    parameter_file=param_file,
+    @property
+    def active_device(self) -> Optional[MvSdkDevice]:
+        if self._mvsdk_camera is None:
+            return None
+        return self._mvsdk_camera.device
+
+    def open_camera(self) -> bool:
+        """Open the explicitly configured MvSDK camera."""
+        self._clear_session_buffers()
+        try:
+            target_sn = str(getattr(self.config, "mvsdk_camera_sn", "") or "").strip()
+            legacy_name = str(
+                getattr(self.config, "mvsdk_friendly_name", "") or ""
+            ).strip()
+            if not target_sn and not legacy_name:
+                raise RuntimeError("未选择迈德相机，请先在配置页选择并保存")
+
+            self._mvsdk_camera = MvSdkCamera(
+                exposure_us=getattr(self.config, "camera_manual_exposure_us", 30000),
+                auto_exposure=getattr(self.config, "camera_manual_ae", False),
+            )
+            param_mode = getattr(self.config, "camera_parameter_mode", "preserve")
+            param_group = getattr(self.config, "camera_parameter_group", 0)
+            param_file = getattr(self.config, "camera_parameter_file", "")
+            opened = self._mvsdk_camera.open(
+                sn=target_sn,
+                friendly_name=legacy_name if not target_sn else "",
+                parameter_mode=param_mode,
+                parameter_group=param_group,
+                parameter_file=param_file,
+            )
+            if not opened:
+                raise RuntimeError(
+                    self._mvsdk_camera.last_error
+                    or f"无法打开迈德相机: {target_sn or legacy_name}"
                 )
-                if not opened:
-                    raise RuntimeError(f"无法打开 MvSDK 相机: {mvsdk_name}")
-                self.cap = MvSdkCapture(self._mvsdk_camera)
-                # 读取相机参数
-                try:
-                    params = self._mvsdk_camera.read_params()
-                    self.camera_params_updated.emit(params)
-                except Exception:
-                    pass
-            else:
-                cam_idx = getattr(self.config, "camera_index", 0)
-                self.cap = cv2.VideoCapture(cam_idx)
-                if not self.cap.isOpened():
-                    raise RuntimeError(f"无法打开相机 {cam_idx}")
+            self.cap = MvSdkCapture(self._mvsdk_camera)
+            try:
+                params = self._mvsdk_camera.read_params()
+                self.camera_params_updated.emit(params)
+            except Exception:
+                pass
 
             self.running = True
             self.state.set_camera_on(True)
             self._start_threads()
             return True
         except Exception as exc:
+            if self._mvsdk_camera is not None:
+                try:
+                    self._mvsdk_camera.close()
+                except Exception:
+                    pass
+            self._mvsdk_camera = None
+            self.cap = None
+            self.running = False
+            self.state.set_camera_on(False)
+            self.state.set_inference_on(False)
             self.error_occurred.emit(str(exc))
             return False
 
     def close_camera(self) -> None:
         self.running = False
+        self._session_generation += 1
         self.state.set_camera_on(False)
         self.state.set_inference_on(False)
+        self._wait_for_threads_to_stop()
         if self._mvsdk_camera:
             try:
                 self._mvsdk_camera.close()
@@ -125,6 +150,16 @@ class CameraWorker(QObject):
             except Exception:
                 pass
         self.cap = None
+        self._clear_session_buffers()
+
+    def _wait_for_threads_to_stop(self, timeout_s: float = 1.0) -> None:
+        current_thread = threading.current_thread()
+        for attr_name in ("_capture_thread", "_inference_thread"):
+            thread = getattr(self, attr_name)
+            if thread is not None and thread is not current_thread and thread.is_alive():
+                thread.join(timeout=timeout_s)
+            if thread is None or not thread.is_alive():
+                setattr(self, attr_name, None)
 
     def start_inference(self) -> None:
         self.state.set_inference_on(True)
@@ -133,18 +168,30 @@ class CameraWorker(QObject):
         self.state.set_inference_on(False)
 
     def _start_threads(self) -> None:
-        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._session_generation += 1
+        generation = self._session_generation
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop,
+            args=(generation,),
+            daemon=True,
+        )
         self._capture_thread.start()
-        self._inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
+        self._inference_thread = threading.Thread(
+            target=self._inference_loop,
+            args=(generation,),
+            daemon=True,
+        )
         self._inference_thread.start()
 
-    def _capture_loop(self) -> None:
-        while self.running and self.cap:
+    def _capture_loop(self, generation: int) -> None:
+        while self.running and generation == self._session_generation and self.cap:
             try:
                 ret, frame = self.cap.read()
                 if not ret or frame is None:
                     time.sleep(0.01)
                     continue
+                if not self.running or generation != self._session_generation:
+                    break
                 if len(frame.shape) == 2:
                     frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
                 with self._preview_lock:
@@ -159,8 +206,8 @@ class CameraWorker(QObject):
             except Exception:
                 time.sleep(0.05)
 
-    def _inference_loop(self) -> None:
-        while self.running:
+    def _inference_loop(self, generation: int) -> None:
+        while self.running and generation == self._session_generation:
             if not self.state.inference_on or self.frame_processor is None:
                 time.sleep(0.05)
                 continue
@@ -177,6 +224,8 @@ class CameraWorker(QObject):
             self._last_inferred_frame_id = fid
             try:
                 overlay = self.frame_processor.process_frame(frame, source_frame_id=fid)
+                if not self.running or generation != self._session_generation:
+                    break
                 with self._overlay_lock:
                     self._latest_overlay = overlay
                 # 同帧：保存推理完成的帧和 overlay
@@ -191,6 +240,29 @@ class CameraWorker(QObject):
                 self._update_infer_fps()
             except Exception as exc:
                 self.error_occurred.emit(f"推理异常: {exc}")
+
+    def _clear_session_buffers(self) -> None:
+        with self._preview_lock:
+            self._latest_preview_frame = None
+            self._next_frame_id = 0
+        with self._infer_lock:
+            self._latest_infer_frame = None
+            self._latest_infer_frame_id = 0
+            self._last_inferred_frame_id = 0
+        with self._display_lock:
+            self._latest_display_frame = None
+            self._latest_display_frame_id = 0
+        with self._overlay_lock:
+            self._latest_overlay = DetectionOverlayState()
+        with self._stats_lock:
+            self._pipeline_stats = PipelineStats()
+            self._capture_count = 0
+            self._infer_count = 0
+            self._preview_count = 0
+            now = time.time()
+            self._capture_fps_start = now
+            self._infer_fps_start = now
+            self._preview_fps_start = now
 
     def get_latest_preview_frame(self) -> Optional[np.ndarray]:
         with self._preview_lock:

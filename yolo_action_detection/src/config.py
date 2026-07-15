@@ -31,6 +31,7 @@ class ConfigManager:
 
     camera_index: int = 0
     mvsdk_friendly_name: str = ""
+    mvsdk_camera_sn: str = ""
 
     # 相机参数模式: preserve / load_group / load_file / manual
     camera_parameter_mode: str = "preserve"
@@ -57,7 +58,7 @@ class ConfigManager:
     # 动作判定：模型输出类别名直接匹配步骤类别序列。
     action_overlap_threshold: float = 0.20
     action_pass_stable_frames: int = 1
-    action_ng_stable_frames: int = 2
+    action_ng_stable_frames: int = 10
     action_leave_stable_frames: int = 4
     action_order_constraint_enabled: bool = True
 
@@ -93,14 +94,20 @@ class ConfigManager:
     display_result_max_age_ms: int = 250
 
     # 结果反馈
+    pass_sound_enabled: bool = False
+    fail_sound_enabled: bool = True
+    # 旧统一开关仅用于配置兼容，运行时以两个独立开关为准。
     sound_feedback_enabled: bool = True
     fail_evidence_enabled: bool = True
 
-    # PCB 多板元器件检查模式
+    # 首类别区域检查模式：category_names[0] 为父区域，后续类别为子控件。
+    first_category_region_check_enabled: bool = False
+
+    # PCB 多板元器件检查模式（保留历史配置兼容）。
     pcb_inspection_enabled: bool = False
     pcb_class_name: str = "pcb"
     pcb_component_class_names: List[str] = field(default_factory=lambda: ["", "", "", ""])
-    pcb_fail_stable_frames: int = 3
+    pcb_fail_stable_frames: int = 10
     pcb_round_interval_seconds: float = 0.0
     pcb_assignment_margin_ratio: float = 0.15
 
@@ -124,14 +131,18 @@ class ConfigManager:
         self.fusion_iou_threshold = max(0.01, min(1.0, self.fusion_iou_threshold))
         self.fusion_center_dist_threshold = max(10, min(500, int(self.fusion_center_dist_threshold)))
         self.display_result_max_age_ms = max(0, int(self.display_result_max_age_ms))
-        self.sound_feedback_enabled = _coerce_bool(self.sound_feedback_enabled)
+        self.round_cooldown_seconds = max(0.0, float(self.round_cooldown_seconds))
+        self.pass_sound_enabled = _coerce_bool(self.pass_sound_enabled)
+        self.fail_sound_enabled = _coerce_bool(self.fail_sound_enabled)
+        self.sound_feedback_enabled = self.fail_sound_enabled
         self.fail_evidence_enabled = _coerce_bool(self.fail_evidence_enabled)
+        self.first_category_region_check_enabled = _coerce_bool(self.first_category_region_check_enabled)
         self.pcb_inspection_enabled = _coerce_bool(self.pcb_inspection_enabled)
         self.pcb_fail_stable_frames = max(1, int(self.pcb_fail_stable_frames))
         self.pcb_round_interval_seconds = max(0.0, float(self.pcb_round_interval_seconds))
         self.pcb_assignment_margin_ratio = max(0.0, min(1.0, float(self.pcb_assignment_margin_ratio)))
-        if self.pcb_inspection_enabled:
-            self._validate_pcb_config()
+        if self.first_category_region_check_enabled:
+            self._validate_first_category_region_config()
         self._normalize_category_counts()
 
     def _normalize_category_counts(self) -> None:
@@ -161,6 +172,15 @@ class ConfigManager:
                 f"配置文件的 model_task 为 '{mt}'，"
                 f"不支持该类型，只支持 '{ULTRALYTICS_OBB_TASK}'"
             )
+        has_new_sound_setting = (
+            "pass_sound_enabled" in data or "fail_sound_enabled" in data
+        )
+        if has_new_sound_setting:
+            data.setdefault("pass_sound_enabled", False)
+            data.setdefault("fail_sound_enabled", True)
+        else:
+            data["pass_sound_enabled"] = False
+            data["fail_sound_enabled"] = data.get("sound_feedback_enabled", True)
         for key, value in data.items():
             if hasattr(self, key) and not key.startswith("_"):
                 setattr(self, key, value)
@@ -171,6 +191,9 @@ class ConfigManager:
         """保存配置到 JSON 文件。"""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.pass_sound_enabled = _coerce_bool(self.pass_sound_enabled)
+        self.fail_sound_enabled = _coerce_bool(self.fail_sound_enabled)
+        self.sound_feedback_enabled = self.fail_sound_enabled
         data = {}
         for k, v in self.__dict__.items():
             if k.startswith("_"):
@@ -189,6 +212,25 @@ class ConfigManager:
     def get_step_class_names(self) -> List[str]:
         """返回有效步骤类别（非空）。"""
         return [c for c in self.category_names if c and c.strip()]
+
+    def get_first_category_region_classes(self) -> tuple[str, List[str]]:
+        """返回首类别区域检查的父类别和子类别。"""
+        names = [c.strip() for c in self.category_names if c and c.strip()]
+        if not names:
+            return "", []
+        return names[0], names[1:]
+
+    def _validate_first_category_region_config(self) -> None:
+        """校验首类别区域检查模式配置。"""
+        parent, children = self.get_first_category_region_classes()
+        if not parent:
+            raise ValueError("首类别区域检查已启用，但类别1为空")
+        if not children:
+            raise ValueError("首类别区域检查至少需要 1 个子类别")
+        if parent in children:
+            raise ValueError(f"父区域类别 '{parent}' 不能与子类别相同")
+        if len(set(children)) != len(children):
+            raise ValueError("首类别区域检查的子类别存在重复")
 
     def _validate_pcb_config(self) -> None:
         """校验 PCB 检查模式配置。"""

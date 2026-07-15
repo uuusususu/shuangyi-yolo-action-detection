@@ -19,9 +19,11 @@ class MvSdkDevice:
     sn: str
 
     def __str__(self) -> str:
+        parts = [self.friendly_name or f"相机 {self.index}"]
         if self.port_type:
-            return f"{self.friendly_name} ({self.port_type})"
-        return self.friendly_name
+            parts.append(self.port_type)
+        parts.append(f"SN: {self.sn or '缺失'}")
+        return " | ".join(parts)
 
 
 class MvSdkCamera:
@@ -38,6 +40,7 @@ class MvSdkCamera:
 
         self._mvsdk = get_mvsdk()
         self._dev: Optional[MvSdkDevice] = None
+        self._last_error = ""
 
         self._h_camera: int = 0
         self._cap = None
@@ -56,20 +59,36 @@ class MvSdkCamera:
         devices = []
         dev_list = mvsdk.CameraEnumerateDevice()
         for i, dev in enumerate(dev_list):
-            try:
-                friendly = str(dev.GetFriendlyName())
-            except Exception:
-                friendly = str(i)
-            try:
-                port = str(dev.GetPortType())
-            except Exception:
-                port = ""
-            try:
-                sn = str(dev.GetSn())
-            except Exception:
-                sn = ""
-            devices.append(MvSdkDevice(index=int(i), friendly_name=friendly, port_type=port, sn=sn))
+            devices.append(MvSdkCamera._device_from_sdk_info(dev, int(i)))
         return devices
+
+    @staticmethod
+    def _device_from_sdk_info(dev_info, index: int) -> MvSdkDevice:
+        try:
+            friendly = str(dev_info.GetFriendlyName())
+        except Exception:
+            friendly = str(index)
+        try:
+            port = str(dev_info.GetPortType())
+        except Exception:
+            port = ""
+        try:
+            sn = str(dev_info.GetSn())
+        except Exception:
+            sn = ""
+        return MvSdkDevice(
+            index=int(index),
+            friendly_name=friendly,
+            port_type=port,
+            sn=sn,
+        )
+
+    @staticmethod
+    def _format_sdk_error(prefix: str, exc: Exception) -> str:
+        error_code = getattr(exc, "error_code", None)
+        message = getattr(exc, "message", None) or str(exc)
+        code_text = f" (SDK 错误码 {error_code})" if error_code is not None else ""
+        return f"{prefix}{code_text}: {message}"
 
     @staticmethod
     def is_available() -> bool:
@@ -86,36 +105,80 @@ class MvSdkCamera:
     def device(self) -> Optional[MvSdkDevice]:
         return self._dev
 
-    def open(self, *, friendly_name: str, parameter_mode: str = "preserve", parameter_group: int = 0, parameter_file: str = "") -> bool:
+    @property
+    def last_error(self) -> str:
+        return self._last_error
+
+    def open(
+        self,
+        *,
+        sn: str = "",
+        friendly_name: str = "",
+        parameter_mode: str = "preserve",
+        parameter_group: int = 0,
+        parameter_file: str = "",
+    ) -> bool:
         mvsdk = self._mvsdk
+        self._last_error = ""
         if mvsdk is None:
+            self._last_error = get_mvsdk_load_error() or "迈德 MvSDK 不可用"
             return False
 
         self.close()
 
-        dev_list = mvsdk.CameraEnumerateDevice()
+        try:
+            dev_list = mvsdk.CameraEnumerateDevice()
+        except Exception as exc:
+            self._last_error = self._format_sdk_error("枚举迈德相机失败", exc)
+            return False
         if not dev_list:
+            self._last_error = "未发现在线迈德相机"
             return False
 
         dev_info = None
         dev_idx = 0
-        for i, dev in enumerate(dev_list):
-            try:
-                if str(dev.GetFriendlyName()) == str(friendly_name):
-                    dev_info = dev
-                    dev_idx = i
-                    break
-            except Exception:
-                continue
+        target_sn = str(sn or "").strip()
+        legacy_name = str(friendly_name or "").strip()
+        if target_sn:
+            for i, dev in enumerate(dev_list):
+                try:
+                    if str(dev.GetSn()).strip() == target_sn:
+                        dev_info = dev
+                        dev_idx = i
+                        break
+                except Exception:
+                    continue
+        elif legacy_name:
+            matches = []
+            for i, dev in enumerate(dev_list):
+                try:
+                    if str(dev.GetFriendlyName()).strip() == legacy_name:
+                        matches.append((i, dev))
+                except Exception:
+                    continue
+            if len(matches) == 1:
+                dev_idx, dev_info = matches[0]
+            elif len(matches) > 1:
+                self._last_error = f"相机名称不唯一，请按 SN 选择: {legacy_name}"
+                return False
+        else:
+            self._last_error = "未选择迈德相机，请先在配置页选择并保存"
+            return False
         if dev_info is None:
-            dev_info = dev_list[0]
-            dev_idx = 0
+            identity = f"SN {target_sn}" if target_sn else f"名称 {legacy_name}"
+            self._last_error = f"目标迈德相机不在线: {identity}"
+            return False
 
         try:
             h_camera = mvsdk.CameraInit(dev_info, -1, -1)
-        except Exception:
+        except Exception as exc:
+            identity = f"SN {target_sn}" if target_sn else f"名称 {legacy_name}"
+            self._last_error = self._format_sdk_error(
+                f"无法打开迈德相机 {identity}", exc
+            )
             return False
 
+        frame_buffer = 0
         try:
             cap = mvsdk.CameraGetCapability(h_camera)
 
@@ -153,40 +216,30 @@ class MvSdkCamera:
             frame_buffer_size = width_max * height_max * (1 if mono else 3)
             frame_buffer = mvsdk.CameraAlignMalloc(int(frame_buffer_size), 16)
 
-            try:
-                friendly = str(dev_info.GetFriendlyName())
-            except Exception:
-                friendly = str(dev_idx)
-            try:
-                port = str(dev_info.GetPortType())
-            except Exception:
-                port = ""
-            try:
-                sn = str(dev_info.GetSn())
-            except Exception:
-                sn = ""
-
             self._h_camera = int(h_camera)
             self._cap = cap
             self._mono = bool(mono)
             self._frame_buffer = int(frame_buffer)
             self._frame_buffer_size = int(frame_buffer_size)
-            self._dev = MvSdkDevice(index=int(dev_idx), friendly_name=friendly, port_type=port, sn=sn)
+            self._dev = self._device_from_sdk_info(dev_info, int(dev_idx))
 
             return True
-        except Exception:
+        except Exception as exc:
             try:
                 mvsdk.CameraUnInit(h_camera)
             except Exception:
                 pass
+            if frame_buffer:
+                try:
+                    mvsdk.CameraAlignFree(frame_buffer)
+                except Exception:
+                    pass
             self._h_camera = 0
+            self._last_error = self._format_sdk_error("初始化迈德相机采集失败", exc)
             return False
 
     def close(self) -> None:
         mvsdk = self._mvsdk
-        if mvsdk is None:
-            return
-
         with self._lock:
             h = int(self._h_camera)
             buf = int(self._frame_buffer)
@@ -196,6 +249,9 @@ class MvSdkCamera:
             self._frame_buffer = 0
             self._frame_buffer_size = 0
             self._dev = None
+
+        if mvsdk is None:
+            return
 
         if h > 0:
             try:

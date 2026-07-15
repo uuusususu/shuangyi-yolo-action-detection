@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QSizePolicy
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFrame,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QHBoxLayout,
+    QWidget,
+)
 
 from ui.runtime_ui_tokens import (
     BTN_DANGER_BG,
@@ -20,9 +29,11 @@ from ui.runtime_ui_tokens import (
     FONT_SECTION,
     FONT_SMALL,
     FONT_TITLE,
+    PAGE_BG,
     PANEL_BG,
     PANEL_BG_ALT,
     PANEL_BG_DARK,
+    PRIMARY_CONTROL_HEIGHT,
     STEP_ACTIVE_BG,
     STEP_ACTIVE_BORDER,
     STEP_ACTIVE_TEXT,
@@ -41,9 +52,13 @@ from ui.runtime_ui_tokens import (
     STROKE_MAIN,
     STROKE_SOFT,
     TEXT_ACCENT,
+    TEXT_MUTED,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
+    config_button_style,
+    config_nav_button_style,
     frame_style,
+    switch_checkbox_style,
     text_style,
 )
 
@@ -213,6 +228,119 @@ class ThumbnailTile(QFrame):
         layout.addWidget(self.status_badge)
 
 
+class ConfigNavButton(QPushButton):
+    """配置页左侧分区导航按钮。"""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(config_nav_button_style())
+
+
+class FormGroup(QFrame):
+    """带标题的配置表单分组。"""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(frame_style(PANEL_BG, border=STROKE_MAIN, radius=8))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 18, 18, 18)
+        outer.setSpacing(14)
+        self.title_label = QLabel(title, self)
+        self.title_label.setStyleSheet(text_style(TEXT_ACCENT, size=FONT_SECTION, weight=700))
+        outer.addWidget(self.title_label)
+        self._content = QWidget(self)
+        self._content.setObjectName("formGroupContent")
+        self._content.setStyleSheet("QWidget#formGroupContent { background: transparent; border: none; }")
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(12)
+        outer.addWidget(self._content)
+
+    @property
+    def content_layout(self) -> QVBoxLayout:
+        return self._content_layout
+
+
+class FormField(QWidget):
+    """可见标签、输入控件和可选帮助文字组成的字段。"""
+
+    def __init__(self, title: str, control: QWidget, helper: str = "", parent=None):
+        super().__init__(parent)
+        self.setObjectName("formField")
+        self.setStyleSheet("QWidget#formField { background: transparent; border: none; }")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.label = QLabel(title, self)
+        self.label.setStyleSheet(text_style(TEXT_SECONDARY, size=FONT_SMALL, weight=700))
+        layout.addWidget(self.label)
+        control.setParent(self)
+        layout.addWidget(control)
+        self.control = control
+        self.helper_label = QLabel(helper, self)
+        self.helper_label.setWordWrap(True)
+        self.helper_label.setStyleSheet(text_style(TEXT_MUTED, size=11, weight=500))
+        self.helper_label.setVisible(bool(helper))
+        layout.addWidget(self.helper_label)
+
+
+class SwitchRow(QFrame):
+    """标题、帮助文字和二元开关组成的设置行。"""
+
+    def __init__(self, title: str, helper: str, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            f"QFrame {{ background: transparent; border: none; border-bottom: 1px solid {STROKE_MAIN}; }}"
+        )
+        self.setMinimumHeight(60)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 8, 0, 8)
+        layout.setSpacing(16)
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(3)
+        self.title_label = QLabel(title, self)
+        self.title_label.setStyleSheet(text_style(TEXT_PRIMARY, size=FONT_BODY, weight=700))
+        self.helper_label = QLabel(helper, self)
+        self.helper_label.setWordWrap(True)
+        self.helper_label.setStyleSheet(text_style(TEXT_MUTED, size=FONT_SMALL, weight=500))
+        text_layout.addWidget(self.title_label)
+        text_layout.addWidget(self.helper_label)
+        layout.addLayout(text_layout, 1)
+        self.checkbox = QCheckBox(self)
+        self.checkbox.setAccessibleName(title)
+        self.checkbox.setStyleSheet(switch_checkbox_style())
+        layout.addWidget(self.checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
+
+
+class FooterActionBar(QFrame):
+    """配置页固定操作栏。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            f"QFrame {{ background-color: {PANEL_BG_DARK}; border: none; border-top: 1px solid {STROKE_MAIN}; }}"
+        )
+        self.setFixedHeight(68)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 10, 18, 10)
+        layout.setSpacing(10)
+        self.saved_label = QLabel("配置已保存", self)
+        self.saved_label.setStyleSheet(text_style(STEP_PASS_TEXT, size=FONT_SMALL, weight=700))
+        self.saved_label.setVisible(False)
+        self.cancel_button = QPushButton("返回检测", self)
+        self.cancel_button.setStyleSheet(config_button_style("secondary"))
+        self.save_button = QPushButton("验证并保存", self)
+        self.save_button.setStyleSheet(config_button_style("primary"))
+        layout.addWidget(self.saved_label)
+        layout.addStretch(1)
+        layout.addWidget(self.cancel_button)
+        layout.addWidget(self.save_button)
+
+
 # ---------------------------------------------------------------------------
 # 步骤检测卡片（运行时主界面核心控件）
 # ---------------------------------------------------------------------------
@@ -225,6 +353,77 @@ _STEP_STATE_STYLE = {
     "ng": (STEP_NG_BG, STEP_NG_BORDER, STEP_NG_TEXT, "NG", "请重新执行当前步骤"),
     "locked": (STEP_LOCKED_BG, STEP_LOCKED_BORDER, STEP_LOCKED_TEXT, "锁定", "等待纠正前置步骤"),
 }
+
+
+class RecognitionListItem(QFrame):
+    """紧凑识别进度项，显示顺序、类别、数量与语义状态。"""
+
+    def __init__(self, index: int, name: str, required_count: int = 1, parent=None):
+        super().__init__(parent)
+        self._index = index
+        self._state = "waiting"
+        self._required_count = max(1, int(required_count))
+        self.setObjectName("recognitionListItem")
+        self.setMinimumHeight(64)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 12, 8)
+        layout.setSpacing(12)
+
+        self._index_label = QLabel(f"{index:02d}", self)
+        self._index_label.setFixedSize(38, 38)
+        self._index_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._index_label)
+
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(2)
+        self._name_label = QLabel(name, self)
+        self._name_label.setStyleSheet(text_style(TEXT_PRIMARY, size=FONT_BODY, weight=700))
+        self._status_label = QLabel("等待", self)
+        self._status_label.setStyleSheet(text_style(TEXT_MUTED, size=FONT_SMALL, weight=600))
+        text_layout.addWidget(self._name_label)
+        text_layout.addWidget(self._status_label)
+        layout.addLayout(text_layout, 1)
+
+        self._quantity_label = QLabel(f"0 / {self._required_count}", self)
+        self._quantity_label.setMinimumWidth(70)
+        self._quantity_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._quantity_label)
+        self.set_step_state("waiting")
+
+    def set_step_state(self, state: str, *, hint: str | None = None) -> None:
+        bg, border, color, status_text, _default_hint = _STEP_STATE_STYLE.get(
+            state, _STEP_STATE_STYLE["waiting"]
+        )
+        self._state = state if state in _STEP_STATE_STYLE else "waiting"
+        self.setStyleSheet(
+            f"QFrame#recognitionListItem {{ background-color: {bg}; border: 1px solid {border}; border-radius: 8px; }}"
+        )
+        self._index_label.setStyleSheet(
+            f"background-color: {border}; color: {PAGE_BG}; border: none; border-radius: 7px; "
+            "font-size: 13px; font-weight: 800;"
+        )
+        self._name_label.setStyleSheet(text_style(TEXT_PRIMARY if state != "locked" else color, size=FONT_BODY, weight=700))
+        self._status_label.setText(hint if hint is not None else status_text)
+        self._status_label.setStyleSheet(text_style(color, size=FONT_SMALL, weight=700))
+        self._quantity_label.setStyleSheet(
+            f"background-color: {PANEL_BG_DARK}; border: 1px solid {border}; border-radius: 6px; "
+            f"color: {color}; font-size: {FONT_SMALL}px; font-weight: 800; padding: 5px 8px;"
+        )
+
+    def set_quantity_progress(self, current: int, required: int) -> None:
+        self._required_count = max(1, int(required))
+        self._quantity_label.setText(f"{max(0, int(current))} / {self._required_count}")
+
+    def quantity_text(self) -> str:
+        return self._quantity_label.text()
+
+    def status_text(self) -> str:
+        return self._status_label.text()
+
+    def state_name(self) -> str:
+        return self._state
 
 
 class StepCard(QFrame):
@@ -358,7 +557,7 @@ def main_button_style(variant: str = "primary") -> str:
         return (
             f"QPushButton {{ background-color: {BTN_PRIMARY_BG}; border: 2px solid {BTN_PRIMARY_BORDER}; "
             f"color: #FFFFFF; font-size: 16px; font-weight: 700; padding: 10px 16px; "
-            f"border-radius: 10px; min-height: 44px; }}"
+            f"border-radius: 10px; min-height: {PRIMARY_CONTROL_HEIGHT}px; }}"
             f"QPushButton:hover {{ background-color: {BTN_PRIMARY_HOVER}; border: 2px solid {BTN_PRIMARY_BORDER}; }}"
             f"QPushButton:disabled {{ background-color: #123258; border: 2px solid #1B3A5C; color: #4C78A6; }}"
         )
@@ -366,7 +565,7 @@ def main_button_style(variant: str = "primary") -> str:
         return (
             f"QPushButton {{ background-color: {BTN_DANGER_BG}; border: 2px solid {BTN_DANGER_BORDER}; "
             f"color: #FFFFFF; font-size: 16px; font-weight: 700; padding: 10px 16px; "
-            f"border-radius: 10px; min-height: 44px; }}"
+            f"border-radius: 10px; min-height: {PRIMARY_CONTROL_HEIGHT}px; }}"
             f"QPushButton:hover {{ background-color: #A82838; border: 2px solid {BTN_DANGER_BORDER}; }}"
             f"QPushButton:disabled {{ background-color: #2A1018; border: 2px solid #3A1C24; color: #4C78A6; }}"
         )
@@ -376,4 +575,23 @@ def main_button_style(variant: str = "primary") -> str:
         f"border-radius: 10px; min-height: 40px; }}"
         f"QPushButton:hover {{ background-color: {BTN_SECONDARY_HOVER}; border: 2px solid {BTN_SECONDARY_BORDER}; }}"
         f"QPushButton:disabled {{ background-color: #0E1C3F; border: 2px solid #1B2C45; color: #4C78A6; }}"
+    )
+
+
+def top_bar_button_style(variant: str = "secondary") -> str:
+    """顶栏紧凑按钮样式，与右下角主操作按钮分开。"""
+    if variant == "danger":
+        background = BTN_DANGER_BG
+        border = BTN_DANGER_BORDER
+        hover = "#A82838"
+    else:
+        background = BTN_SECONDARY_BG
+        border = BTN_SECONDARY_BORDER
+        hover = BTN_SECONDARY_HOVER
+    return (
+        f"QPushButton {{ background-color: {background}; border: 1px solid {border}; "
+        f"color: #FFFFFF; font-size: 14px; font-weight: 700; padding: 0 14px; "
+        "border-radius: 8px; }}"
+        f"QPushButton:hover {{ background-color: {hover}; border-color: {TEXT_ACCENT}; }}"
+        f"QPushButton:pressed {{ background-color: {PANEL_BG_DARK}; }}"
     )

@@ -18,6 +18,7 @@
   ],
   "camera_index": 0,
   "mvsdk_friendly_name": "",
+  "mvsdk_camera_sn": "",
   "action_pass_stable_frames": 1,
   "action_ng_stable_frames": 2,
   "action_order_constraint_enabled": true,

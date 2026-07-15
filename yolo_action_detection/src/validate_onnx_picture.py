@@ -14,8 +14,96 @@ from typing import Callable, Dict, Optional, Type
 import cv2
 import numpy as np
 
+from config import ConfigManager
+from pcb_inspection.engine import MultiPcbInspectionEngine
+from pcb_inspection.models import PcbInspectionConfig, PcbResult
 from yolo_runtime.onnx_obb_processor import OnnxObbProcessor
-from yolo_runtime.yolo_result_models import DetectionOverlayState
+from yolo_runtime.yolo_result_models import DetectionOverlayState, ObbDetection
+
+
+def evaluate_first_category_region(
+    detections: list[ObbDetection],
+    image_size: tuple[int, int],
+    config,
+    frame_repetitions: Optional[int] = None,
+) -> Dict[str, object]:
+    """用生产区域引擎验证父类优先、区域内子类别数量和最终结果。"""
+    if not getattr(config, "first_category_region_check_enabled", False):
+        return {
+            "ok": False,
+            "status": "disabled",
+            "error": "首类别区域检查未启用",
+            "parents": [],
+        }
+
+    region_config = PcbInspectionConfig.from_first_category_config(config)
+    repetitions = frame_repetitions
+    if repetitions is None:
+        repetitions = max(region_config.pass_stable_frames, region_config.fail_stable_frames)
+    repetitions = max(1, int(repetitions))
+
+    engine = MultiPcbInspectionEngine(region_config)
+    events = []
+    for _ in range(repetitions):
+        events.extend(engine.update(detections, image_size=image_size))
+
+    parents = []
+    for track_id in sorted(engine.current_parent_ids):
+        state = engine.pcb_states[track_id]
+        parents.append({
+            "track_id": track_id,
+            "status": state.status.value,
+            "result": state.result.value,
+            "completed_classes": sorted(state.completed_classes),
+            "observed_counts": {
+                name: slot.observed_count
+                for name, slot in state.last_slot_states.items()
+            },
+            "required_counts": {
+                name: slot.required_count
+                for name, slot in state.last_slot_states.items()
+            },
+            "slot_statuses": {
+                name: slot.status.value
+                for name, slot in state.last_slot_states.items()
+            },
+        })
+
+    if not parents:
+        status = "no_parent"
+    elif any(parent["result"] == PcbResult.FAIL.value for parent in parents):
+        status = "ng"
+    elif all(parent["result"] == PcbResult.PASS.value for parent in parents):
+        status = "pass"
+    else:
+        status = "waiting"
+
+    errors = {
+        "pass": "",
+        "no_parent": f"未识别到父类: {region_config.pcb_class_name}",
+        "ng": "父类区域内子类别数量异常",
+        "waiting": "父类已识别，但子步骤尚未全部完成",
+    }
+
+    return {
+        "ok": status == "pass",
+        "status": status,
+        "error": errors[status],
+        "parent_class": region_config.pcb_class_name,
+        "child_required_counts": dict(region_config.component_required_counts),
+        "parent_detection_count": len(parents),
+        "frame_repetitions": repetitions,
+        "parents": parents,
+        "events": [
+            {
+                "track_id": result.track_id,
+                "result": result.result.value,
+                "observed_counts": dict(result.observed_counts),
+                "required_counts": dict(result.required_counts),
+            }
+            for result in events
+        ],
+    }
 
 
 def run_validation(
@@ -25,6 +113,8 @@ def run_validation(
     conf_threshold: float = 0.3,
     iou_threshold: float = 0.5,
     processor_factory: Optional[Type[OnnxObbProcessor] | Callable[..., object]] = None,
+    region_config_path: Optional[Path | str] = None,
+    region_frame_repetitions: Optional[int] = None,
 ) -> Dict[str, object]:
     """Run ONNX OBB inference on one image and write summary + annotated image."""
     image_path = Path(image_path)
@@ -89,6 +179,20 @@ def run_validation(
         "detection_count": len(overlay.detections),
         "detections": [det.to_dict() for det in overlay.detections],
     }
+    if region_config_path is not None:
+        region_config = ConfigManager()
+        region_config.load(region_config_path)
+        region_summary = evaluate_first_category_region(
+            overlay.detections,
+            image_size=(int(frame.shape[1]), int(frame.shape[0])),
+            config=region_config,
+            frame_repetitions=region_frame_repetitions,
+        )
+        summary["first_category_region"] = region_summary
+        if not region_summary["ok"]:
+            summary["ok"] = False
+            if not summary["error"]:
+                summary["error"] = region_summary["error"]
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -166,6 +270,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--conf", type=float, default=0.3, help="Confidence threshold.")
     parser.add_argument("--iou", type=float, default=0.5, help="Rotated NMS IoU threshold.")
+    parser.add_argument(
+        "--region-config",
+        help="启用首类别区域业务验证时使用的配置 JSON。",
+    )
+    parser.add_argument(
+        "--region-frames",
+        type=int,
+        help="静态检测结果重复送入区域引擎的帧数；默认使用 PASS/FAIL 稳定帧最大值。",
+    )
     return parser.parse_args()
 
 
@@ -177,6 +290,8 @@ def main() -> int:
         output_dir=args.output_dir,
         conf_threshold=args.conf,
         iou_threshold=args.iou,
+        region_config_path=args.region_config,
+        region_frame_repetitions=args.region_frames,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary.get("ok") else 2

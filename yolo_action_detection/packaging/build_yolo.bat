@@ -9,6 +9,7 @@ set "REPO_DIR=%CD%"
 popd
 
 set "PYINSTALLER=%REPO_DIR%\.venv\Scripts\pyinstaller.exe"
+set "PYTHON=%REPO_DIR%\.venv\Scripts\python.exe"
 set "DIST_DIR=%APP_DIR%\dist\YOLOActionDetection"
 
 if not exist "%PYINSTALLER%" (
@@ -52,8 +53,12 @@ if not exist "%DIST_DIR%\config" mkdir "%DIST_DIR%\config"
 if not exist "%DIST_DIR%\python_demo" mkdir "%DIST_DIR%\python_demo"
 if not exist "%DIST_DIR%\assets\sounds" mkdir "%DIST_DIR%\assets\sounds"
 
-copy /Y "%APP_DIR%\config\config.json" "%DIST_DIR%\config.json" >nul
-copy /Y "%APP_DIR%\config\best.onnx" "%DIST_DIR%\config\best.onnx" >nul
+copy /Y "%APP_DIR%\config\*.onnx" "%DIST_DIR%\config\" >nul
+"%PYTHON%" "%APP_DIR%\packaging\prepare_portable_config.py" "%APP_DIR%\config\config.json" "%DIST_DIR%\config.json" "%DIST_DIR%\config"
+if errorlevel 1 (
+  popd
+  exit /b 1
+)
 copy /Y "%APP_DIR%\assets\sounds\Pass.wav" "%DIST_DIR%\assets\sounds\Pass.wav" >nul
 copy /Y "%APP_DIR%\assets\sounds\Fail.wav" "%DIST_DIR%\assets\sounds\Fail.wav" >nul
 copy /Y "%APP_DIR%\python_demo\mvsdk.py" "%DIST_DIR%\python_demo\mvsdk.py" >nul

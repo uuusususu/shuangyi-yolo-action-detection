@@ -1,8 +1,4 @@
-"""YOLO OBB 动作检测主界面（科技风双栏布局）。
-
-左侧实时检测主窗口，右侧业务面板：KPI 行 + 大尺寸步骤检测区 + 核心操作区。
-步骤卡片按配置有效步骤动态生成，NG 锁步可视化，按钮状态与真实运行态同步。
-"""
+"""YOLO OBB 动作检测主界面。"""
 from __future__ import annotations
 
 import time
@@ -29,19 +25,22 @@ from detection_logging.coordinate_logger import (
 from detection_logging.audio_feedback import SoundFeedback
 from detection_logging.fail_evidence import FailEvidenceContext, FailEvidenceSaver
 from detection_logging.production_stats import ProductionStatsManager
-from pcb_inspection.models import PcbInspectionConfig, PcbResult
+from pcb_inspection.models import PcbInspectionConfig, PcbResult, PcbStatus, SlotStatus
 from pcb_inspection.engine import MultiPcbInspectionEngine
 from step_sequence.step_sequence_engine import StepSequenceEngine, RoundResult, StepStatus
 from ui.runtime_ui_tokens import (
     FONT_TITLE,
+    FONT_SMALL,
     PAGE_BG,
     PAGE_MARGIN,
     PANEL_BG,
     PANEL_BG_DARK,
     STROKE_MAIN,
     TEXT_ACCENT,
+    TEXT_DANGER,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
+    TOP_BAR_HEIGHT,
     VIEWPORT_BG,
     frame_style,
     scroll_area_style,
@@ -49,8 +48,9 @@ from ui.runtime_ui_tokens import (
 )
 from ui.widgets.native_panels import (
     KpiRow,
-    StepCard,
+    RecognitionListItem,
     main_button_style,
+    top_bar_button_style,
 )
 from yolo_runtime.yolo_result_models import DetectionOverlayState, ObbDetection
 
@@ -91,6 +91,9 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(f"QMainWindow {{ background-color: {PAGE_BG}; }}")
 
         self.worker = CameraWorker(config, state)
+        self._camera_devices = []
+        self._camera_enumeration_error = ""
+        self._refresh_camera_devices()
         self._display_timer = QTimer(self)
         self._display_timer.timeout.connect(self._update_display)
 
@@ -99,17 +102,22 @@ class MainWindow(QMainWindow):
         # 计数去重键：同一轮同一结果只计一次
         self._last_counted_pass_round = -1
         self._last_counted_ng_key: Optional[tuple] = None
+        self._played_result_sound_keys: dict[tuple, None] = {}
+        self._handled_region_result_keys: dict[tuple, None] = {}
         self._round_start_time = 0.0
-        # PCB 多板检查引擎（按需创建）
+        # 区域/PCB 检查引擎（按需创建）
         self._pcb_engine: Optional[MultiPcbInspectionEngine] = None
+        self._pcb_overlay_parent_class = ""
+        self._pcb_overlay_child_classes: List[str] = []
+        self._latest_runtime_overlay = DetectionOverlayState()
         self._init_pcb_engine()
-        # PASS 文案展示定时器；只负责清理 UI 文案，不阻塞下一轮检测。
+        # 下一轮启动定时器：完成一轮后保持当前步骤框颜色，到间隔结束再开始新一轮。
         self._round_pass_timer = QTimer(self)
         self._round_pass_timer.setSingleShot(True)
         self._round_pass_timer.timeout.connect(self._on_round_pass_settled)
 
-        # 步骤卡片缓存：index -> StepCard
-        self._step_cards: List[StepCard] = []
+        # 保留 _step_cards 名称以兼容现有状态映射和测试，实际控件为紧凑识别项。
+        self._step_cards: List[RecognitionListItem] = []
         self._steps_hint: Optional[QLabel] = None
         self._sticky_ng_step_idx = -1
         self._last_step_focus_key: Optional[tuple] = None
@@ -125,7 +133,10 @@ class MainWindow(QMainWindow):
             else Path("outputs") / "evidence"
         )
         self._sound_feedback = sound_feedback or SoundFeedback(
-            enabled=getattr(config, "sound_feedback_enabled", True),
+            enabled=(
+                bool(getattr(config, "pass_sound_enabled", False))
+                or bool(getattr(config, "fail_sound_enabled", True))
+            ),
             resource_dir=resource_dir,
         )
         self._fail_evidence_saver = fail_evidence_saver or FailEvidenceSaver(
@@ -148,12 +159,18 @@ class MainWindow(QMainWindow):
         self._sync_button_states()
 
     def _init_pcb_engine(self) -> None:
-        """根据配置创建或销毁 PCB 检查引擎。"""
-        if getattr(self.config, "pcb_inspection_enabled", False):
-            pcb_config = PcbInspectionConfig.from_config(self.config)
+        """根据配置创建或销毁区域/PCB 检查引擎。"""
+        self._played_result_sound_keys.clear()
+        self._handled_region_result_keys.clear()
+        if getattr(self.config, "first_category_region_check_enabled", False):
+            pcb_config = PcbInspectionConfig.from_first_category_config(self.config)
             self._pcb_engine = MultiPcbInspectionEngine(pcb_config)
+            self._pcb_overlay_parent_class = pcb_config.pcb_class_name
+            self._pcb_overlay_child_classes = [n for n in pcb_config.component_class_names if n]
         else:
             self._pcb_engine = None
+            self._pcb_overlay_parent_class = ""
+            self._pcb_overlay_child_classes = []
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -176,46 +193,51 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(12)
 
         # 顶部标题栏
-        header = QFrame()
-        header.setStyleSheet(frame_style(PANEL_BG_DARK, border=STROKE_MAIN, radius=10))
-        header.setFixedHeight(52)
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(16, 6, 16, 6)
-        self._title_label = QLabel("双翼科技视觉行为引导系统")
-        self._title_label.setFont(QFont("Microsoft YaHei UI", FONT_TITLE, QFont.Bold))
-        self._title_label.setStyleSheet(text_style(TEXT_PRIMARY, size=FONT_TITLE, weight=800))
+        self._header = QFrame()
+        self._header.setStyleSheet(frame_style(PANEL_BG_DARK, border=STROKE_MAIN, radius=10))
+        self._header.setFixedHeight(TOP_BAR_HEIGHT)
+        self._header_layout = QGridLayout(self._header)
+        self._header_layout.setContentsMargins(16, 6, 16, 6)
+        self._header_layout.setHorizontalSpacing(0)
+        self._header_layout.setColumnStretch(0, 1)
+        self._header_layout.setColumnStretch(2, 1)
+
+        self._title_label = QLabel("双翼科技AI系统")
+        self._title_label.setFixedSize(280, 42)
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title_label.setStyleSheet(
+            f"background-color: #0B2343; border: 1px solid {TEXT_ACCENT}; border-radius: 7px; "
+            f"color: {TEXT_PRIMARY}; font-size: 20px; font-weight: 700;"
+        )
         self._status_label = QLabel("READY")
         self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+        self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._result_label = QLabel("")
         self._result_label.setFont(QFont("Microsoft YaHei UI", 14, QFont.Bold))
-        self._result_label.setMinimumWidth(80)
+        self._result_label.setMinimumWidth(64)
         self._result_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._result_label.setVisible(False)
         self._btn_config = QPushButton("配置")
-        self._btn_config.setFixedHeight(34)
-        self._btn_config.setMinimumWidth(86)
-        self._btn_config.setStyleSheet(
-            f"QPushButton {{ background-color: #19345F; border: 1px solid {STROKE_MAIN}; "
-            f"color: {TEXT_PRIMARY}; font-size: 14px; font-weight: 700; padding: 4px 12px; "
-            f"border-radius: 8px; }}"
-            f"QPushButton:hover {{ background-color: #21416E; border: 1px solid #35D7FF; }}"
-        )
+        self._btn_config.setFixedSize(72, 36)
+        self._btn_config.setStyleSheet(top_bar_button_style("secondary"))
         self._btn_close = QPushButton("关闭")
-        self._btn_close.setFixedHeight(34)
-        self._btn_close.setMinimumWidth(86)
-        self._btn_close.setStyleSheet(
-            "QPushButton { background-color: #8E2230; border: 1px solid #FF6A75; "
-            "color: #FFFFFF; font-size: 14px; font-weight: 700; padding: 4px 12px; "
-            "border-radius: 8px; }"
-            "QPushButton:hover { background-color: #A82838; border: 1px solid #FF8A92; }"
-        )
-        header_layout.addWidget(self._title_label)
-        header_layout.addStretch(1)
-        header_layout.addWidget(self._status_label)
-        header_layout.addWidget(self._result_label)
-        header_layout.addWidget(self._btn_config)
-        header_layout.addWidget(self._btn_close)
-        main_layout.addWidget(header)
+        self._btn_close.setFixedSize(72, 36)
+        self._btn_close.setStyleSheet(top_bar_button_style("danger"))
+
+        actions = QWidget(self._header)
+        actions.setObjectName("topBarActions")
+        actions.setStyleSheet("QWidget#topBarActions { background: transparent; border: none; }")
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(10)
+        actions_layout.addWidget(self._status_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        actions_layout.addWidget(self._result_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        actions_layout.addWidget(self._btn_config, 0, Qt.AlignmentFlag.AlignVCenter)
+        actions_layout.addWidget(self._btn_close, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._header_layout.addWidget(self._title_label, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        self._header_layout.addWidget(actions, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        main_layout.addWidget(self._header)
 
         # 中部双栏：左实时画面 + 右业务面板
         mid_layout = QHBoxLayout()
@@ -248,22 +270,45 @@ class MainWindow(QMainWindow):
         self._kpi_row = KpiRow()
         right_layout.addWidget(self._kpi_row)
 
-        # 右中：步骤检测区（滚动）
+        # 右中：紧凑识别进度列表
+        steps_head = QHBoxLayout()
         steps_title = QLabel("步骤检测")
         steps_title.setStyleSheet(text_style(TEXT_ACCENT, size=15, weight=700))
-        right_layout.addWidget(steps_title)
+        self._recognized_count_label = QLabel("0 / 0")
+        self._recognized_count_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._recognized_count_label.setStyleSheet(text_style(TEXT_SECONDARY, size=FONT_SMALL, weight=700))
+        steps_head.addWidget(steps_title)
+        steps_head.addStretch(1)
+        steps_head.addWidget(self._recognized_count_label)
+        right_layout.addLayout(steps_head)
 
         self._steps_scroll = QScrollArea()
         self._steps_scroll.setWidgetResizable(True)
-        self._steps_scroll.setStyleSheet(scroll_area_style())
+        self._steps_scroll.setMinimumHeight(280)
+        self._steps_scroll.setStyleSheet(
+            scroll_area_style()
+            + f"QScrollArea {{ background-color: #081A34; border: 1px solid {TEXT_ACCENT}; border-radius: 8px; }}"
+        )
         self._steps_container = QWidget()
-        self._steps_container.setStyleSheet("background: transparent;")
+        self._steps_container.setObjectName("recognitionListContainer")
+        self._steps_container.setStyleSheet(
+            "QWidget#recognitionListContainer { background: transparent; border: none; }"
+        )
         self._steps_layout = QVBoxLayout(self._steps_container)
-        self._steps_layout.setContentsMargins(0, 0, 4, 0)
-        self._steps_layout.setSpacing(10)
+        self._steps_layout.setContentsMargins(10, 10, 10, 10)
+        self._steps_layout.setSpacing(8)
         self._steps_layout.addStretch(1)
         self._steps_scroll.setWidget(self._steps_container)
         right_layout.addWidget(self._steps_scroll, 1)
+
+        self._notice_label = QLabel("")
+        self._notice_label.setWordWrap(True)
+        self._notice_label.setVisible(False)
+        self._notice_label.setStyleSheet(
+            f"background-color: #321521; border: 1px solid {TEXT_DANGER}; border-radius: 8px; "
+            "color: #FFD8DC; font-size: 13px; font-weight: 600; padding: 10px 12px;"
+        )
+        right_layout.addWidget(self._notice_label)
 
         # 右下：核心操作区
         ctrl_layout = QGridLayout()
@@ -298,7 +343,7 @@ class MainWindow(QMainWindow):
         self._btn_close.clicked.connect(self._on_close_clicked)
 
     # ------------------------------------------------------------------
-    # 动态步骤卡片
+    # 动态识别进度项
     # ------------------------------------------------------------------
     def _effective_step_names(self) -> List[str]:
         """配置中的有效（非空）步骤名称，保留顺序。"""
@@ -306,7 +351,7 @@ class MainWindow(QMainWindow):
         return [n.strip() for n in names if n and n.strip()]
 
     def _refresh_steps(self) -> None:
-        """根据配置有效步骤重建步骤卡片。"""
+        """根据配置有效步骤重建识别进度项。"""
         # 清空旧卡片
         for card in self._step_cards:
             card.setParent(None)
@@ -319,8 +364,12 @@ class MainWindow(QMainWindow):
             self._steps_hint = None
 
         names = self._effective_step_names()
+        counts = getattr(self.config, "category_counts", []) or []
         for i, name in enumerate(names):
-            card = StepCard(i + 1, name)
+            engine_idx = self._card_to_engine_index(i)
+            required = counts[engine_idx] if 0 <= engine_idx < len(counts) else 1
+            card = RecognitionListItem(i + 1, name, required_count=required)
+            card.setVisible(False)
             self._step_cards.append(card)
             # 插在 stretch 之前
             self._steps_layout.insertWidget(self._steps_layout.count() - 1, card)
@@ -330,8 +379,12 @@ class MainWindow(QMainWindow):
             hint = QLabel("未配置有效步骤，请进入配置页设置步骤类别")
             hint.setStyleSheet(text_style(TEXT_SECONDARY, size=13, weight=500))
             hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            hint.setWordWrap(True)
+            hint.setMinimumHeight(180)
             self._steps_layout.insertWidget(self._steps_layout.count() - 1, hint)
             self._steps_hint = hint
+
+        self._recognized_count_label.setText(f"0 / {len(self._step_cards)}")
 
         self._update_step_display(self.step_engine.get_state() if self.step_engine else None)
         self._last_step_focus_key = None
@@ -345,7 +398,9 @@ class MainWindow(QMainWindow):
         frame = self.worker.get_latest_preview_frame()
         if frame is None:
             return
-        overlay = self.worker.get_latest_overlay()
+        overlay = self._latest_runtime_overlay
+        if not getattr(overlay, "detections", None):
+            overlay = self.worker.get_latest_overlay()
         if self._overlay_is_fresh(overlay):
             frame = self._draw_overlay(frame, overlay)
         self._show_frame(frame)
@@ -384,18 +439,18 @@ class MainWindow(QMainWindow):
 
         frame = self._draw_tip_and_holes(frame, overlay)
 
-        # PCB 模式：在画面上绘制 PCB ID、元器件归属标注和连续 FAIL 帧
+        # 首类别区域检查：在画面上绘制父区域 ID、子控件归属标注和连续 FAIL 帧
         if self._pcb_engine is not None:
             frame = self._draw_pcb_overlay(frame, overlay)
 
         return frame
 
     def _draw_pcb_overlay(self, frame: np.ndarray, overlay) -> np.ndarray:
-        """在画面上绘制 PCB ID、已识别元器件、连续 FAIL 帧和最终结果。"""
+        """在画面上绘制父区域 ID、已识别子控件、连续 FAIL 帧和最终结果。"""
         if not self._pcb_engine:
             return frame
-        pcb_class = getattr(self.config, "pcb_class_name", "pcb")
-        comp_names = [n for n in getattr(self.config, "pcb_component_class_names", []) if n]
+        pcb_class = self._pcb_overlay_parent_class or getattr(self.config, "pcb_class_name", "pcb")
+        comp_names = list(self._pcb_overlay_child_classes)
 
         # 找到画面中的 PCB 检测
         for det in overlay.detections:
@@ -418,8 +473,11 @@ class MainWindow(QMainWindow):
             else:
                 color = (255, 200, 0) # 橙色
 
-            # PCB ID
-            cv2.putText(frame, f"PCB #{tid}", (cx - 40, label_y),
+            parent_points = np.array(det.polygon, dtype=np.int32)
+            cv2.polylines(frame, [parent_points], True, color, 3)
+
+            # 父区域 ID
+            cv2.putText(frame, f"区域 #{tid}", (cx - 40, label_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
             # 结果标签
@@ -428,7 +486,7 @@ class MainWindow(QMainWindow):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             elif state.result.value == "fail":
                 missing = "/".join(state.missing_classes[:3])
-                cv2.putText(frame, f"NG 缺:{missing}", (cx - 60, label_y + 20),
+                cv2.putText(frame, f"NG 数量:{missing}", (cx - 60, label_y + 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             else:
                 # 显示连续 FAIL 帧数和已识别槽位
@@ -439,17 +497,6 @@ class MainWindow(QMainWindow):
                 cv2.putText(frame, f"{identified}/{total} FAIL:{state.consecutive_fail}",
                             (cx - 50, label_y + 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-            # 在每个已识别元器件旁标注其所属 PCB ID
-            for comp_name in comp_names:
-                for cd in overlay.detections:
-                    if cd.label != comp_name:
-                        continue
-                    # 简单标注：在元器件旁边写上 PCB ID
-                    comp_cx = int(cd.center[0])
-                    comp_cy = int(cd.center[1])
-                    cv2.putText(frame, f"#{tid}", (comp_cx + 15, comp_cy),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
         return frame
 
@@ -531,7 +578,7 @@ class MainWindow(QMainWindow):
     # 步骤状态 → 卡片状态映射
     # ------------------------------------------------------------------
     def _update_step_display(self, state) -> None:
-        """根据步骤引擎状态更新步骤卡片与 KPI。"""
+        """根据步骤引擎状态更新识别进度项与 KPI。"""
         if not self._step_cards:
             return
 
@@ -543,6 +590,7 @@ class MainWindow(QMainWindow):
 
         current_idx = state.current_step_index if state else -1
 
+        recognized_count = 0
         for card_i, card in enumerate(self._step_cards):
             # card_i 对应有效步骤序号；引擎 steps 可能比卡片多（含空步骤），
             # 需要把卡片序号映射到引擎 steps 中的对应索引。
@@ -567,19 +615,28 @@ class MainWindow(QMainWindow):
             else:
                 card.set_step_state("waiting")
 
-            # 显示数量进度
+            # 显示当前帧数量进度，不跨帧累计。
             if state is not None and 0 <= engine_idx < len(state.steps):
                 ss = state.steps[engine_idx]
-                if ss.required_count > 1 and step_state == StepStatus.WAITING:
-                    card.set_quantity_progress(ss.current_count, ss.required_count)
+                card.set_quantity_progress(ss.current_count, ss.required_count)
+                should_show = (
+                    ss.current_count > 0
+                    or step_state == StepStatus.PASS
+                    or engine_idx == ng_step_idx
+                )
+                card.setVisible(should_show)
+                recognized_count += int(should_show)
+
+        self._sync_recognition_empty_state(recognized_count)
 
         # KPI 与结果标签
         if state is not None:
             if state.round_result == RoundResult.PASS:
+                self._set_notice("")
                 if state.round_id != self._last_counted_pass_round:
                     self._last_counted_pass_round = state.round_id
                     self._stats_manager.record_pass()
-                    self._play_pass_feedback()
+                    self._play_pass_feedback(("action", state.round_id, "pass"))
                     ct = ""
                     if self._round_start_time > 0:
                         ct = f"{(time.time() - self._round_start_time):.1f}s"
@@ -592,6 +649,7 @@ class MainWindow(QMainWindow):
                 self._set_result_label("PASS", "#4CAF50")
                 self._update_kpi()
             elif state.round_result == RoundResult.ACTION_NG:
+                self._set_notice("检测到顺序异常，请按配置顺序重新执行当前步骤。")
                 ng_key = (state.round_id, state.action_ng_step)
                 if ng_key != self._last_counted_ng_key:
                     self._last_counted_ng_key = ng_key
@@ -608,47 +666,83 @@ class MainWindow(QMainWindow):
 
         self._sync_step_focus_scroll(state)
 
+    def _sync_recognition_empty_state(self, recognized_count: int) -> None:
+        if self._steps_hint is not None:
+            self._steps_hint.setVisible(not self._step_cards)
+        self._recognized_count_label.setText(f"{recognized_count} / {len(self._step_cards)}")
+
+    def _set_notice(self, text: str) -> None:
+        self._notice_label.setText(text)
+        self._notice_label.setVisible(bool(text))
+
     def _start_next_round_after_pass(self) -> None:
         if not self.step_engine:
             return
-        self.step_engine.start_round()
-        self._round_start_time = time.time()
-        self._last_counted_ng_key = None
-        self._sticky_ng_step_idx = -1
-        self._last_step_focus_key = None
-        self._round_pass_timer.start(2000)
-        state = self.step_engine.get_state()
-        self._update_step_display(state)
-        self._sync_step_focus_scroll(state, reason="pass-next-round", force=True)
+        interval_ms = int(max(0.0, float(getattr(self.config, "round_cooldown_seconds", 0.0))) * 1000)
+        self._round_pass_timer.start(interval_ms)
 
     def _start_next_round_after_ng(self) -> None:
         if not self.step_engine:
             return
-        self._round_pass_timer.stop()
-        self.step_engine.start_round(require_first_step_rearm=True)
+        interval_ms = int(max(0.0, float(getattr(self.config, "round_cooldown_seconds", 0.0))) * 1000)
+        self._round_pass_timer.start(interval_ms)
+        return
+
+    def _start_new_round_now(self) -> None:
+        if not self.step_engine:
+            return
+        require_rearm = bool(self._last_counted_ng_key is not None)
+        self.step_engine.start_round(require_first_step_rearm=require_rearm)
         self._round_start_time = time.time()
         self._last_counted_pass_round = -1
         self._last_counted_ng_key = None
         self._sticky_ng_step_idx = -1
         self._last_step_focus_key = None
+        self._set_notice("")
         state = self.step_engine.get_state()
         self._update_step_display(state)
         self._sync_step_focus_scroll(state, reason="ng-next-round", force=True)
 
-    def _play_pass_feedback(self) -> None:
-        if not getattr(self.config, "sound_feedback_enabled", True):
+    @staticmethod
+    def _remember_result_key(cache: dict[tuple, None], key: tuple) -> bool:
+        """登记有界结果键；返回该键是否首次出现。"""
+        if key in cache:
+            return False
+        cache[key] = None
+        if len(cache) > 2048:
+            cache.pop(next(iter(cache)))
+        return True
+
+    def _play_pass_feedback(self, result_key: Optional[tuple] = None) -> None:
+        if result_key is not None and not self._remember_result_key(
+            self._played_result_sound_keys,
+            result_key,
+        ):
+            return
+        if not getattr(self.config, "pass_sound_enabled", False):
             return
         try:
             self._sound_feedback.play_pass()
         except Exception:
             pass
 
+    def _play_fail_feedback(self, result_key: Optional[tuple] = None) -> None:
+        if result_key is not None and not self._remember_result_key(
+            self._played_result_sound_keys,
+            result_key,
+        ):
+            return
+        if not getattr(self.config, "fail_sound_enabled", True):
+            return
+        try:
+            self._sound_feedback.play_fail()
+        except Exception:
+            pass
+
     def _handle_action_ng_feedback(self, state) -> None:
-        if getattr(self.config, "sound_feedback_enabled", True):
-            try:
-                self._sound_feedback.play_fail()
-            except Exception:
-                pass
+        self._play_fail_feedback(
+            ("action", int(getattr(state, "round_id", 0)), "fail")
+        )
         if getattr(self.config, "fail_evidence_enabled", True):
             self._save_fail_evidence(state)
 
@@ -673,21 +767,30 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _handle_pcb_ng_feedback(self, result, frame_id: int) -> None:
+    def _handle_pcb_ng_feedback(
+        self,
+        result,
+        frame_id: int,
+        *,
+        save_evidence: bool = True,
+    ) -> None:
         """PCB FAIL 时播放声音和保存证据。"""
-        if getattr(self.config, "sound_feedback_enabled", True):
-            try:
-                self._sound_feedback.play_fail()
-            except Exception:
-                pass
-        if getattr(self.config, "fail_evidence_enabled", True):
+        self._play_fail_feedback(
+            (
+                "region",
+                int(result.track_id),
+                int(getattr(result, "attempt_id", 0)),
+                "fail",
+            )
+        )
+        if save_evidence and getattr(self.config, "fail_evidence_enabled", True):
             try:
                 frame, _ = self._get_feedback_frame()
                 data = self._last_overlay_data or {}
                 context = FailEvidenceContext(
                     round_id=int(result.track_id),
                     action_ng_step=-1,
-                    step_name=f"PCB #{result.track_id} 缺: {'/'.join(result.missing_classes)}",
+                    step_name=f"区域 #{result.track_id} 数量异常: {'/'.join(result.missing_classes)}",
                     source_frame_id=int(frame_id),
                     detections=list(data.get("detections", []) or []),
                     model_path=str(data.get("model_path", "")),
@@ -696,6 +799,106 @@ class MainWindow(QMainWindow):
                 self._fail_evidence_saver.save_fail_event(frame, context)
             except Exception:
                 pass
+
+    def _sync_region_step_cards(self, result) -> None:
+        """首类别区域检查结果同步到右侧步骤卡片，并在间隔期保持颜色。"""
+        if not getattr(self.config, "first_category_region_check_enabled", False):
+            return
+        missing = set(getattr(result, "missing_classes", []) or [])
+        child_names = set(self._pcb_overlay_child_classes)
+        observed_counts = dict(getattr(result, "observed_counts", {}) or {})
+        required_counts = dict(getattr(result, "required_counts", {}) or {})
+        recognized_count = 1 if self._step_cards else 0
+        for index, card in enumerate(self._step_cards):
+            if index == 0:
+                card.setVisible(True)
+                card.set_quantity_progress(1, 1)
+                if result.result == PcbResult.PASS:
+                    card.set_step_state("pass", hint=f"区域 #{result.track_id} 检查通过")
+                else:
+                    card.set_step_state("ng", hint=f"区域 #{result.track_id} 子控件数量不符")
+                continue
+            name = card._name_label.text() if hasattr(card, "_name_label") else ""
+            current = observed_counts.get(name, 0)
+            required = required_counts.get(name, 1)
+            should_show = current > 0 or name in missing
+            card.setVisible(should_show)
+            card.set_quantity_progress(current, required)
+            recognized_count += int(should_show)
+            if name in child_names and name not in missing:
+                card.set_step_state("pass", hint="已识别")
+            elif name in missing:
+                card.set_step_state("ng", hint="数量不符")
+            else:
+                card.set_step_state("waiting")
+        self._sync_recognition_empty_state(recognized_count)
+
+    def _sync_region_observation_cards(self) -> None:
+        """显示当前轮次父类的步骤，不把历史观测或旧 FAIL ID 混进来。"""
+        if self._pcb_engine is None:
+            return
+        current_id = self._pcb_engine.current_round_id
+        if current_id is None:
+            self._clear_region_step_cards()
+            return
+        state = self._pcb_engine.pcb_states.get(current_id)
+        if state is None or state.status == PcbStatus.RETIRED:
+            self._clear_region_step_cards()
+            return
+        if current_id not in self._pcb_engine.current_parent_ids:
+            self._clear_region_step_cards()
+            return
+
+        recognized_count = 1 if self._step_cards else 0
+        for index, card in enumerate(self._step_cards):
+            if index == 0:
+                card.setVisible(True)
+                if state.result == PcbResult.FAIL:
+                    card.set_step_state("ng", hint=f"区域 #{state.track_id} 数量异常")
+                elif state.result == PcbResult.PASS:
+                    card.set_step_state("pass", hint=f"区域 #{state.track_id} 检查通过")
+                elif state.status == PcbStatus.COOLDOWN:
+                    card.set_step_state("active", hint=f"区域 #{state.track_id} 等待下一轮间隔")
+                else:
+                    card.set_step_state("active", hint=f"区域 #{state.track_id} 检查中")
+                card.set_quantity_progress(1, 1)
+                continue
+            name = card._name_label.text() if hasattr(card, "_name_label") else ""
+            slot = state.last_slot_states.get(name)
+            if slot is None:
+                card.setVisible(False)
+                card.set_step_state("waiting")
+                continue
+            should_show = (
+                slot.observed_count > 0
+                or slot.present
+                or slot.status in (SlotStatus.MISMATCHING, SlotStatus.NG_LATCHED, SlotStatus.COMPLETED)
+                or name in state.missing_classes
+            )
+            card.setVisible(should_show)
+            card.set_quantity_progress(slot.observed_count, slot.required_count)
+            recognized_count += int(should_show)
+            if slot.status == SlotStatus.COMPLETED:
+                card.set_step_state("pass", hint="数量匹配")
+            elif slot.status == SlotStatus.NG_LATCHED or (name in state.missing_classes and state.result == PcbResult.FAIL):
+                card.set_step_state("ng", hint="数量不符")
+            elif slot.status == SlotStatus.MATCHING:
+                card.set_step_state("active", hint="数量匹配中")
+            elif slot.status == SlotStatus.MISMATCHING or slot.observed_count > 0:
+                card.set_step_state("active", hint="数量不符")
+            else:
+                card.set_step_state("waiting")
+        self._sync_recognition_empty_state(recognized_count)
+
+    def _clear_region_step_cards(self) -> None:
+        counts = getattr(self.config, "category_counts", []) or []
+        for index, card in enumerate(self._step_cards):
+            engine_index = self._card_to_engine_index(index)
+            required = counts[engine_index] if 0 <= engine_index < len(counts) else 1
+            card.set_quantity_progress(0, required)
+            card.set_step_state("waiting")
+            card.setVisible(False)
+        self._sync_recognition_empty_state(0)
 
     def _get_feedback_frame(self):
         try:
@@ -780,11 +983,11 @@ class MainWindow(QMainWindow):
         self._kpi_row.set_value("ng", str(batch.ng))
 
     def _on_round_pass_settled(self) -> None:
-        """PASS 文案展示结束；不改变步骤状态机。"""
-        if self._result_label.text() == "PASS":
-            self._clear_result_label()
-            self._status_label.setText("检测中")
-            self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+        """完成一轮间隔结束后再启动新一轮。"""
+        self._clear_result_label()
+        self._status_label.setText("检测中")
+        self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+        self._start_new_round_now()
 
     def _set_result_label(self, text: str, color: str) -> None:
         """显示顶部 PASS/NG 结果，避免无结果时保留空白占位。"""
@@ -811,11 +1014,9 @@ class MainWindow(QMainWindow):
         self._btn_detect.setVisible(True)
         self._btn_detect.setEnabled(infer_on or can_detect)
         if not can_detect and not infer_on:
-            if not cam_on:
-                self._status_label.setText("请先打开相机")
-            elif self.processor is None:
+            if cam_on and self.processor is None:
                 self._status_label.setText("处理器未加载")
-            self._status_label.setStyleSheet(text_style(TEXT_SECONDARY, size=14, weight=500))
+                self._status_label.setStyleSheet(text_style(TEXT_SECONDARY, size=14, weight=500))
 
     # ------------------------------------------------------------------
     # 信号槽
@@ -828,6 +1029,7 @@ class MainWindow(QMainWindow):
     def _on_error(self, msg: str) -> None:
         self._status_label.setText(f"错误: {msg}")
         self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+        self._set_notice(msg)
 
     @Slot(dict)
     def _on_overlay_updated(self, data: dict) -> None:
@@ -847,10 +1049,14 @@ class MainWindow(QMainWindow):
 
         state = None
         if self._pcb_engine is not None:
-            # PCB 多板检查模式
+            # 首类别区域检查模式
             image_size = data.get("image_size")
             pcb_results = self._pcb_engine.update(obb_dets, image_size=image_size)
+            obb_dets = self._pcb_engine.last_resolved_detections
+            self._last_overlay_data["detections"] = [detection.to_dict() for detection in obb_dets]
             self._handle_pcb_results(pcb_results, data.get("source_frame_id", 0))
+            if not pcb_results:
+                self._sync_region_observation_cards()
         elif self.step_engine:
             try:
                 state = self.step_engine.update(obb_dets, frame_id=data.get("source_frame_id", 0))
@@ -869,24 +1075,62 @@ class MainWindow(QMainWindow):
             round_id=data.get("round_id", 0),
             latency_ms=data.get("latency_ms", 0.0),
         )
+        self._latest_runtime_overlay = overlay
         self._record_coordinate_log(overlay, state)
         self._update_display()
 
     def _handle_pcb_results(self, results: list, frame_id: int) -> None:
         """处理 PCB 检查结果，接入声音/证据/统计。"""
         for result in results:
+            result_key = (
+                "region-result",
+                int(result.track_id),
+                int(getattr(result, "attempt_id", 0)),
+                result.result.value,
+            )
+            is_new_result = self._remember_result_key(
+                self._handled_region_result_keys,
+                result_key,
+            )
             if result.result == PcbResult.PASS:
-                self._stats_manager.record_pass()
-                self._play_pass_feedback()
+                if is_new_result:
+                    self._stats_manager.record_pass()
+                self._play_pass_feedback(
+                    (
+                        "region",
+                        int(result.track_id),
+                        int(getattr(result, "attempt_id", 0)),
+                        "pass",
+                    )
+                )
                 self._set_result_label("PASS", "#4CAF50")
-                self._status_label.setText(f"PCB #{result.track_id} PASS")
+                self._status_label.setText(f"区域 #{result.track_id} PASS")
+                self._sync_region_step_cards(result)
+                self._set_notice("")
             elif result.result == PcbResult.FAIL:
-                self._stats_manager.record_ng()
-                self._handle_pcb_ng_feedback(result, frame_id)
+                is_new_fail_signature = bool(
+                    getattr(result, "is_new_fail_signature", False)
+                )
+                should_report_fail = is_new_result and is_new_fail_signature
+                if should_report_fail:
+                    self._stats_manager.record_ng()
+                self._handle_pcb_ng_feedback(
+                    result,
+                    frame_id,
+                    save_evidence=should_report_fail,
+                )
                 self._set_result_label("NG", "#F44336")
                 self._status_label.setText(
-                    f"PCB #{result.track_id} NG 缺: {'/'.join(result.missing_classes)}"
+                    f"区域 #{result.track_id} NG 数量异常: {'/'.join(result.missing_classes)}"
                 )
+                self._sync_region_step_cards(result)
+                self._set_notice(f"区域检查数量异常：{' / '.join(result.missing_classes)}")
+            if (
+                self._pcb_engine is not None
+                and self._pcb_engine.current_round_id is not None
+                and self._pcb_engine.current_round_id != result.track_id
+            ):
+                self._sync_region_observation_cards()
             self._update_kpi()
 
     @Slot(dict)
@@ -922,11 +1166,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_toggle_camera(self) -> None:
         if self.state.camera_on:
-            # 关闭前先停止检测
-            if self.state.inference_on:
-                self.worker.stop_inference()
-            self.worker.close_camera()
-            self._display_timer.stop()
+            self._close_camera_session()
             self._status_label.setText("READY")
             self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
         else:
@@ -982,11 +1222,36 @@ class MainWindow(QMainWindow):
             self._config_page.back_clicked.connect(self._on_config_back)
             self._config_page.stats_changed.connect(self._on_stats_changed)
             self._config_page.config_saved.connect(self._on_config_saved)
+            self._config_page.camera_refresh_requested.connect(
+                self._on_camera_refresh_requested
+            )
             self._stacked.addWidget(self._config_page)
+        self._config_page.set_camera_devices(
+            self._camera_devices,
+            self._camera_enumeration_error,
+        )
         self._config_page.refresh_stats_display()
         self._stacked.setCurrentWidget(self._config_page)
         self._status_label.setText("配置页")
         self._status_label.setStyleSheet("color: #9C27B0; font-weight: bold;")
+
+    def _refresh_camera_devices(self) -> None:
+        """Refresh the in-memory MvSDK device catalog without changing cameras."""
+        try:
+            self._camera_devices = list(self.worker.enumerate_devices())
+            self._camera_enumeration_error = ""
+        except Exception as exc:
+            self._camera_devices = []
+            self._camera_enumeration_error = str(exc)
+
+    @Slot()
+    def _on_camera_refresh_requested(self) -> None:
+        self._refresh_camera_devices()
+        if self._config_page is not None:
+            self._config_page.set_camera_devices(
+                self._camera_devices,
+                self._camera_enumeration_error,
+            )
 
     def _on_config_back(self) -> None:
         """从配置页返回主界面：刷新动态步骤卡片和 PCB 引擎。"""
@@ -1007,6 +1272,7 @@ class MainWindow(QMainWindow):
 
     def _on_config_saved(self) -> None:
         """配置页保存后立即应用运行时配置。"""
+        camera_switch_result = self._apply_camera_selection()
         self._apply_feedback_config()
         model_ok = self._apply_runtime_model_config()
         self._rebuild_step_engine()
@@ -1016,13 +1282,71 @@ class MainWindow(QMainWindow):
         if not model_ok:
             self._status_label.setText(self._last_model_reload_error or "模型加载失败")
             self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
-        elif not self.state.inference_on:
+        elif camera_switch_result is None and not self.state.inference_on:
             self._status_label.setText("配置已应用")
             self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
 
+    def _apply_camera_selection(self) -> Optional[bool]:
+        """Apply a saved SN change only when a camera session is currently open."""
+        active_device = self.worker.active_device
+        if not self.state.camera_on or active_device is None:
+            return None
+
+        active_sn = str(active_device.sn or "").strip()
+        target_sn = str(getattr(self.config, "mvsdk_camera_sn", "") or "").strip()
+        if target_sn == active_sn:
+            return None
+
+        if self.state.inference_on:
+            self.worker.stop_inference()
+        self._close_camera_session()
+
+        if self.worker.open_camera():
+            self._display_timer.start(33)
+            self._status_label.setText("预览中")
+            self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+            return True
+
+        self._status_label.setText(f"相机切换失败（SN: {target_sn}）")
+        self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+        return False
+
+    def _close_camera_session(self, *, clear_visuals: bool = True) -> None:
+        """Stop detection and camera threads before releasing the SDK session."""
+        if self.state.inference_on:
+            self.worker.stop_inference()
+        self._display_timer.stop()
+        self._round_pass_timer.stop()
+        if self._coordinate_logger.active:
+            self._coordinate_logger.stop_session()
+        self.worker.close_camera()
+        if clear_visuals:
+            self._clear_camera_session_visuals()
+
+    def _clear_camera_session_visuals(self) -> None:
+        """Remove all camera-specific frames, overlays, results, and trackers."""
+        self._video_label.clear()
+        self._latest_runtime_overlay = DetectionOverlayState()
+        self._last_overlay_data = {}
+        self._last_pipeline_stats = {}
+        self._last_camera_params = {}
+        self._last_counted_pass_round = -1
+        self._last_counted_ng_key = None
+        self._round_start_time = 0.0
+        self._sticky_ng_step_idx = -1
+        self._last_step_focus_key = None
+        self._clear_result_label()
+        self._set_notice("")
+        self._rebuild_step_engine()
+        self._init_pcb_engine()
+        self._refresh_steps()
+
     def _apply_feedback_config(self) -> None:
         """同步保存后可立即生效的反馈配置。"""
-        self._sound_feedback.enabled = bool(getattr(self.config, "sound_feedback_enabled", True))
+        self._sound_feedback.enabled = (
+            bool(getattr(self.config, "pass_sound_enabled", False))
+            or bool(getattr(self.config, "fail_sound_enabled", True))
+        )
         self._fail_evidence_saver.enabled = bool(getattr(self.config, "fail_evidence_enabled", True))
 
     @staticmethod
@@ -1106,9 +1430,5 @@ class MainWindow(QMainWindow):
         self.close()
 
     def closeEvent(self, event) -> None:
-        self._display_timer.stop()
-        self._round_pass_timer.stop()
-        if self._coordinate_logger.active:
-            self._coordinate_logger.stop_session()
-        self.worker.close_camera()
+        self._close_camera_session(clear_visuals=False)
         event.accept()

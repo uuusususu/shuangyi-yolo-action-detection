@@ -4,27 +4,27 @@ from __future__ import annotations
 
 FONT_FAMILY = "Microsoft YaHei UI"
 
-PAGE_BG = "#0B1636"
-PANEL_BG = "#101F43"
-PANEL_BG_DARK = "#09132A"
-PANEL_BG_MID = "#102247"
-PANEL_BG_SOFT = "#11244C"
-PANEL_BG_ALT = "#122A56"
-INPUT_BG = "#19345F"
-CHIP_BG = "#17345E"
-HEADER_BG = "#12386F"
-TRACK_BG = "#164B7A"
-VIEWPORT_BG = "#0A1228"
+PAGE_BG = "#071226"
+PANEL_BG = "#0D1D39"
+PANEL_BG_DARK = "#09172F"
+PANEL_BG_MID = "#11284C"
+PANEL_BG_SOFT = "#10213F"
+PANEL_BG_ALT = "#102442"
+INPUT_BG = "#08162D"
+CHIP_BG = "#102442"
+HEADER_BG = "#0B1B35"
+TRACK_BG = "#17385F"
+VIEWPORT_BG = "#050D1B"
 
-STROKE_MAIN = "#2876D9"
-STROKE_SOFT = "#2E6DC2"
-STROKE_MUTED = "#274C77"
+STROKE_MAIN = "#24558A"
+STROKE_SOFT = "#315A82"
+STROKE_MUTED = "#263C58"
 
-TEXT_PRIMARY = "#D7F8FF"
-TEXT_SECONDARY = "#8FEFFF"
-TEXT_ACCENT = "#73F2FF"
-TEXT_MUTED = "#4C78A6"
-TEXT_SUCCESS = "#ACFFC6"
+TEXT_PRIMARY = "#EDF6FF"
+TEXT_SECONDARY = "#A9C0DA"
+TEXT_ACCENT = "#35D7FF"
+TEXT_MUTED = "#87A2C2"
+TEXT_SUCCESS = "#7CE9BE"
 TEXT_WARNING = "#FFD34D"
 TEXT_DANGER = "#FF6A75"
 
@@ -50,20 +50,23 @@ STEP_LOCKED_BORDER = "#1B2C45"
 STEP_LOCKED_TEXT = "#3A5575"
 
 # 主按钮状态色
-BTN_PRIMARY_BG = "#1668C9"
-BTN_PRIMARY_BORDER = "#4FA3F5"
-BTN_PRIMARY_HOVER = "#1B79E6"
+BTN_PRIMARY_BG = "#1764B8"
+BTN_PRIMARY_BORDER = "#2C7BD2"
+BTN_PRIMARY_HOVER = "#1C72C9"
 BTN_SECONDARY_BG = "#19345F"
 BTN_SECONDARY_BORDER = "#2E6DC2"
 BTN_SECONDARY_HOVER = "#21416E"
 BTN_DANGER_BG = "#8E2230"
 BTN_DANGER_BORDER = "#FF6A75"
 
-PAGE_MARGIN = 20
-PAGE_SPACING = 16
+PAGE_MARGIN = 14
+PAGE_SPACING = 12
 CARD_PADDING = 16
-CARD_SPACING = 12
-CARD_RADIUS = 12
+CARD_SPACING = 10
+CARD_RADIUS = 8
+CONFIG_NAV_WIDTH = 230
+TOP_BAR_HEIGHT = 56
+PRIMARY_CONTROL_HEIGHT = 52
 
 FONT_TITLE = 18
 FONT_SECTION = 16
@@ -74,9 +77,9 @@ FONT_METRIC = 26
 FONT_METRIC_LARGE = 42
 FONT_TAG = 14
 
-MIN_BUTTON_HEIGHT = 34
-TAG_BUTTON_HEIGHT = 34
-ROW_HEIGHT = 42
+MIN_BUTTON_HEIGHT = 40
+TAG_BUTTON_HEIGHT = 40
+ROW_HEIGHT = 44
 TABLE_ROW_HEIGHT = 36
 
 DEFAULT_WINDOW_WIDTH = 1366
@@ -184,7 +187,7 @@ def group_box_style() -> str:
         "QGroupBox { "
         f"background-color: {PANEL_BG}; "
         f"border: 1px solid {STROKE_MAIN}; "
-        "border-radius: 10px; "
+        "border-radius: 8px; "
         "margin-top: 18px; "
         "padding: 14px 12px 12px 12px; "
         f"color: {TEXT_PRIMARY}; "
@@ -220,10 +223,10 @@ def input_style() -> str:
         f"font-family: '{FONT_FAMILY}'; "
         f"font-size: {FONT_BODY}px; "
         "padding: 6px 8px; "
-        "min-height: 30px; "
+        "min-height: 38px; "
         "}"
         "QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { "
-        f"border: 1px solid {TEXT_ACCENT}; "
+        f"border: 2px solid {TEXT_ACCENT}; "
         "}"
         "QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled { "
         f"background-color: {PANEL_BG_DARK}; "
@@ -271,7 +274,7 @@ def config_button_style(variant: str = "primary") -> str:
             border=BTN_PRIMARY_BORDER,
             color="#FFFFFF",
             font_size=FONT_BODY,
-            min_height=36,
+            min_height=40,
             padding="7px 14px",
             radius=8,
             disabled_background="#123258",
@@ -283,7 +286,7 @@ def config_button_style(variant: str = "primary") -> str:
             border=BTN_DANGER_BORDER,
             color="#FFFFFF",
             font_size=FONT_BODY,
-            min_height=36,
+            min_height=40,
             padding="7px 14px",
             radius=8,
             disabled_background="#2A1018",
@@ -294,9 +297,32 @@ def config_button_style(variant: str = "primary") -> str:
         border=BTN_SECONDARY_BORDER,
         color=TEXT_PRIMARY,
         font_size=FONT_BODY,
-        min_height=36,
+        min_height=40,
         padding="7px 14px",
         radius=8,
         disabled_background=PANEL_BG_DARK,
         disabled_border=STEP_LOCKED_BORDER,
+    )
+
+
+def config_nav_button_style() -> str:
+    return (
+        "QPushButton { "
+        "background: transparent; border: 1px solid transparent; border-radius: 7px; "
+        f"color: {TEXT_MUTED}; font-size: {FONT_BODY}px; font-weight: 600; "
+        "text-align: left; padding: 10px 12px; min-height: 40px; "
+        "}"
+        f"QPushButton:hover {{ background-color: {PANEL_BG_SOFT}; color: {TEXT_PRIMARY}; }}"
+        f"QPushButton:checked {{ background-color: {PANEL_BG_MID}; border-color: {STROKE_MAIN}; "
+        f"color: {TEXT_ACCENT}; }}"
+    )
+
+
+def switch_checkbox_style() -> str:
+    return (
+        "QCheckBox { spacing: 0; background: transparent; }"
+        "QCheckBox::indicator { width: 44px; height: 24px; border-radius: 12px; }"
+        f"QCheckBox::indicator:unchecked {{ background-color: {STROKE_MUTED}; border: 1px solid {STROKE_SOFT}; }}"
+        f"QCheckBox::indicator:checked {{ background-color: {BTN_PRIMARY_BG}; border: 1px solid {TEXT_ACCENT}; }}"
+        f"QCheckBox::indicator:disabled {{ background-color: {PANEL_BG_DARK}; border: 1px solid {STROKE_MUTED}; }}"
     )

@@ -103,6 +103,18 @@ def create_yolo_processor(config: ConfigManager, app_base_dir: Path | str | None
     return processor
 
 
+def create_step_engine(config: ConfigManager) -> StepSequenceEngine:
+    """按当前配置创建步骤引擎。"""
+    return StepSequenceEngine(
+        step_class_names=config.category_names,
+        step_counts=getattr(config, "category_counts", None),
+        enter_stable_frames=config.action_pass_stable_frames,
+        out_of_order_frames=config.action_ng_stable_frames,
+        leave_stable_frames=config.action_leave_stable_frames,
+        order_constraint_enabled=config.action_order_constraint_enabled,
+    )
+
+
 def _resolve_portable_sound(kind: str, app_base_dir: Path, resource_dir: Path) -> Path:
     resource_sound = resolve_sound_file(kind, resource_dir=resource_dir)
     if resource_sound.exists():
@@ -230,13 +242,7 @@ def main():
         processor = None
 
     # 创建步骤引擎
-    step_engine = StepSequenceEngine(
-        step_class_names=config.category_names,
-        enter_stable_frames=config.action_pass_stable_frames,
-        out_of_order_frames=config.action_ng_stable_frames,
-        leave_stable_frames=config.action_leave_stable_frames,
-        order_constraint_enabled=config.action_order_constraint_enabled,
-    )
+    step_engine = create_step_engine(config)
 
     window = MainWindow(
         config,

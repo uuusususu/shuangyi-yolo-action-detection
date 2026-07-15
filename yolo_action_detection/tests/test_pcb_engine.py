@@ -54,15 +54,16 @@ def test_first_frame_pass():
     assert results[0].track_id == 1
 
 
-def test_consecutive_fail():
-    """连续三帧缺件 -> 第三帧 FAIL。"""
+def test_consecutive_nonzero_quantity_mismatch_fails():
+    """连续三帧出现非零错误数量 -> 第三帧 FAIL。"""
     eng = MultiPcbInspectionEngine(_config(fail_stable=3))
     dets = [
         _make_pcb_det(1, 100, 100, 200, 200),
         _make_comp_det("R1", 120, 120),
         _make_comp_det("C2", 160, 120),
         _make_comp_det("U3", 120, 160),
-        # 缺 Q4
+        _make_comp_det("Q4", 160, 160),
+        _make_comp_det("Q4", 180, 160),
     ]
     # 前两帧不应 FAIL
     r1 = eng.update(dets, image_size=(1000, 1000))
@@ -94,8 +95,8 @@ def test_third_frame_recovers_pass():
     assert r3[0].result == PcbResult.PASS
 
 
-def test_no_pcb_id_no_judgment():
-    """PCB 没有 track_id -> 不判定。"""
+def test_no_pcb_id_is_assigned_and_judged():
+    """ONNX 不提供 track_id 时，父区域仍应获得临时身份并完成判定。"""
     eng = MultiPcbInspectionEngine(_config())
     # PCB 检测没有 track_id
     dets = [
@@ -110,7 +111,107 @@ def test_no_pcb_id_no_judgment():
         _make_comp_det("Q4", 160, 160),
     ]
     results = eng.update(dets, image_size=(1000, 1000))
-    assert len(results) == 0
+    assert len(results) == 1
+    assert results[0].result == PcbResult.PASS
+    assert results[0].track_id < 0
+    assert eng.update(dets, image_size=(1000, 1000)) == []
+    assert eng.last_resolved_detections[0].track_id == results[0].track_id
+
+
+def test_untracked_parent_keeps_identity_across_fail_frames():
+    """无原生 ID 的同一父区域应跨帧保持身份，支持连续 FAIL 判定。"""
+    eng = MultiPcbInspectionEngine(_config(fail_stable=3))
+
+    for x in (100, 103):
+        assert eng.update(
+            [
+                _make_pcb_det(None, x, 100, 200, 200),
+                _make_comp_det("R1", x + 20, 120),
+                _make_comp_det("R1", x + 50, 120),
+            ],
+            image_size=(1000, 1000),
+        ) == []
+
+    results = eng.update(
+        [
+            _make_pcb_det(None, 101, 100, 200, 200),
+            _make_comp_det("R1", 121, 120),
+            _make_comp_det("R1", 151, 120),
+        ],
+        image_size=(1000, 1000),
+    )
+
+    assert len(results) == 1
+    assert results[0].result == PcbResult.FAIL
+    assert len(eng.pcb_states) == 1
+
+
+def test_two_untracked_parents_are_judged_independently():
+    """同一帧多个无原生 ID 父目标应分别分配身份和统计。"""
+    eng = MultiPcbInspectionEngine(_config())
+    detections = [
+        _make_pcb_det(None, 50, 50, 200, 200),
+        _make_pcb_det(None, 500, 50, 200, 200),
+        _make_comp_det("R1", 70, 70),
+        _make_comp_det("C2", 110, 70),
+        _make_comp_det("U3", 70, 110),
+        _make_comp_det("Q4", 110, 110),
+        _make_comp_det("R1", 520, 70),
+        _make_comp_det("C2", 560, 70),
+        _make_comp_det("U3", 520, 110),
+        _make_comp_det("Q4", 560, 110),
+    ]
+
+    results = eng.update(detections, image_size=(1000, 1000))
+
+    assert len(results) == 2
+    assert {result.result for result in results} == {PcbResult.PASS}
+    assert len({result.track_id for result in results}) == 2
+    assert all(result.track_id < 0 for result in results)
+
+
+def test_untracked_parent_gets_new_identity_after_leaving_view():
+    """父目标连续离场后再进入，应开启新生命周期而不是永久复用旧结果。"""
+    eng = MultiPcbInspectionEngine(_config())
+    complete = [
+        _make_pcb_det(None, 100, 100, 200, 200),
+        _make_comp_det("R1", 120, 120),
+        _make_comp_det("C2", 160, 120),
+        _make_comp_det("U3", 120, 160),
+        _make_comp_det("Q4", 160, 160),
+    ]
+    first = eng.update(complete, image_size=(1000, 1000))
+    assert len(first) == 1
+
+    for _ in range(16):
+        assert eng.update([], image_size=(1000, 1000)) == []
+
+    second = eng.update(complete, image_size=(1000, 1000))
+
+    assert len(second) == 1
+    assert second[0].track_id != first[0].track_id
+
+
+def test_reused_native_track_id_gets_new_business_identity_after_retirement():
+    """上游复用原生 ID 时，新父类生命周期仍必须获得新业务 ID。"""
+    eng = MultiPcbInspectionEngine(_config())
+    complete = [
+        _make_pcb_det(7, 100, 100, 200, 200),
+        _make_comp_det("R1", 120, 120),
+        _make_comp_det("C2", 160, 120),
+        _make_comp_det("U3", 120, 160),
+        _make_comp_det("Q4", 160, 160),
+    ]
+    first = eng.update(complete, image_size=(1000, 1000))
+    assert len(first) == 1
+
+    for _ in range(16):
+        assert eng.update([], image_size=(1000, 1000)) == []
+
+    second = eng.update(complete, image_size=(1000, 1000))
+
+    assert len(second) == 1
+    assert second[0].track_id != first[0].track_id
 
 
 def test_decided_pcb_not_recounted():
@@ -134,7 +235,7 @@ def test_decided_pcb_not_recounted():
 
 
 def test_two_pcb_parallel_update():
-    """两块 PCB 同时在画面，一块 PASS 一块缺件。"""
+    """两块 PCB 同时在画面，一块 PASS 一块数量异常。"""
     eng = MultiPcbInspectionEngine(_config(fail_stable=3))
     dets = [
         _make_pcb_det(1, 50, 50, 200, 200),
@@ -144,8 +245,9 @@ def test_two_pcb_parallel_update():
         _make_comp_det("C2", 110, 70),
         _make_comp_det("U3", 70, 110),
         _make_comp_det("Q4", 110, 110),
-        # PCB2 缺 Q4
+        # PCB2 的 R1 数量异常，其他未出现类别仍保持等待
         _make_comp_det("R1", 520, 70),
+        _make_comp_det("R1", 550, 70),
         _make_comp_det("C2", 560, 70),
         _make_comp_det("U3", 520, 110),
     ]
@@ -154,7 +256,7 @@ def test_two_pcb_parallel_update():
     pass_results = [x for x in r if x.result == PcbResult.PASS]
     assert len(pass_results) == 1
     assert pass_results[0].track_id == 1
-    # PCB2 未决策（仅 1 帧缺件）
+    # PCB2 未决策（仅 1 帧数量异常）
     assert eng.pcb_states[2].consecutive_fail == 1
     assert eng.pcb_states[2].status == PcbStatus.OBSERVING
 
