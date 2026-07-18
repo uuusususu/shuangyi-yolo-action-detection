@@ -14,6 +14,7 @@ from detection_logging.audio_feedback import resolve_sound_file
 from yolo_runtime.onnx_obb_processor import OnnxObbProcessor
 from step_sequence.step_sequence_engine import StepSequenceEngine
 from ui.main_window import MainWindow
+from ui.theme import THEME_ID, apply_application_theme, require_theme_module
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,13 @@ def run_portable_smoke_check(
     except Exception as exc:
         emit(f"[portable-smoke] mvsdk=error: {exc}")
 
+    try:
+        require_theme_module()
+        emit(f"[portable-smoke] theme={THEME_ID}")
+    except RuntimeError as exc:
+        emit(f"[portable-smoke] theme unavailable: {exc}")
+        return finish(5)
+
     emit("[portable-smoke] ok")
     return finish(0)
 
@@ -218,6 +226,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("YOLO OBB 动作检测系统")
     app.setOrganizationName("WingTech")
+    apply_application_theme(app)
 
     # 加载配置
     config = ConfigManager()

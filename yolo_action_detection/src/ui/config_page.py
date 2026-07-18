@@ -18,8 +18,6 @@ from ui.runtime_ui_tokens import (
     TEXT_MUTED,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
-    config_button_style,
-    input_style,
     scroll_area_style,
     text_style,
 )
@@ -54,6 +52,7 @@ class ConfigPage(QWidget):
         self.refresh_stats_display()
 
     def _build_ui(self) -> None:
+        self.setObjectName("configPage")
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -68,11 +67,6 @@ class ConfigPage(QWidget):
         side_layout.setSpacing(8)
         self._sidebar_back_btn = QPushButton("返回检测")
         self._sidebar_back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._sidebar_back_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none; color: {TEXT_MUTED}; "
-            "font-size: 13px; text-align: left; min-height: 36px; padding: 0; }}"
-            f"QPushButton:hover {{ color: {TEXT_ACCENT}; }}"
-        )
         self._sidebar_back_btn.clicked.connect(self.back_clicked.emit)
         side_layout.addWidget(self._sidebar_back_btn)
         brand = QLabel("系统配置")
@@ -97,6 +91,7 @@ class ConfigPage(QWidget):
         root.addWidget(sidebar)
 
         content = QWidget(self)
+        content.setObjectName("configPageContent")
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
@@ -144,11 +139,20 @@ class ConfigPage(QWidget):
         content_layout.addWidget(self._footer)
         root.addWidget(content, 1)
 
+        self._apply_control_metrics()
         self.setStyleSheet(
-            f"QWidget {{ background-color: {PAGE_BG}; color: {TEXT_PRIMARY}; }}"
-            + input_style()
+            f"QWidget#configPage, QWidget#configPageContent {{ "
+            f"background-color: {PAGE_BG}; color: {TEXT_PRIMARY}; }}"
         )
         self._show_section(0)
+
+    def _apply_control_metrics(self) -> None:
+        """Keep production-friendly hit sizes while the theme owns drawing."""
+        for control_type in (QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox):
+            for control in self.findChildren(control_type):
+                control.setMinimumHeight(40)
+        for button in self.findChildren(QPushButton):
+            button.setMinimumHeight(40)
 
     def _create_section_page(self):
         scroll = QScrollArea(self._section_stack)
@@ -165,11 +169,20 @@ class ConfigPage(QWidget):
         self._section_stack.addWidget(scroll)
         return page, layout
 
+    @staticmethod
+    def _transparent_container(parent=None) -> QWidget:
+        container = QWidget(parent)
+        container.setObjectName("layoutContainer")
+        container.setStyleSheet(
+            "QWidget#layoutContainer { background: transparent; border: none; }"
+        )
+        return container
+
     def _insert_group(self, layout: QVBoxLayout, group: FormGroup) -> None:
         layout.insertWidget(layout.count() - 1, group)
 
     def _add_form_grid(self, group: FormGroup, fields, columns: int = 2) -> None:
-        container = QWidget(group)
+        container = self._transparent_container(group)
         grid = QGridLayout(container)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(18)
@@ -198,9 +211,8 @@ class ConfigPage(QWidget):
         self._model_path_input = QLineEdit()
         self._select_model_btn = QPushButton("浏览")
         self._select_model_btn.setMinimumWidth(84)
-        self._select_model_btn.setStyleSheet(config_button_style("secondary"))
         self._select_model_btn.clicked.connect(self._on_select_model)
-        path_row = QWidget()
+        path_row = self._transparent_container()
         path_layout = QHBoxLayout(path_row)
         path_layout.setContentsMargins(0, 0, 0, 0)
         path_layout.setSpacing(8)
@@ -225,7 +237,7 @@ class ConfigPage(QWidget):
         self._insert_group(layout, model_group)
 
         steps_group = FormGroup("类别步骤与数量")
-        steps_container = QWidget(steps_group)
+        steps_container = self._transparent_container(steps_group)
         steps_grid = QGridLayout(steps_container)
         steps_grid.setContentsMargins(0, 0, 0, 0)
         steps_grid.setHorizontalSpacing(10)
@@ -266,14 +278,13 @@ class ConfigPage(QWidget):
 
     def _build_camera_section(self, layout: QVBoxLayout) -> None:
         group = FormGroup("工业相机参数")
-        device_row = QWidget(group)
+        device_row = self._transparent_container(group)
         device_layout = QHBoxLayout(device_row)
         device_layout.setContentsMargins(0, 0, 0, 0)
         device_layout.setSpacing(10)
         self._camera_device_input = QComboBox(device_row)
         self._camera_device_input.setMinimumWidth(360)
         self._camera_refresh_btn = QPushButton("刷新设备", device_row)
-        self._camera_refresh_btn.setStyleSheet(config_button_style("secondary"))
         self._camera_refresh_btn.clicked.connect(self.camera_refresh_requested.emit)
         device_layout.addWidget(self._camera_device_input, 1)
         device_layout.addWidget(self._camera_refresh_btn)
@@ -421,7 +432,7 @@ class ConfigPage(QWidget):
 
     def _build_stats_section(self, layout: QVBoxLayout) -> None:
         self._stats_group = FormGroup("生产统计")
-        stats_row = QWidget(self._stats_group)
+        stats_row = self._transparent_container(self._stats_group)
         stats_grid = QGridLayout(stats_row)
         stats_grid.setContentsMargins(0, 0, 0, 0)
         self._stats_start_label = QLabel("开始时间: --")
@@ -447,7 +458,7 @@ class ConfigPage(QWidget):
         hint.setStyleSheet(text_style(TEXT_MUTED, size=13, weight=500))
         actions.content_layout.addWidget(hint)
         self._reset_btn = QPushButton("归零并归档")
-        self._reset_btn.setStyleSheet(config_button_style("danger"))
+        self._reset_btn.setProperty("buttonRole", "danger")
         self._reset_btn.setEnabled(self._stats_manager is not None)
         self._reset_btn.clicked.connect(self._on_reset_stats)
         actions.content_layout.addWidget(self._reset_btn, 0, Qt.AlignmentFlag.AlignLeft)

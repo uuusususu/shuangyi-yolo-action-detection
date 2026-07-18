@@ -35,6 +35,7 @@ from ui.runtime_ui_tokens import (
     PAGE_MARGIN,
     PANEL_BG,
     PANEL_BG_DARK,
+    PRIMARY_CONTROL_HEIGHT,
     STROKE_MAIN,
     TEXT_ACCENT,
     TEXT_DANGER,
@@ -49,8 +50,6 @@ from ui.runtime_ui_tokens import (
 from ui.widgets.native_panels import (
     KpiRow,
     RecognitionListItem,
-    main_button_style,
-    top_bar_button_style,
 )
 from yolo_runtime.yolo_result_models import DetectionOverlayState, ObbDetection
 
@@ -84,6 +83,8 @@ class MainWindow(QMainWindow):
             else Path(__file__).resolve().parents[2]
         )
         self._runtime_model_signature = self._model_runtime_signature(config)
+        self._step_engine_signature = self._step_engine_config_signature(config)
+        self._pcb_engine_signature: Optional[tuple] = None
         self._last_model_reload_error = ""
 
         self.setWindowTitle("双翼科技视觉行为引导系统")
@@ -162,6 +163,7 @@ class MainWindow(QMainWindow):
         """根据配置创建或销毁区域/PCB 检查引擎。"""
         self._played_result_sound_keys.clear()
         self._handled_region_result_keys.clear()
+        self._pcb_engine_signature = self._pcb_engine_config_signature(self.config)
         if getattr(self.config, "first_category_region_check_enabled", False):
             pcb_config = PcbInspectionConfig.from_first_category_config(self.config)
             self._pcb_engine = MultiPcbInspectionEngine(pcb_config)
@@ -177,6 +179,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("mainCentral")
+        central.setStyleSheet(f"QWidget#mainCentral {{ background-color: {PAGE_BG}; }}")
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
         outer.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
@@ -187,7 +191,8 @@ class MainWindow(QMainWindow):
 
         # 主页面
         self._main_page = QWidget()
-        self._main_page.setStyleSheet("background: transparent;")
+        self._main_page.setObjectName("mainPage")
+        self._main_page.setStyleSheet("QWidget#mainPage { background: transparent; }")
         main_layout = QVBoxLayout(self._main_page)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(12)
@@ -218,11 +223,10 @@ class MainWindow(QMainWindow):
         self._result_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._result_label.setVisible(False)
         self._btn_config = QPushButton("配置")
-        self._btn_config.setFixedSize(72, 36)
-        self._btn_config.setStyleSheet(top_bar_button_style("secondary"))
+        self._btn_config.setFixedSize(72, 40)
         self._btn_close = QPushButton("关闭")
-        self._btn_close.setFixedSize(72, 36)
-        self._btn_close.setStyleSheet(top_bar_button_style("danger"))
+        self._btn_close.setFixedSize(72, 40)
+        self._btn_close.setProperty("buttonRole", "danger")
 
         actions = QWidget(self._header)
         actions.setObjectName("topBarActions")
@@ -317,9 +321,11 @@ class MainWindow(QMainWindow):
         ctrl_layout.setVerticalSpacing(8)
 
         self._btn_camera = QPushButton("打开相机")
-        self._btn_camera.setStyleSheet(main_button_style("primary"))
+        self._btn_camera.setMinimumHeight(PRIMARY_CONTROL_HEIGHT)
+        self._btn_camera.setProperty("buttonRole", "primary")
         self._btn_detect = QPushButton("开始检测")
-        self._btn_detect.setStyleSheet(main_button_style("primary"))
+        self._btn_detect.setMinimumHeight(PRIMARY_CONTROL_HEIGHT)
+        self._btn_detect.setProperty("buttonRole", "primary")
 
         ctrl_layout.addWidget(self._btn_camera, 0, 0)
         ctrl_layout.addWidget(self._btn_detect, 0, 1)
@@ -1256,9 +1262,9 @@ class MainWindow(QMainWindow):
     def _on_config_back(self) -> None:
         """从配置页返回主界面：刷新动态步骤卡片和 PCB 引擎。"""
         self._stacked.setCurrentWidget(self._main_page)
-        self._rebuild_step_engine()
-        self._init_pcb_engine()
-        self._refresh_steps()
+        self._apply_feedback_config()
+        self._apply_step_engine_config()
+        self._apply_pcb_engine_config()
         self._sync_button_states()
         self._update_kpi()
         self._status_label.setText("READY" if not self.state.camera_on else "预览中")
@@ -1275,8 +1281,8 @@ class MainWindow(QMainWindow):
         camera_switch_result = self._apply_camera_selection()
         self._apply_feedback_config()
         model_ok = self._apply_runtime_model_config()
-        self._rebuild_step_engine()
-        self._refresh_steps()
+        self._apply_step_engine_config()
+        self._apply_pcb_engine_config()
         self._sync_button_states()
         self._update_kpi()
         if not model_ok:
@@ -1350,6 +1356,65 @@ class MainWindow(QMainWindow):
         self._fail_evidence_saver.enabled = bool(getattr(self.config, "fail_evidence_enabled", True))
 
     @staticmethod
+    def _step_engine_config_signature(config) -> tuple:
+        """Configuration fields that require resetting the normal step engine."""
+        names = tuple(str(name).strip() for name in (getattr(config, "category_names", []) or []))
+        counts = tuple(
+            max(1, int(count))
+            for count in (getattr(config, "category_counts", []) or [])
+        )
+        return (
+            names,
+            counts,
+            int(getattr(config, "action_pass_stable_frames", 1)),
+            int(getattr(config, "action_ng_stable_frames", 1)),
+            int(getattr(config, "action_leave_stable_frames", 4)),
+            bool(getattr(config, "action_order_constraint_enabled", True)),
+        )
+
+    @staticmethod
+    def _pcb_engine_config_signature(config) -> tuple:
+        """Configuration fields that require resetting first-category tracking."""
+        enabled = bool(getattr(config, "first_category_region_check_enabled", False))
+        if not enabled:
+            return (False,)
+        parent, children = config.get_first_category_region_classes()
+        names = list(getattr(config, "category_names", []) or [])
+        counts = list(getattr(config, "category_counts", []) or [])
+        required_counts = []
+        for index, name in enumerate(names):
+            normalized = str(name).strip()
+            if normalized in children:
+                count = counts[index] if index < len(counts) else 1
+                required_counts.append((normalized, max(1, int(count))))
+        return (
+            True,
+            str(parent).strip(),
+            tuple(str(child).strip() for child in children),
+            tuple(required_counts),
+            int(getattr(config, "action_pass_stable_frames", 1)),
+            int(getattr(config, "action_ng_stable_frames", 1)),
+            float(getattr(config, "round_cooldown_seconds", 0.0)),
+            float(getattr(config, "pcb_assignment_margin_ratio", 0.15)),
+        )
+
+    def _apply_step_engine_config(self) -> bool:
+        new_signature = self._step_engine_config_signature(self.config)
+        if new_signature == self._step_engine_signature:
+            return False
+        self._rebuild_step_engine()
+        self._refresh_steps()
+        return True
+
+    def _apply_pcb_engine_config(self) -> bool:
+        new_signature = self._pcb_engine_config_signature(self.config)
+        if new_signature == self._pcb_engine_signature:
+            return False
+        self._init_pcb_engine()
+        self._refresh_steps()
+        return True
+
+    @staticmethod
     def _model_runtime_signature(config) -> tuple:
         """影响推理处理器实例的配置签名。"""
         return (
@@ -1412,6 +1477,7 @@ class MainWindow(QMainWindow):
 
     def _rebuild_step_engine(self) -> None:
         """根据最新配置重建步骤引擎，保证 UI 卡片和判定顺序一致。"""
+        self._step_engine_signature = self._step_engine_config_signature(self.config)
         if self.step_engine is None:
             return
         self.step_engine = StepSequenceEngine(

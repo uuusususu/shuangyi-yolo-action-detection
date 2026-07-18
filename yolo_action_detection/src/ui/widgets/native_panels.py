@@ -15,14 +15,6 @@ from PySide6.QtWidgets import (
 )
 
 from ui.runtime_ui_tokens import (
-    BTN_DANGER_BG,
-    BTN_DANGER_BORDER,
-    BTN_PRIMARY_BG,
-    BTN_PRIMARY_BORDER,
-    BTN_PRIMARY_HOVER,
-    BTN_SECONDARY_BG,
-    BTN_SECONDARY_BORDER,
-    BTN_SECONDARY_HOVER,
     CHIP_BG,
     FONT_BODY,
     FONT_METRIC,
@@ -33,7 +25,6 @@ from ui.runtime_ui_tokens import (
     PANEL_BG,
     PANEL_BG_ALT,
     PANEL_BG_DARK,
-    PRIMARY_CONTROL_HEIGHT,
     STEP_ACTIVE_BG,
     STEP_ACTIVE_BORDER,
     STEP_ACTIVE_TEXT,
@@ -55,10 +46,7 @@ from ui.runtime_ui_tokens import (
     TEXT_MUTED,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
-    config_button_style,
-    config_nav_button_style,
     frame_style,
-    switch_checkbox_style,
     text_style,
 )
 
@@ -235,7 +223,8 @@ class ConfigNavButton(QPushButton):
         super().__init__(text, parent)
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet(config_nav_button_style())
+        self.setMinimumHeight(40)
+        self.setProperty("navigation", True)
 
 
 class FormGroup(QFrame):
@@ -312,7 +301,6 @@ class SwitchRow(QFrame):
         layout.addLayout(text_layout, 1)
         self.checkbox = QCheckBox(self)
         self.checkbox.setAccessibleName(title)
-        self.checkbox.setStyleSheet(switch_checkbox_style())
         layout.addWidget(self.checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
 
 
@@ -332,9 +320,11 @@ class FooterActionBar(QFrame):
         self.saved_label.setStyleSheet(text_style(STEP_PASS_TEXT, size=FONT_SMALL, weight=700))
         self.saved_label.setVisible(False)
         self.cancel_button = QPushButton("返回检测", self)
-        self.cancel_button.setStyleSheet(config_button_style("secondary"))
+        self.cancel_button.setMinimumHeight(40)
         self.save_button = QPushButton("验证并保存", self)
-        self.save_button.setStyleSheet(config_button_style("primary"))
+        self.save_button.setMinimumHeight(40)
+        self.save_button.setProperty("buttonRole", "primary")
+        self.save_button.setDefault(True)
         layout.addWidget(self.saved_label)
         layout.addStretch(1)
         layout.addWidget(self.cancel_button)
@@ -549,49 +539,3 @@ class KpiRow(QFrame):
 
 # 良率/OK 用青色，NG 用红色
 TEXT_DANGER_COLOR = "#FF6A75"
-
-
-def main_button_style(variant: str = "primary") -> str:
-    """主操作按钮科技风样式。variant: primary(相机/检测) / secondary(配置/关闭)。"""
-    if variant == "primary":
-        return (
-            f"QPushButton {{ background-color: {BTN_PRIMARY_BG}; border: 2px solid {BTN_PRIMARY_BORDER}; "
-            f"color: #FFFFFF; font-size: 16px; font-weight: 700; padding: 10px 16px; "
-            f"border-radius: 10px; min-height: {PRIMARY_CONTROL_HEIGHT}px; }}"
-            f"QPushButton:hover {{ background-color: {BTN_PRIMARY_HOVER}; border: 2px solid {BTN_PRIMARY_BORDER}; }}"
-            f"QPushButton:disabled {{ background-color: #123258; border: 2px solid #1B3A5C; color: #4C78A6; }}"
-        )
-    if variant == "danger":
-        return (
-            f"QPushButton {{ background-color: {BTN_DANGER_BG}; border: 2px solid {BTN_DANGER_BORDER}; "
-            f"color: #FFFFFF; font-size: 16px; font-weight: 700; padding: 10px 16px; "
-            f"border-radius: 10px; min-height: {PRIMARY_CONTROL_HEIGHT}px; }}"
-            f"QPushButton:hover {{ background-color: #A82838; border: 2px solid {BTN_DANGER_BORDER}; }}"
-            f"QPushButton:disabled {{ background-color: #2A1018; border: 2px solid #3A1C24; color: #4C78A6; }}"
-        )
-    return (
-        f"QPushButton {{ background-color: {BTN_SECONDARY_BG}; border: 2px solid {BTN_SECONDARY_BORDER}; "
-        f"color: {TEXT_PRIMARY}; font-size: 14px; font-weight: 700; padding: 8px 14px; "
-        f"border-radius: 10px; min-height: 40px; }}"
-        f"QPushButton:hover {{ background-color: {BTN_SECONDARY_HOVER}; border: 2px solid {BTN_SECONDARY_BORDER}; }}"
-        f"QPushButton:disabled {{ background-color: #0E1C3F; border: 2px solid #1B2C45; color: #4C78A6; }}"
-    )
-
-
-def top_bar_button_style(variant: str = "secondary") -> str:
-    """顶栏紧凑按钮样式，与右下角主操作按钮分开。"""
-    if variant == "danger":
-        background = BTN_DANGER_BG
-        border = BTN_DANGER_BORDER
-        hover = "#A82838"
-    else:
-        background = BTN_SECONDARY_BG
-        border = BTN_SECONDARY_BORDER
-        hover = BTN_SECONDARY_HOVER
-    return (
-        f"QPushButton {{ background-color: {background}; border: 1px solid {border}; "
-        f"color: #FFFFFF; font-size: 14px; font-weight: 700; padding: 0 14px; "
-        "border-radius: 8px; }}"
-        f"QPushButton:hover {{ background-color: {hover}; border-color: {TEXT_ACCENT}; }}"
-        f"QPushButton:pressed {{ background-color: {PANEL_BG_DARK}; }}"
-    )

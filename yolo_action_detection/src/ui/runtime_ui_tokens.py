@@ -53,9 +53,6 @@ STEP_LOCKED_TEXT = "#3A5575"
 BTN_PRIMARY_BG = "#1764B8"
 BTN_PRIMARY_BORDER = "#2C7BD2"
 BTN_PRIMARY_HOVER = "#1C72C9"
-BTN_SECONDARY_BG = "#19345F"
-BTN_SECONDARY_BORDER = "#2E6DC2"
-BTN_SECONDARY_HOVER = "#21416E"
 BTN_DANGER_BG = "#8E2230"
 BTN_DANGER_BORDER = "#FF6A75"
 
@@ -78,7 +75,6 @@ FONT_METRIC_LARGE = 42
 FONT_TAG = 14
 
 MIN_BUTTON_HEIGHT = 40
-TAG_BUTTON_HEIGHT = 40
 ROW_HEIGHT = 44
 TABLE_ROW_HEIGHT = 36
 
@@ -110,43 +106,6 @@ def text_style(
         f"font-weight: {weight}; "
         "background: transparent; border: none;"
         f"{extra_rules}"
-    )
-
-
-def chip_button_style(
-    *,
-    background: str,
-    border: str,
-    color: str,
-    font_size: int = FONT_BODY,
-    min_height: int = TAG_BUTTON_HEIGHT,
-    padding: str = "6px 12px",
-    radius: int = 8,
-    disabled_background: str | None = None,
-    disabled_border: str | None = None,
-    disabled_color: str = TEXT_MUTED,
-) -> str:
-    disabled_bg = disabled_background or background
-    disabled_border_color = disabled_border or border
-    return (
-        "QPushButton { "
-        f"background-color: {background}; "
-        f"border: 2px solid {border}; "
-        f"color: {color}; "
-        f"font-size: {font_size}px; "
-        "font-weight: 700; "
-        f"padding: {padding}; "
-        f"border-radius: {radius}px; "
-        f"min-height: {min_height}px; "
-        "}"
-        "QPushButton:hover { "
-        f"border: 2px solid {border}; "
-        "}"
-        "QPushButton:disabled { "
-        f"background-color: {disabled_bg}; "
-        f"border: 2px solid {disabled_border_color}; "
-        f"color: {disabled_color}; "
-        "}"
     )
 
 
@@ -211,118 +170,3 @@ def form_label_style() -> str:
 
 def hint_label_style() -> str:
     return text_style(TEXT_MUTED, size=FONT_SMALL, weight=500)
-
-
-def input_style() -> str:
-    return (
-        "QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { "
-        f"background-color: {INPUT_BG}; "
-        f"border: 1px solid {STROKE_MUTED}; "
-        "border-radius: 7px; "
-        f"color: {TEXT_PRIMARY}; "
-        f"font-family: '{FONT_FAMILY}'; "
-        f"font-size: {FONT_BODY}px; "
-        "padding: 6px 8px; "
-        "min-height: 38px; "
-        "}"
-        "QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { "
-        f"border: 2px solid {TEXT_ACCENT}; "
-        "}"
-        "QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled { "
-        f"background-color: {PANEL_BG_DARK}; "
-        f"color: {TEXT_MUTED}; "
-        "}"
-        "QComboBox::drop-down { "
-        f"border-left: 1px solid {STROKE_MUTED}; "
-        "width: 24px; "
-        "}"
-        "QComboBox QAbstractItemView { "
-        f"background-color: {PANEL_BG_DARK}; "
-        f"border: 1px solid {STROKE_MAIN}; "
-        f"color: {TEXT_PRIMARY}; "
-        "selection-background-color: #174D8F; "
-        "}"
-    )
-
-
-def checkbox_style() -> str:
-    return (
-        "QCheckBox { "
-        f"color: {TEXT_PRIMARY}; "
-        f"font-family: '{FONT_FAMILY}'; "
-        f"font-size: {FONT_BODY}px; "
-        "spacing: 8px; "
-        "}"
-        "QCheckBox::indicator { width: 18px; height: 18px; }"
-        "QCheckBox::indicator:unchecked { "
-        f"background-color: {PANEL_BG_DARK}; "
-        f"border: 1px solid {STROKE_MUTED}; "
-        "border-radius: 4px; "
-        "}"
-        "QCheckBox::indicator:checked { "
-        f"background-color: {BTN_PRIMARY_BG}; "
-        f"border: 1px solid {TEXT_ACCENT}; "
-        "border-radius: 4px; "
-        "}"
-    )
-
-
-def config_button_style(variant: str = "primary") -> str:
-    if variant == "primary":
-        return chip_button_style(
-            background=BTN_PRIMARY_BG,
-            border=BTN_PRIMARY_BORDER,
-            color="#FFFFFF",
-            font_size=FONT_BODY,
-            min_height=40,
-            padding="7px 14px",
-            radius=8,
-            disabled_background="#123258",
-            disabled_border="#1B3A5C",
-        )
-    if variant == "danger":
-        return chip_button_style(
-            background=BTN_DANGER_BG,
-            border=BTN_DANGER_BORDER,
-            color="#FFFFFF",
-            font_size=FONT_BODY,
-            min_height=40,
-            padding="7px 14px",
-            radius=8,
-            disabled_background="#2A1018",
-            disabled_border="#3A1C24",
-        )
-    return chip_button_style(
-        background=BTN_SECONDARY_BG,
-        border=BTN_SECONDARY_BORDER,
-        color=TEXT_PRIMARY,
-        font_size=FONT_BODY,
-        min_height=40,
-        padding="7px 14px",
-        radius=8,
-        disabled_background=PANEL_BG_DARK,
-        disabled_border=STEP_LOCKED_BORDER,
-    )
-
-
-def config_nav_button_style() -> str:
-    return (
-        "QPushButton { "
-        "background: transparent; border: 1px solid transparent; border-radius: 7px; "
-        f"color: {TEXT_MUTED}; font-size: {FONT_BODY}px; font-weight: 600; "
-        "text-align: left; padding: 10px 12px; min-height: 40px; "
-        "}"
-        f"QPushButton:hover {{ background-color: {PANEL_BG_SOFT}; color: {TEXT_PRIMARY}; }}"
-        f"QPushButton:checked {{ background-color: {PANEL_BG_MID}; border-color: {STROKE_MAIN}; "
-        f"color: {TEXT_ACCENT}; }}"
-    )
-
-
-def switch_checkbox_style() -> str:
-    return (
-        "QCheckBox { spacing: 0; background: transparent; }"
-        "QCheckBox::indicator { width: 44px; height: 24px; border-radius: 12px; }"
-        f"QCheckBox::indicator:unchecked {{ background-color: {STROKE_MUTED}; border: 1px solid {STROKE_SOFT}; }}"
-        f"QCheckBox::indicator:checked {{ background-color: {BTN_PRIMARY_BG}; border: 1px solid {TEXT_ACCENT}; }}"
-        f"QCheckBox::indicator:disabled {{ background-color: {PANEL_BG_DARK}; border: 1px solid {STROKE_MUTED}; }}"
-    )

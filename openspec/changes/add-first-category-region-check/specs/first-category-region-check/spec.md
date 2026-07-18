@@ -132,8 +132,8 @@
 - **THEN** 系统 SHALL 允许该父类 ID 锁存剩余步骤完成
 - **AND** 当全部子步骤完成时 SHALL 将该父类 ID 转为 PASS
 
-### Requirement: PASS 终局与 FAIL 事件去重
-系统 SHALL 将 PASS 作为父类 ID 的终局完成状态，并 SHALL 对可重试 FAIL 事件按异常签名去重/节流。
+### Requirement: PASS 终局与 FAIL 统计/证据去重
+系统 SHALL 将 PASS 作为父类 ID 的终局完成状态，并 SHALL 对可重试 FAIL 的统计和证据按异常签名去重/节流。FAIL 声音播放 SHALL 遵循结果声音反馈能力的按识别轮次去重规则。
 
 #### Scenario: 全部子步骤完成后输出一次 PASS
 - **WHEN** 同一父类 ID 的全部有效子步骤均已锁存完成
@@ -147,10 +147,11 @@
 - **AND** 系统 SHALL NOT 将该父类 ID 视为最终结束
 - **AND** 系统 SHALL 在该 ID 未退休且未 PASS 时允许它重新进入等待队列
 
-#### Scenario: 同一异常签名不重复刷事件
+#### Scenario: 同一异常签名不重复刷统计和证据
 - **WHEN** 同一父类 ID、同一子步骤、同一实际数量和同一配置数量的异常已经上报过
 - **THEN** 后续重试中再次出现相同异常时，系统 SHALL 保持红框和状态显示
-- **AND** 系统 SHALL NOT 重复增加统计、播放声音或保存证据
+- **AND** 系统 SHALL NOT 重复增加统计或保存证据
+- **AND** 声音播放 SHALL 按识别轮次去重，不得由异常签名直接吞掉新轮次 FAIL 声音
 
 #### Scenario: 异常签名变化允许新 FAIL 事件
 - **WHEN** 同一父类 ID 后续出现不同子步骤、不同实际数量或不同配置数量的异常

@@ -406,6 +406,76 @@ def test_sound_player_failure_does_not_interrupt_region_result_flow(qapp, tmp_pa
     assert tuple(int(value) for value in rendered[100, 100]) == (0, 0, 255)
 
 
+def test_config_save_sound_only_preserves_runtime_and_region_state(qapp, tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config.category_names = ["parent", "child", "", "", "", ""]
+    config.category_counts = [1, 4, 1, 1, 1, 1]
+    config.first_category_region_check_enabled = True
+    config.mvsdk_camera_sn = "SN-SAME"
+    config.pass_sound_enabled = False
+    config.fail_sound_enabled = True
+    old_processor = DummyProcessor("old")
+    created = []
+    sound = SoundSpy()
+
+    def factory(runtime_config, app_base_dir=None):
+        created.append(runtime_config.yolo_model_path)
+        return DummyProcessor(runtime_config.yolo_model_path)
+
+    window = _window(
+        qapp,
+        config,
+        factory,
+        processor=old_processor,
+        sound_feedback=sound,
+    )
+    window.worker._mvsdk_camera = SimpleNamespace(
+        device=SimpleNamespace(sn="SN-SAME")
+    )
+    window.state.set_camera_on(True)
+    window.state.set_inference_on(True)
+    camera_calls = []
+    monkeypatch.setattr(window.worker, "stop_inference", lambda: camera_calls.append("stop_inference"))
+    monkeypatch.setattr(window.worker, "close_camera", lambda: camera_calls.append("close_camera"))
+    monkeypatch.setattr(window.worker, "open_camera", lambda: camera_calls.append("open_camera"))
+
+    parent = ObbDetection(
+        class_id=0,
+        label="parent",
+        conf=0.9,
+        track_id=1,
+        polygon=[(100, 100), (300, 100), (300, 300), (100, 300)],
+        box=(100, 100, 300, 300),
+        center=(200, 200),
+    )
+    window._pcb_engine.update([parent], image_size=(1000, 1000))
+    old_step_engine = window.step_engine
+    old_pcb_engine = window._pcb_engine
+    first_card = window._step_cards[0]
+
+    config.pass_sound_enabled = True
+    config.fail_sound_enabled = False
+    window._on_config_saved()
+
+    assert created == []
+    assert camera_calls == []
+    assert window.processor is old_processor
+    assert window.worker.frame_processor is old_processor
+    assert window.step_engine is old_step_engine
+    assert window._pcb_engine is old_pcb_engine
+    assert window._pcb_engine.pcb_states
+    assert window._step_cards[0] is first_card
+    assert sound.enabled is True
+
+    window._on_config_back()
+
+    assert camera_calls == []
+    assert window.step_engine is old_step_engine
+    assert window._pcb_engine is old_pcb_engine
+    assert window._pcb_engine.pcb_states
+    assert window._step_cards[0] is first_card
+
+
 def test_config_save_reloads_processor_and_updates_worker(qapp, tmp_path):
     config = _config(tmp_path)
     old_processor = DummyProcessor("old")
@@ -479,8 +549,8 @@ def test_runtime_header_uses_centered_brand_and_compact_actions(qapp, tmp_path):
     assert window._title_label.alignment() == Qt.AlignmentFlag.AlignCenter
     assert abs(window._title_label.geometry().center().x() - window._header.rect().center().x()) <= 2
     assert window._status_label.text() == "READY"
-    assert window._btn_config.height() == 36
-    assert window._btn_close.height() == 36
+    assert window._btn_config.height() == 40
+    assert window._btn_close.height() == 40
     assert window._status_label.geometry().center().y() == window._btn_config.geometry().center().y()
     window.close()
 

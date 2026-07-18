@@ -26,6 +26,8 @@
   "today_target_capacity": 300,
   "show_confidence_overlay": true,
   "show_track_id_overlay": true,
+  "pass_sound_enabled": false,
+  "fail_sound_enabled": true,
   "sound_feedback_enabled": true,
   "fail_evidence_enabled": true
 }

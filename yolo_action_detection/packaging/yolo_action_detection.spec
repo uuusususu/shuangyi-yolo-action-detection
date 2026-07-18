@@ -25,6 +25,8 @@ a = Analysis(
         "cv2",
         "numpy",
         "onnxruntime",
+        "qdarktheme",
+        "darkdetect",
         "PySide6.QtCore",
         "PySide6.QtGui",
         "PySide6.QtWidgets",
