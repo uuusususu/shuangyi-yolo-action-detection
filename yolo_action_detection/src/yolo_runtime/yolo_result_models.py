@@ -46,6 +46,10 @@ class DetectionOverlayState:
     error: str = ""
     round_id: int = 0
     latency_ms: float = 0.0
+    template_matched: bool = False
+    template_score: float = 0.0
+    template_center: Optional[Tuple[float, float]] = None
+    template_angle: Optional[float] = None
 
 
 @dataclass

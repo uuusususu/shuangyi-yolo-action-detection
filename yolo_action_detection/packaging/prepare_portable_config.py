@@ -5,6 +5,19 @@ import json
 from pathlib import Path
 
 
+CURRENT_CONFIG_SCHEMA_VERSION = 4
+LEGACY_REGION_KEYS = {
+    "first_category_region_check_enabled",
+    "pcb_inspection_enabled",
+    "pcb_class_name",
+    "pcb_component_class_names",
+    "pcb_fail_stable_frames",
+    "pcb_round_interval_seconds",
+    "pcb_assignment_margin_ratio",
+    "roi_template_min_matches",
+}
+
+
 def prepare_portable_config(
     source_path: str | Path,
     destination_path: str | Path,
@@ -15,6 +28,15 @@ def prepare_portable_config(
     model_dir = Path(bundled_model_dir)
 
     payload = json.loads(source.read_text(encoding="utf-8"))
+    version = payload.get("config_schema_version")
+    if type(version) is not int or version != CURRENT_CONFIG_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported config_schema_version: {version!r}; "
+            f"expected {CURRENT_CONFIG_SCHEMA_VERSION}"
+        )
+    legacy_keys = sorted(LEGACY_REGION_KEYS.intersection(payload))
+    if legacy_keys:
+        raise ValueError(f"Legacy region fields are not allowed: {', '.join(legacy_keys)}")
     model_name = Path(str(payload.get("yolo_model_path", ""))).name
     if not model_name:
         raise ValueError("yolo_model_path is empty")

@@ -43,6 +43,42 @@ class SoundFeedback:
     def play_fail(self) -> bool:
         return self._play("fail")
 
+    def play_fail_loop(self) -> bool:
+        """循环播放 FAIL 声音，直到 stop_loop() 被调用。"""
+        if not self.enabled:
+            return False
+        if not self._platform_name.startswith("win"):
+            return False
+        path = resolve_sound_file("fail", self.resource_dir)
+        if not path.exists():
+            return False
+        try:
+            if self._player is not None:
+                self._player(str(path))
+                return True
+            import winsound
+
+            winsound.PlaySound(
+                str(path),
+                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP,
+            )
+            return True
+        except Exception:
+            return False
+
+    def stop_loop(self) -> None:
+        """停止循环播放。"""
+        if not self._platform_name.startswith("win"):
+            return
+        try:
+            if self._player is not None:
+                return
+            import winsound
+
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
     def _play(self, kind: str) -> bool:
         if not self.enabled:
             return False

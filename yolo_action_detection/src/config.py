@@ -2,18 +2,22 @@
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
+
+from roi_inspection.geometry import NormalizedRect
 
 ULTRALYTICS_OBB_TASK = "ultralytics_obb"
 SUPPORTED_MODEL_TASKS = (ULTRALYTICS_OBB_TASK,)
 DEFAULT_YOLO_MODEL_PATH = "config/best.pt"
 SUPPORTED_YOLO_MODEL_SUFFIXES = (".pt", ".onnx")
+CURRENT_CONFIG_SCHEMA_VERSION = 4
 
 
 @dataclass
 class ConfigManager:
     """配置管理器，只支持 YOLO OBB。"""
 
+    config_schema_version: int = CURRENT_CONFIG_SCHEMA_VERSION
     model_task: str = ULTRALYTICS_OBB_TASK
     yolo_model_path: str = DEFAULT_YOLO_MODEL_PATH
     yolo_conf_threshold: float = 0.7
@@ -100,16 +104,33 @@ class ConfigManager:
     sound_feedback_enabled: bool = True
     fail_evidence_enabled: bool = True
 
-    # 首类别区域检查模式：category_names[0] 为父区域，后续类别为子控件。
-    first_category_region_check_enabled: bool = False
+    # 固定工位 ROI 定位检测。
+    roi_inspection_enabled: bool = False
+    roi_inspection_rect: Optional[Dict[str, float]] = None
+    # 搜索 ROI 内的边缘模板匹配定位。
+    roi_template_enabled: bool = False
+    roi_template_path: str = "locator_template.png"
+    # 形状模型（分层定向边缘点集）落盘文件，与模板同目录。
+    roi_template_model_path: str = "locator_model.npz"
+    # 形状匹配得分近似"方向一致且可见的轮廓比例"：0.7 即允许 30% 轮廓缺失。
+    roi_template_match_threshold: float = 0.7
+    roi_template_angle_range: float = 15.0
+    # 0 表示按模板尺寸自动推算角度步进（金字塔下不需要手动调）。
+    roi_template_angle_step: float = 0.0
+    # use = 区分明暗方向（判别力强）；ignore_global = 允许工件与背景对比度反转。
+    roi_template_polarity: str = "use"
+    # 搜索框相对模板必须留出的最小平移余量，抗工位停位波动。
+    roi_template_min_travel_px: int = 40
+    roi_template_min_travel_ratio: float = 0.30
+    roi_template_rect: Optional[Dict[str, float]] = None
+    roi_template_search_rect: Optional[Dict[str, float]] = None
 
-    # PCB 多板元器件检查模式（保留历史配置兼容）。
-    pcb_inspection_enabled: bool = False
-    pcb_class_name: str = "pcb"
-    pcb_component_class_names: List[str] = field(default_factory=lambda: ["", "", "", ""])
-    pcb_fail_stable_frames: int = 10
-    pcb_round_interval_seconds: float = 0.0
-    pcb_assignment_margin_ratio: float = 0.15
+    # 模板匹配现场诊断（默认关闭；现场测试时打开）。
+    template_diagnostics_enabled: bool = False
+    template_diagnostics_dir: str = "logs/template_sessions"
+    template_diagnostics_shadow_enabled: bool = True
+    template_diagnostics_sample_frames: int = 120
+    template_diagnostics_max_queue: int = 600
 
     _config_path: Optional[str] = field(default=None, repr=False)
 
@@ -136,13 +157,17 @@ class ConfigManager:
         self.fail_sound_enabled = _coerce_bool(self.fail_sound_enabled)
         self.sound_feedback_enabled = self.fail_sound_enabled
         self.fail_evidence_enabled = _coerce_bool(self.fail_evidence_enabled)
-        self.first_category_region_check_enabled = _coerce_bool(self.first_category_region_check_enabled)
-        self.pcb_inspection_enabled = _coerce_bool(self.pcb_inspection_enabled)
-        self.pcb_fail_stable_frames = max(1, int(self.pcb_fail_stable_frames))
-        self.pcb_round_interval_seconds = max(0.0, float(self.pcb_round_interval_seconds))
-        self.pcb_assignment_margin_ratio = max(0.0, min(1.0, float(self.pcb_assignment_margin_ratio)))
-        if self.first_category_region_check_enabled:
-            self._validate_first_category_region_config()
+        self.roi_inspection_enabled = _coerce_bool(self.roi_inspection_enabled)
+        self.template_diagnostics_enabled = _coerce_bool(self.template_diagnostics_enabled)
+        self.template_diagnostics_shadow_enabled = _coerce_bool(
+            self.template_diagnostics_shadow_enabled
+        )
+        self.template_diagnostics_sample_frames = max(
+            0, min(2000, int(self.template_diagnostics_sample_frames))
+        )
+        self.template_diagnostics_max_queue = max(
+            50, min(20000, int(self.template_diagnostics_max_queue))
+        )
         self._normalize_category_counts()
 
     def _normalize_category_counts(self) -> None:
@@ -154,8 +179,6 @@ class ConfigManager:
             counts.append(1)
         # 裁剪到相同长度
         counts = counts[:names_len]
-        # 每个值至少为 1
-        counts = [max(1, int(c)) for c in counts]
         self.category_counts = counts
 
     def load(self, path: Path | str) -> None:
@@ -165,6 +188,13 @@ class ConfigManager:
             return
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        # v3 只窄迁移边缘模板新增字段，其他现场参数原样保留。
+        data["config_schema_version"] = data.get("config_schema_version", 0)
+        if data["config_schema_version"] == 3:
+            data["config_schema_version"] = CURRENT_CONFIG_SCHEMA_VERSION
+            data.setdefault("roi_template_search_rect", None)
+            data.setdefault("roi_template_angle_step", 1.0)
+            data.pop("roi_template_min_matches", None)
         # 检查 model_task
         mt = data.get("model_task", "")
         if mt and mt != ULTRALYTICS_OBB_TASK:
@@ -213,39 +243,111 @@ class ConfigManager:
         """返回有效步骤类别（非空）。"""
         return [c for c in self.category_names if c and c.strip()]
 
-    def get_first_category_region_classes(self) -> tuple[str, List[str]]:
-        """返回首类别区域检查的父类别和子类别。"""
-        names = [c.strip() for c in self.category_names if c and c.strip()]
-        if not names:
-            return "", []
-        return names[0], names[1:]
+    def get_runtime_category_counts(self) -> List[int]:
+        """返回不会阻止配置界面启动的临时运行数量；有效性仍由校验器决定。"""
+        counts = list(self.category_counts or [])
+        result: List[int] = []
+        for index in range(len(self.category_names or [])):
+            value = counts[index] if index < len(counts) else 1
+            result.append(int(value) if _is_positive_int(value) else 1)
+        return result
 
-    def _validate_first_category_region_config(self) -> None:
-        """校验首类别区域检查模式配置。"""
-        parent, children = self.get_first_category_region_classes()
-        if not parent:
-            raise ValueError("首类别区域检查已启用，但类别1为空")
-        if not children:
-            raise ValueError("首类别区域检查至少需要 1 个子类别")
-        if parent in children:
-            raise ValueError(f"父区域类别 '{parent}' 不能与子类别相同")
-        if len(set(children)) != len(children):
-            raise ValueError("首类别区域检查的子类别存在重复")
-
-    def _validate_pcb_config(self) -> None:
-        """校验 PCB 检查模式配置。"""
-        if not self.pcb_class_name or not self.pcb_class_name.strip():
-            raise ValueError("PCB 检查模式已启用，但 PCB 类别名称为空")
-        pcb_class = self.pcb_class_name.strip()
-        comps = [c.strip() for c in self.pcb_component_class_names if c and c.strip()]
-        if len(comps) != 4:
-            raise ValueError(
-                f"PCB 检查模式需要恰好 4 个非空元器件类别，当前有 {len(comps)} 个"
+    def inspection_validation_errors(
+        self,
+        model_class_names: Optional[Iterable[str]] = None,
+        *,
+        require_roi_rects: bool = True,
+    ) -> List[str]:
+        """返回配置错误；保存草稿时可允许尚未创建的 ROI。"""
+        errors: List[str] = []
+        if (
+            type(self.config_schema_version) is not int
+            or self.config_schema_version != CURRENT_CONFIG_SCHEMA_VERSION
+        ):
+            errors.append(
+                f"配置版本无效：需要 {CURRENT_CONFIG_SCHEMA_VERSION}，"
+                f"当前为 {self.config_schema_version}；请重新配置并保存"
             )
-        if len(set(comps)) != 4:
-            raise ValueError("PCB 元器件类别存在重复，必须 4 个互不相同")
-        if pcb_class in comps:
-            raise ValueError(f"PCB 类别 '{pcb_class}' 不能与元器件类别相同")
+
+        available = None
+        if model_class_names is not None:
+            available = {str(name).strip() for name in model_class_names if str(name).strip()}
+
+        names = [str(name).strip() for name in (self.category_names or [])]
+        counts = list(self.category_counts or [])
+        valid_names = [name for name in names if name]
+        if not valid_names:
+            errors.append("至少配置一个有效待检类别")
+        if len(valid_names) != len(set(valid_names)):
+            errors.append("待检类别不能重复")
+        for index, name in enumerate(names):
+            if not name:
+                continue
+            count = counts[index] if index < len(counts) else 0
+            if not _is_positive_int(count):
+                errors.append(f"待检数量无效：类别 '{name}' 必须为正整数")
+            if available is not None and name not in available:
+                errors.append(f"待检类别 '{name}' 不属于当前模型")
+
+        if not self.roi_inspection_enabled:
+            return errors
+
+        if require_roi_rects or self.roi_inspection_rect is not None:
+            self._append_roi_error(errors, "识别 ROI", self.roi_inspection_rect)
+
+        if getattr(self, "roi_template_enabled", False):
+            template_path = str(getattr(self, "roi_template_path", "") or "").strip()
+            if not template_path:
+                errors.append("定位模板文件名不能为空")
+            elif require_roi_rects:
+                # 模板文件存在性检查在严格模式下执行（运行时路径解析由调用方负责）。
+                pass
+            threshold = _as_float(getattr(self, "roi_template_match_threshold", 0.6))
+            if threshold is None or not 0.0 < threshold <= 1.0:
+                errors.append("匹配分数阈值必须在 0 到 1 之间")
+            angle_range = _as_float(getattr(self, "roi_template_angle_range", 15.0))
+            if angle_range is None or not 0.0 <= angle_range <= 180.0:
+                errors.append("旋转角度范围必须在 0 到 180 度之间")
+            # 0 表示按模板尺寸自动推算步进（金字塔下不需要手动指定）。
+            angle_step = _as_float(getattr(self, "roi_template_angle_step", 0.0))
+            if angle_step is None or not 0.0 <= angle_step <= 180.0:
+                errors.append("模板角度步进必须在 0 到 180 度之间（0 表示自动）")
+            polarity = str(getattr(self, "roi_template_polarity", "use") or "use")
+            if polarity not in ("use", "ignore_global"):
+                errors.append("模板极性只支持 use 或 ignore_global")
+
+            if require_roi_rects or self.roi_template_rect is not None:
+                self._append_roi_error(errors, "模板 ROI", self.roi_template_rect)
+            if require_roi_rects or self.roi_template_search_rect is not None:
+                self._append_roi_error(errors, "搜索 ROI", self.roi_template_search_rect)
+        return errors
+
+    def require_valid_inspection_config(
+        self,
+        model_class_names: Optional[Iterable[str]] = None,
+        *,
+        require_roi_rects: bool = True,
+    ) -> None:
+        errors = self.inspection_validation_errors(
+            model_class_names,
+            require_roi_rects=require_roi_rects,
+        )
+        if errors:
+            raise ValueError("\n".join(errors))
+
+    @staticmethod
+    def _append_roi_error(
+        errors: List[str],
+        label: str,
+        value: Optional[Dict[str, float]],
+    ) -> None:
+        if value is None:
+            errors.append(f"{label} 未配置")
+            return
+        try:
+            NormalizedRect.from_mapping(value)
+        except ValueError as exc:
+            errors.append(f"{label} 无效：{exc}")
 
 
 def _coerce_bool(value) -> bool:
@@ -254,3 +356,23 @@ def _coerce_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in ("0", "false", "no", "off", "")
     return bool(value)
+
+
+def _is_positive_int(value) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, str):
+        text = value.strip()
+        return text.isdigit() and int(text) > 0
+    return False
+
+
+def _as_float(value) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

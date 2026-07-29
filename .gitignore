@@ -44,6 +44,7 @@ datasets/
 
 # Agent and tool directories
 .agent/
+.zcode/
 .dotnet/
 .superpowers/
 graphify-out/
@@ -78,6 +79,7 @@ mediapipe_runtime_test/
 *.html
 *.css
 *.js
+_bl.txt
 !docs/**/*.html
 
 # PyInstaller output

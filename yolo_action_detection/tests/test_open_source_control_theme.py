@@ -151,13 +151,13 @@ def test_config_page_preserves_native_control_types_and_binary_api(themed_app):
     assert isinstance(page._tracker_input, QComboBox)
     assert isinstance(page._conf_input, QDoubleSpinBox)
     assert isinstance(page._max_det_input, QSpinBox)
-    assert isinstance(page._first_category_region_cb, QCheckBox)
-    assert page._first_category_region_cb.styleSheet() == ""
+    assert isinstance(page._roi_enabled_cb, QCheckBox)
+    assert page._roi_enabled_cb.styleSheet() == ""
 
     states = []
-    page._first_category_region_cb.stateChanged.connect(states.append)
-    page._first_category_region_cb.setChecked(True)
-    assert page._first_category_region_cb.isChecked() is True
+    page._roi_enabled_cb.stateChanged.connect(states.append)
+    page._roi_enabled_cb.setChecked(True)
+    assert page._roi_enabled_cb.isChecked() is True
     assert states
 
 

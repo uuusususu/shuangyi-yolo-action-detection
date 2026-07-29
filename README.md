@@ -37,6 +37,7 @@
 
 - 作业目标检测：识别当前画面中被操作的目标位置、动作点或工艺步骤类别。
 - 工艺顺序校验：按配置步骤逐项推进，确认工人是否按指定顺序作业。
+- 固定工位数量检测：搜索 ROI 内边缘模板定位触发一轮，在识别 ROI 内并行判定多个平级类别和数量。
 - 错序防呆：首步启动后，后续跳步、错序达到 NG 稳定帧立即 FAIL。
 - 现场追溯：NG 时保存证据图片和 metadata。
 - 生产统计：统计总数、OK、NG、良率，并支持手动归零归档。
@@ -71,6 +72,10 @@
           +--> PASS / FAIL 声音反馈
           +--> FAIL 证据保存
           +--> ProductionStats 生产统计归档
+
+    ROI 模式：EdgeTemplateModel 搜索 ROI 定位门控
+          -> RoiInspectionEngine 单帧触发与分类别数量锁存
+          +--> 同一套 PASS / FAIL、证据和生产统计
 
 ## 技术栈
 
@@ -111,6 +116,8 @@ PASS 和 NG 使用独立稳定帧配置。默认 PASS 1 帧、NG 2 帧，减少�
 
 打包目录包含模型、配置、声音和运行依赖。目标电脑只需要相机驱动，复制目录后即可双击运行。
 
+便携目录同时提供 `diagnose.bat`。目标电脑无法开始检测时运行该脚本，程序会实际加载 ONNX 处理器，并在 `logs\startup_diagnostics.log` 记录配置来源、模型路径和 SHA256、ONNX Runtime/provider、相机与推理错误及完整异常堆栈；`logs\portable_smoke_test.log` 保存便携自检摘要。将这两个文件复制回来即可定位模型缺失、绝对路径失效、运行库/DLL、模型损坏或推理异常。正常启动不计算完整模型哈希，不增加这部分启动等待。
+
 ### 7. 开源控件主题与明确交互边界
 
 界面使用 MIT 许可的 PyQtDarkTheme 管理 PySide6 标准按钮、输入框、下拉框、数字框和复选框。项目保留深蓝背景、青色强调、步骤状态和 PASS/FAIL 业务色，主题库负责控件边界、箭头以及默认、悬停、按下、焦点、选中和禁用状态，避免把可点击控件误认为普通文字。
@@ -124,6 +131,8 @@ PASS 和 NG 使用独立稳定帧配置。默认 PASS 1 帧、NG 2 帧，减少�
 | yolo_action_detection/src/camera | 相机采集、SDK 封装和推理线程 |
 | yolo_action_detection/src/yolo_runtime | YOLO OBB / ONNX Runtime 推理 |
 | yolo_action_detection/src/step_sequence | 工艺步骤顺序状态机 |
+| yolo_action_detection/src/template_matching | 搜索 ROI 内固定比例、多角度边缘模板定位 |
+| yolo_action_detection/src/roi_inspection | 识别 ROI 几何、单帧定位触发和分类别轮次引擎 |
 | yolo_action_detection/src/detection_logging | 声音反馈、FAIL 证据、生产统计记录 |
 | yolo_action_detection/config | 默认配置和 ONNX 模型 |
 | yolo_action_detection/assets | PASS / FAIL 声音、展示截图与演示素材 |
@@ -153,7 +162,10 @@ PASS 和 NG 使用独立稳定帧配置。默认 PASS 1 帧、NG 2 帧，减少�
 | --- | --- |
 | yolo_model_path | ONNX / YOLO 模型路径 |
 | category_names | 工艺步骤类别名称和顺序，演示默认 1号 到 5号，可随模型调整 |
-| first_category_region_check_enabled | 启用后类别 1 作为父区域，后续类别作为需归属到父区域内的子控件 |
+| roi_inspection_enabled | 是否启用固定工位 ROI 定位检测 |
+| roi_template_enabled | 是否启用边缘模板定位门控 |
+| roi_template_rect / roi_template_search_rect | 创建模板 ROI 和运行时搜索 ROI |
+| roi_inspection_rect | 归一化识别 ROI |
 | action_pass_stable_frames | PASS 稳定帧 |
 | action_ng_stable_frames | NG 稳定帧 |
 | action_order_constraint_enabled | 是否启用错序 NG |

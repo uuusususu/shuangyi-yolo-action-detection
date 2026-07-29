@@ -298,7 +298,7 @@ def test_camera_worker_releases_sdk_only_after_blocking_read_finishes(monkeypatc
     assert sdk.uninit_before_read_finished is False
 
 
-def test_camera_worker_close_clears_all_frames_and_runtime_overlay(monkeypatch):
+def test_camera_worker_close_clears_all_frames_and_runtime_overlay(qapp, monkeypatch):
     selected = FakeDeviceInfo("MV-Camera", "USB3", "SN-B")
     sdk = FrameMvSdk([selected])
     monkeypatch.setattr(mvsdk_camera_module, "get_mvsdk", lambda: sdk)
@@ -306,14 +306,19 @@ def test_camera_worker_close_clears_all_frames_and_runtime_overlay(monkeypatch):
     config.mvsdk_camera_sn = "SN-B"
     worker = CameraWorker(config, AppState())
     worker.set_frame_processor(EchoProcessor())
+    payloads = []
+    worker.overlay_state_updated.connect(lambda payload: payloads.append(payload))
 
-    assert worker.open_camera() is True
-    worker.start_inference()
-    assert wait_until(lambda: worker.get_display_frame()[0] is not None)
-    assert worker.get_latest_preview_frame() is not None
-    assert worker.get_latest_overlay().source_frame_id > 0
-
-    worker.close_camera()
+    try:
+        assert worker.open_camera() is True
+        worker.start_inference()
+        assert wait_until(lambda: worker.get_display_frame()[0] is not None)
+        assert wait_until(lambda: (qapp.processEvents() or bool(payloads)))
+        assert worker.get_latest_preview_frame() is not None
+        assert worker.get_latest_overlay().source_frame_id > 0
+        assert tuple(payloads[-1]["image_size"]) == (16, 8)
+    finally:
+        worker.close_camera()
 
     assert worker.get_latest_preview_frame() is None
     assert worker.get_display_frame() == (None, 0)
@@ -515,10 +520,13 @@ def test_camera_switch_clears_visual_and_inspection_session(
     config = ConfigManager()
     config._config_path = str(tmp_path / "config.json")
     config.mvsdk_camera_sn = "SN-OLD"
-    config.category_names = ["parent", "child", "", "", "", ""]
-    config.category_counts = [1, 1, 1, 1, 1, 1]
-    config.first_category_region_check_enabled = True
+    config.category_names = ["child", "", "", "", "", ""]
+    config.category_counts = [2, 1, 1, 1, 1, 1]
+    config.roi_inspection_enabled = True
+    config.roi_template_enabled = False
+    config.roi_inspection_rect = {"x": 0.5, "y": 0.0, "width": 0.5, "height": 1.0}
     processor = EchoProcessor()
+    processor.get_class_names = lambda: {0: "parent", 1: "child"}
     state = AppState()
     window = MainWindow(
         config,
@@ -528,25 +536,25 @@ def test_camera_switch_clears_visual_and_inspection_session(
         processor_factory=lambda *_args, **_kwargs: processor,
         evidence_base_dir=tmp_path / "evidence",
     )
-    parent = ObbDetection(
-        class_id=0,
-        label="parent",
+    child = ObbDetection(
+        class_id=1,
+        label="child",
         conf=0.95,
         track_id=7,
-        polygon=[(20, 20), (80, 20), (80, 80), (20, 80)],
-        box=(20, 20, 80, 80),
-        center=(50, 50),
+        polygon=[(60, 20), (90, 20), (90, 80), (60, 80)],
+        box=(60, 20, 90, 80),
+        center=(75, 50),
     )
-    old_pcb_engine = window._pcb_engine
-    old_pcb_engine.update([parent], image_size=(100, 100))
-    assert old_pcb_engine.pcb_states
+    old_roi_engine = window._roi_engine
+    old_roi_engine.update([child], image_size=(100, 100))
+    assert old_roi_engine.snapshot.phase.value == "inspecting"
 
     window._video_label.setPixmap(QPixmap(16, 16))
     window._latest_runtime_overlay = DetectionOverlayState(
         source_frame_id=12,
-        detections=[parent],
+        detections=[child],
     )
-    window._last_overlay_data = {"detections": [parent.to_dict()]}
+    window._last_overlay_data = {"detections": [child.to_dict()]}
     window._set_result_label("NG", "#F44336")
     window._set_notice("旧相机异常")
     window._step_cards[0].setVisible(True)
@@ -579,8 +587,8 @@ def test_camera_switch_clears_visual_and_inspection_session(
     assert window._latest_runtime_overlay == DetectionOverlayState()
     assert window._last_overlay_data == {}
     assert all(not card.isVisibleTo(window._steps_container) for card in window._step_cards)
-    assert window._pcb_engine is not old_pcb_engine
-    assert window._pcb_engine.pcb_states == {}
+    assert window._roi_engine is not old_roi_engine
+    assert window._roi_engine.snapshot.phase.value == "waiting_for_locator"
     assert window._notice_label.text() == ""
     assert window._notice_label.isVisible() is False
     assert window._result_label.text() == ""

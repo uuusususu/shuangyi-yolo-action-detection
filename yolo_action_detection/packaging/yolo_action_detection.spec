@@ -10,7 +10,8 @@ python_demo_dir = project_dir / "python_demo"
 
 datas = [
     (str(config_dir / "config.json"), "."),
-    (str(config_dir / "best.onnx"), "config"),
+    (str(config_dir / "config.example.json"), "."),
+    (str(config_dir / "jiaodian3.onnx"), "config"),
     (str(assets_dir / "sounds" / "Pass.wav"), "assets/sounds"),
     (str(assets_dir / "sounds" / "Fail.wav"), "assets/sounds"),
     (str(python_demo_dir / "mvsdk.py"), "python_demo"),
@@ -25,6 +26,10 @@ a = Analysis(
         "cv2",
         "numpy",
         "onnxruntime",
+        # 形状匹配与诊断是按需导入的，显式声明避免便携包里缺模块。
+        "template_matching.shape_model",
+        "template_matching.template_store",
+        "template_matching.match_diagnostics",
         "qdarktheme",
         "darkdetect",
         "PySide6.QtCore",
@@ -33,7 +38,7 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(project_dir / "packaging" / "windowed_stdio.py")],
     excludes=[
         "matplotlib",
         "pytest",

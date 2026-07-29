@@ -15,91 +15,100 @@ import cv2
 import numpy as np
 
 from config import ConfigManager
-from pcb_inspection.engine import MultiPcbInspectionEngine
-from pcb_inspection.models import PcbInspectionConfig, PcbResult
+from roi_inspection.engine import RoiInspectionEngine
+from roi_inspection.geometry import NormalizedRect
+from roi_inspection.models import InspectionOutcome, RoiInspectionConfig, RoundPhase
 from yolo_runtime.onnx_obb_processor import OnnxObbProcessor
 from yolo_runtime.yolo_result_models import DetectionOverlayState, ObbDetection
 
 
-def evaluate_first_category_region(
+def evaluate_roi_inspection(
     detections: list[ObbDetection],
     image_size: tuple[int, int],
     config,
+    model_class_names=None,
     frame_repetitions: Optional[int] = None,
 ) -> Dict[str, object]:
-    """用生产区域引擎验证父类优先、区域内子类别数量和最终结果。"""
-    if not getattr(config, "first_category_region_check_enabled", False):
+    """使用与实时检测相同的配置校验、ROI 几何和轮次引擎。"""
+    if not getattr(config, "roi_inspection_enabled", False):
         return {
             "ok": False,
             "status": "disabled",
-            "error": "首类别区域检查未启用",
-            "parents": [],
+            "error": "ROI 定位检测未启用",
+        }
+    errors = config.inspection_validation_errors(model_class_names)
+    if errors:
+        return {
+            "ok": False,
+            "status": "invalid_config",
+            "error": "；".join(errors),
+            "config_errors": errors,
         }
 
-    region_config = PcbInspectionConfig.from_first_category_config(config)
+    roi_config = RoiInspectionConfig.from_config(config)
     repetitions = frame_repetitions
     if repetitions is None:
-        repetitions = max(region_config.pass_stable_frames, region_config.fail_stable_frames)
+        repetitions = max(roi_config.pass_stable_frames, roi_config.fail_stable_frames)
     repetitions = max(1, int(repetitions))
 
-    engine = MultiPcbInspectionEngine(region_config)
+    engine = RoiInspectionEngine(roi_config)
     events = []
-    for _ in range(repetitions):
-        events.extend(engine.update(detections, image_size=image_size))
+    for index in range(repetitions):
+        events.extend(
+            engine.update(
+                detections,
+                image_size=image_size,
+                source_frame_id=index + 1,
+                timestamp=float(index),
+            )
+        )
+        if events:
+            break
 
-    parents = []
-    for track_id in sorted(engine.current_parent_ids):
-        state = engine.pcb_states[track_id]
-        parents.append({
-            "track_id": track_id,
-            "status": state.status.value,
-            "result": state.result.value,
-            "completed_classes": sorted(state.completed_classes),
-            "observed_counts": {
-                name: slot.observed_count
-                for name, slot in state.last_slot_states.items()
-            },
-            "required_counts": {
-                name: slot.required_count
-                for name, slot in state.last_slot_states.items()
-            },
-            "slot_statuses": {
-                name: slot.status.value
-                for name, slot in state.last_slot_states.items()
-            },
-        })
-
-    if not parents:
-        status = "no_parent"
-    elif any(parent["result"] == PcbResult.FAIL.value for parent in parents):
-        status = "ng"
-    elif all(parent["result"] == PcbResult.PASS.value for parent in parents):
+    snapshot = engine.snapshot
+    if snapshot.result and snapshot.result.outcome == InspectionOutcome.PASS:
         status = "pass"
+    elif snapshot.result and snapshot.result.outcome == InspectionOutcome.FAIL:
+        status = "ng"
+    elif snapshot.phase == RoundPhase.WAITING_FOR_LOCATOR:
+        status = "waiting_locator"
     else:
-        status = "waiting"
+        status = "inspecting"
 
     errors = {
         "pass": "",
-        "no_parent": f"未识别到父类: {region_config.pcb_class_name}",
-        "ng": "父类区域内子类别数量异常",
-        "waiting": "父类已识别，但子步骤尚未全部完成",
+        "waiting_locator": "等待模板匹配定位或识别 ROI 内出现目标",
+        "ng": "识别 ROI 内待检类别数量异常",
+        "inspecting": "已触发本轮，但稳定帧尚未达到 PASS/FAIL 阈值",
     }
 
     return {
         "ok": status == "pass",
         "status": status,
         "error": errors[status],
-        "parent_class": region_config.pcb_class_name,
-        "child_required_counts": dict(region_config.component_required_counts),
-        "parent_detection_count": len(parents),
+        "round_id": snapshot.round_id,
+        "phase": snapshot.phase.value,
+        "template_enabled": roi_config.template_enabled,
+        "template_matched": snapshot.template_matched,
+        "template_score": snapshot.template_score,
         "frame_repetitions": repetitions,
-        "parents": parents,
+        "categories": {
+            name: {
+                "observed_count": state.observed_count,
+                "required_count": state.required_count,
+                "passed": state.passed,
+                "match_streak": state.match_streak,
+                "mismatch_streak": state.mismatch_streak,
+            }
+            for name, state in snapshot.category_states.items()
+        },
         "events": [
             {
-                "track_id": result.track_id,
-                "result": result.result.value,
-                "observed_counts": dict(result.observed_counts),
+                "round_id": result.round_id,
+                "result": result.outcome.value,
+                "observed_counts": dict(result.actual_counts),
                 "required_counts": dict(result.required_counts),
+                "failed_categories": list(result.failed_categories),
             }
             for result in events
         ],
@@ -113,8 +122,8 @@ def run_validation(
     conf_threshold: float = 0.3,
     iou_threshold: float = 0.5,
     processor_factory: Optional[Type[OnnxObbProcessor] | Callable[..., object]] = None,
-    region_config_path: Optional[Path | str] = None,
-    region_frame_repetitions: Optional[int] = None,
+    roi_config_path: Optional[Path | str] = None,
+    roi_frame_repetitions: Optional[int] = None,
 ) -> Dict[str, object]:
     """Run ONNX OBB inference on one image and write summary + annotated image."""
     image_path = Path(image_path)
@@ -179,20 +188,23 @@ def run_validation(
         "detection_count": len(overlay.detections),
         "detections": [det.to_dict() for det in overlay.detections],
     }
-    if region_config_path is not None:
-        region_config = ConfigManager()
-        region_config.load(region_config_path)
-        region_summary = evaluate_first_category_region(
+    if roi_config_path is not None:
+        roi_config = ConfigManager()
+        roi_config.load(roi_config_path)
+        roi_summary = evaluate_roi_inspection(
             overlay.detections,
             image_size=(int(frame.shape[1]), int(frame.shape[0])),
-            config=region_config,
-            frame_repetitions=region_frame_repetitions,
+            config=roi_config,
+            model_class_names=processor.get_class_names().values(),
+            frame_repetitions=roi_frame_repetitions,
         )
-        summary["first_category_region"] = region_summary
-        if not region_summary["ok"]:
+        summary["roi_inspection"] = roi_summary
+        annotated = draw_roi_rects(annotated, roi_config)
+        write_image(annotated_path, annotated)
+        if not roi_summary["ok"]:
             summary["ok"] = False
             if not summary["error"]:
-                summary["error"] = region_summary["error"]
+                summary["error"] = roi_summary["error"]
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -230,6 +242,27 @@ def draw_overlay(frame: np.ndarray, overlay: DetectionOverlayState) -> np.ndarra
             2,
             cv2.LINE_AA,
         )
+    return frame
+
+
+def draw_roi_rects(frame: np.ndarray, config) -> np.ndarray:
+    """在静态验收图上绘制与实时界面一致的识别 ROI。"""
+    if not getattr(config, "roi_inspection_enabled", False):
+        return frame
+    height, width = frame.shape[:2]
+    for value, color, label in (
+        (config.roi_inspection_rect, (87, 217, 126), "INSPECTION"),
+    ):
+        try:
+            rect = NormalizedRect.from_mapping(value)
+        except ValueError:
+            continue
+        x, y, rect_width, rect_height = rect.to_pixel_rect((width, height))
+        p1 = (int(round(x)), int(round(y)))
+        p2 = (int(round(x + rect_width)), int(round(y + rect_height)))
+        cv2.rectangle(frame, p1, p2, color, 2)
+        cv2.putText(frame, label, (p1[0] + 4, max(18, p1[1] + 18)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
     return frame
 
 
@@ -271,13 +304,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.3, help="Confidence threshold.")
     parser.add_argument("--iou", type=float, default=0.5, help="Rotated NMS IoU threshold.")
     parser.add_argument(
-        "--region-config",
-        help="启用首类别区域业务验证时使用的配置 JSON。",
+        "--roi-config",
+        help="启用 ROI 定位业务验收时使用的配置 JSON。",
     )
     parser.add_argument(
-        "--region-frames",
+        "--roi-frames",
         type=int,
-        help="静态检测结果重复送入区域引擎的帧数；默认使用 PASS/FAIL 稳定帧最大值。",
+        help="静态检测结果重复送入 ROI 引擎的帧数；默认使用 PASS/FAIL 稳定帧最大值。",
     )
     return parser.parse_args()
 
@@ -290,8 +323,8 @@ def main() -> int:
         output_dir=args.output_dir,
         conf_threshold=args.conf,
         iou_threshold=args.iou,
-        region_config_path=args.region_config,
-        region_frame_repetitions=args.region_frames,
+        roi_config_path=args.roi_config,
+        roi_frame_repetitions=args.roi_frames,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary.get("ok") else 2

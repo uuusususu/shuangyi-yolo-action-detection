@@ -7,9 +7,10 @@
 ## What Changes
 
 - **BREAKING**：用“固定比例、多角度、搜索 ROI 内的边缘 NCC 模板匹配”替换 SIFT + FLANN + Homography 定位，不再使用“最少 SIFT 匹配点数”。
-- 新增独立的“搜索 ROI”。模板 ROI 必须完全位于搜索 ROI 内；运行时只在搜索 ROI 中查找模板。
-- ROI 配置页改为统一的 ROI 类型下拉框，支持选择“识别 ROI / 模板 ROI / 搜索 ROI”后创建或替换。
-- 点击“保存模板”后才创建正式模板。保存时从模板 ROI 提取真实边缘轮廓，并在同一静态原图的搜索 ROI 内执行一次回查。
+- 新增独立的“搜索 ROI”。模板 ROI、搜索 ROI、识别 ROI 互不关联：模板 ROI 只负责创建模板，搜索 ROI 只限制运行时查找范围，识别 ROI 只负责 YOLO 类别数量判断。
+- ROI 配置页只保留一套操作：在下拉框选择“识别 ROI / 模板 ROI / 搜索 ROI”后创建或替换，并通过编辑器下方的“保存当前 ROI”单独保存所选 ROI。
+- 保存模板 ROI 时只校验模板 ROI，从该区域提取真实边缘轮廓，并在模板 ROI 自身范围完成创建回查；不得要求搜索 ROI 或识别 ROI 已配置。
+- 删除配置页中间的模板裁剪预览；模板创建结果直接显示在 ROI 静态原图上。
 - 保存验证成功后，在 ROI 编辑原图上显示绿色模板轮廓、绿色外框和创建得分；不再仅依赖裁剪图片说明模板内容。
 - 保存验证失败时显示红色结果和具体原因，不覆盖旧模板、旧配置或旧运行处理器。
 - 运行时每帧先在搜索 ROI 内做模板匹配；匹配成功才调用现有整图 YOLO 处理器，匹配失败跳过该帧 YOLO。
@@ -33,7 +34,7 @@
 
 - `yolo_action_detection/src/template_matching/`：用完整边缘 NCC 模板模型替换 SIFT 定位器，提供创建、查找、轮廓和得分结果。
 - `yolo_action_detection/src/yolo_runtime/template_gated_processor.py`：改为在搜索 ROI 中调用边缘模板模型，命中后继续调用原有 YOLO。
-- `yolo_action_detection/src/config.py`：新增搜索 ROI、角度步进和版本迁移；删除 SIFT 最少匹配点配置。
+- `yolo_action_detection/src/config.py`：新增搜索 ROI、角度步进和版本迁移；删除 SIFT 最少匹配点配置及三种 ROI 之间的位置包含约束。
 - `yolo_action_detection/src/ui/roi_editor.py`：新增搜索 ROI 类型和保存后模板轮廓/得分覆盖层。
 - `yolo_action_detection/src/ui/config_page.py`：新增统一 ROI 类型下拉框及保存后创建验证反馈。
 - `yolo_action_detection/src/ui/main_window.py`：主画面仅显示搜索 ROI 框，并清理成功启动后的旧错误提示。

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -13,7 +12,7 @@ SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication
 
 from config import ConfigManager
 from ui.config_page import ConfigPage
@@ -41,7 +40,7 @@ def test_config_navigation_preserves_unsaved_values(qapp):
         "动作判定",
         "工业相机",
         "显示与反馈",
-        "区域检查",
+        "ROI 配置",
         "生产统计",
     ]
     assert page._model_path_input.text() == "unsaved-model.onnx"
@@ -73,25 +72,3 @@ def test_recognition_item_displays_quantity_and_semantic_states(qapp):
     item.set_step_state("ng")
     assert item.state_name() == "ng"
     assert item.status_text() == "NG"
-
-
-def test_region_save_uses_shared_round_interval(qapp, tmp_path, monkeypatch):
-    config = ConfigManager()
-    config._config_path = str(tmp_path / "config.json")
-    config.category_names = ["父区域", "子控件", "", "", "", ""]
-    page = ConfigPage(config)
-    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: None)
-
-    page._first_category_region_cb.setChecked(True)
-    page._cooldown_input.setValue(10.0)
-    page._action_ng_frames_input.setValue(10)
-    page._pcb_margin_input.setValue(0.2)
-    page._on_save()
-
-    saved = json.loads(Path(config.get_config_path()).read_text(encoding="utf-8"))
-    assert saved["first_category_region_check_enabled"] is True
-    assert saved["round_cooldown_seconds"] == 10.0
-    assert saved["pcb_round_interval_seconds"] == 10.0
-    assert saved["action_ng_stable_frames"] == 10
-    assert saved["pcb_fail_stable_frames"] == 10
-    assert saved["pcb_assignment_margin_ratio"] == 0.2

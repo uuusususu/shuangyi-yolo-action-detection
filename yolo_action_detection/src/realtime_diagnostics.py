@@ -69,6 +69,13 @@ def run_realtime_diagnostics(
     """Run the real camera/YOLO worker for a short interval and return metrics."""
     config = ConfigManager()
     config.load(config_path)
+    structural_errors = config.inspection_validation_errors(None)
+    if structural_errors:
+        return {
+            "ok": False,
+            "error": "inspection_config_invalid",
+            "config_errors": structural_errors,
+        }
     state = AppState()
     worker = CameraWorker(config, state)
 
@@ -88,6 +95,16 @@ def run_realtime_diagnostics(
                 "duration_s": round(max(0.0, time.time() - started_at), 3),
             }
         processor = processor_factory(config)
+        class_names = processor.get_class_names()
+        class_values = class_names.values() if isinstance(class_names, dict) else class_names
+        config_errors = config.inspection_validation_errors(class_values)
+        if config_errors:
+            return {
+                "ok": False,
+                "error": "inspection_config_invalid",
+                "config_errors": config_errors,
+                "duration_s": round(max(0.0, time.time() - started_at), 3),
+            }
         worker.set_frame_processor(processor)
         worker.start_inference()
         deadline = time.time() + max(0.1, float(duration_s))

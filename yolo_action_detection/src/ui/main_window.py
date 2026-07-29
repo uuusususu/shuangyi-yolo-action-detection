@@ -25,8 +25,12 @@ from detection_logging.coordinate_logger import (
 from detection_logging.audio_feedback import SoundFeedback
 from detection_logging.fail_evidence import FailEvidenceContext, FailEvidenceSaver
 from detection_logging.production_stats import ProductionStatsManager
-from pcb_inspection.models import PcbInspectionConfig, PcbResult, PcbStatus, SlotStatus
-from pcb_inspection.engine import MultiPcbInspectionEngine
+from runtime_diagnostics import get_runtime_logger
+from roi_inspection.engine import RoiInspectionEngine
+from roi_inspection.geometry import NormalizedRect
+from roi_inspection.models import InspectionOutcome, RoiInspectionConfig, RoundPhase
+from template_matching.match_diagnostics import get_recorder as get_template_diagnostics
+from ui.roi_fail_alert_dialog import RoiFailAlertDialog
 from step_sequence.step_sequence_engine import StepSequenceEngine, RoundResult, StepStatus
 from ui.runtime_ui_tokens import (
     FONT_TITLE,
@@ -52,6 +56,7 @@ from ui.widgets.native_panels import (
     RecognitionListItem,
 )
 from yolo_runtime.yolo_result_models import DetectionOverlayState, ObbDetection
+from template_matching.template_store import resolve_template_path, template_file_signature
 
 
 class MainWindow(QMainWindow):
@@ -70,6 +75,7 @@ class MainWindow(QMainWindow):
         evidence_base_dir=None,
         processor_factory: Optional[Callable] = None,
         app_base_dir=None,
+        runtime_log_path=None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -84,8 +90,10 @@ class MainWindow(QMainWindow):
         )
         self._runtime_model_signature = self._model_runtime_signature(config)
         self._step_engine_signature = self._step_engine_config_signature(config)
-        self._pcb_engine_signature: Optional[tuple] = None
+        self._roi_engine_signature: Optional[tuple] = None
         self._last_model_reload_error = ""
+        self._runtime_logger = get_runtime_logger()
+        self._runtime_log_path = Path(runtime_log_path) if runtime_log_path else None
 
         self.setWindowTitle("双翼科技视觉行为引导系统")
         self.setMinimumSize(1200, 760)
@@ -104,14 +112,13 @@ class MainWindow(QMainWindow):
         self._last_counted_pass_round = -1
         self._last_counted_ng_key: Optional[tuple] = None
         self._played_result_sound_keys: dict[tuple, None] = {}
-        self._handled_region_result_keys: dict[tuple, None] = {}
+        self._handled_roi_result_keys: dict[tuple, None] = {}
         self._round_start_time = 0.0
-        # 区域/PCB 检查引擎（按需创建）
-        self._pcb_engine: Optional[MultiPcbInspectionEngine] = None
-        self._pcb_overlay_parent_class = ""
-        self._pcb_overlay_child_classes: List[str] = []
+        # 固定工位 ROI 定位检测引擎（按需创建）。
+        self._roi_engine: Optional[RoiInspectionEngine] = None
+        self._roi_fail_alert: Optional[RoiFailAlertDialog] = None
         self._latest_runtime_overlay = DetectionOverlayState()
-        self._init_pcb_engine()
+        self._init_roi_engine()
         # 下一轮启动定时器：完成一轮后保持当前步骤框颜色，到间隔结束再开始新一轮。
         self._round_pass_timer = QTimer(self)
         self._round_pass_timer.setSingleShot(True)
@@ -158,21 +165,41 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._refresh_steps()
         self._sync_button_states()
+        self._runtime_logger.info(
+            "main_window=ready processor_available=%s log_path=%s",
+            self.processor is not None,
+            self._runtime_log_path or "unavailable",
+        )
+        if self.processor is None:
+            self._show_processor_log_notice()
 
-    def _init_pcb_engine(self) -> None:
-        """根据配置创建或销毁区域/PCB 检查引擎。"""
-        self._played_result_sound_keys.clear()
-        self._handled_region_result_keys.clear()
-        self._pcb_engine_signature = self._pcb_engine_config_signature(self.config)
-        if getattr(self.config, "first_category_region_check_enabled", False):
-            pcb_config = PcbInspectionConfig.from_first_category_config(self.config)
-            self._pcb_engine = MultiPcbInspectionEngine(pcb_config)
-            self._pcb_overlay_parent_class = pcb_config.pcb_class_name
-            self._pcb_overlay_child_classes = [n for n in pcb_config.component_class_names if n]
+    def _show_processor_log_notice(self) -> None:
+        if self._runtime_log_path is not None:
+            self._set_notice(f"处理器未加载，请复制日志文件：{self._runtime_log_path}")
         else:
-            self._pcb_engine = None
-            self._pcb_overlay_parent_class = ""
-            self._pcb_overlay_child_classes = []
+            self._set_notice("处理器未加载，且诊断日志目录不可写。")
+
+    def _init_roi_engine(self) -> None:
+        """根据当前有效配置创建或清空 ROI 轮次引擎。"""
+        self._played_result_sound_keys.clear()
+        self._handled_roi_result_keys.clear()
+        self._roi_engine_signature = self._roi_engine_config_signature(self.config)
+        self._roi_engine = None
+        if not getattr(self.config, "roi_inspection_enabled", False):
+            return
+        if self.config.inspection_validation_errors(self._current_model_class_names()):
+            return
+        self._roi_engine = RoiInspectionEngine(RoiInspectionConfig.from_config(self.config))
+
+    def _current_model_class_names(self) -> List[str]:
+        if self.processor is None or not hasattr(self.processor, "get_class_names"):
+            return []
+        try:
+            names = self.processor.get_class_names()
+        except Exception:
+            return []
+        values = names.values() if isinstance(names, dict) else names
+        return [str(name).strip() for name in values if str(name).strip()]
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -370,7 +397,7 @@ class MainWindow(QMainWindow):
             self._steps_hint = None
 
         names = self._effective_step_names()
-        counts = getattr(self.config, "category_counts", []) or []
+        counts = self.config.get_runtime_category_counts()
         for i, name in enumerate(names):
             engine_idx = self._card_to_engine_index(i)
             required = counts[engine_idx] if 0 <= engine_idx < len(counts) else 1
@@ -409,6 +436,8 @@ class MainWindow(QMainWindow):
             overlay = self.worker.get_latest_overlay()
         if self._overlay_is_fresh(overlay):
             frame = self._draw_overlay(frame, overlay)
+        elif self._roi_engine is not None:
+            frame = self._draw_roi_overlay(frame)
         self._show_frame(frame)
 
     def _overlay_is_fresh(self, overlay) -> bool:
@@ -424,86 +453,48 @@ class MainWindow(QMainWindow):
         return (time.time() - timestamp) * 1000 <= max_age_ms
 
     def _draw_overlay(self, frame: np.ndarray, overlay) -> np.ndarray:
-        if not overlay or not overlay.detections:
-            return frame
-        show_conf = self.config.show_confidence_overlay
-        show_tid = self.config.show_track_id_overlay
-        for det in overlay.detections:
-            if len(det.polygon) < 4:
-                continue
-            pts = np.array(det.polygon, dtype=np.int32)
-            cv2.polylines(frame, [pts], True, (0, 255, 128), 2)
-            label_parts = [det.label]
-            if show_conf:
-                label_parts.append(f"{det.conf:.2f}")
-            if show_tid and det.track_id is not None:
-                label_parts.append(f"#{det.track_id}")
-            label = " ".join(label_parts)
-            tx, ty = int(det.polygon[0][0]), int(det.polygon[0][1]) - 5
-            cv2.putText(frame, label, (tx, max(15, ty)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 1)
+        if overlay:
+            show_conf = self.config.show_confidence_overlay
+            show_tid = self.config.show_track_id_overlay
+            for det in overlay.detections:
+                if len(det.polygon) < 4:
+                    continue
+                pts = np.array(det.polygon, dtype=np.int32)
+                cv2.polylines(frame, [pts], True, (0, 255, 128), 2)
+                label_parts = [det.label]
+                if show_conf:
+                    label_parts.append(f"{det.conf:.2f}")
+                if show_tid and det.track_id is not None:
+                    label_parts.append(f"#{det.track_id}")
+                label = " ".join(label_parts)
+                tx, ty = int(det.polygon[0][0]), int(det.polygon[0][1]) - 5
+                cv2.putText(frame, label, (tx, max(15, ty)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 1)
+            frame = self._draw_tip_and_holes(frame, overlay)
 
-        frame = self._draw_tip_and_holes(frame, overlay)
-
-        # 首类别区域检查：在画面上绘制父区域 ID、子控件归属标注和连续 FAIL 帧
-        if self._pcb_engine is not None:
-            frame = self._draw_pcb_overlay(frame, overlay)
+        if self._roi_engine is not None:
+            frame = self._draw_roi_overlay(frame)
 
         return frame
 
-    def _draw_pcb_overlay(self, frame: np.ndarray, overlay) -> np.ndarray:
-        """在画面上绘制父区域 ID、已识别子控件、连续 FAIL 帧和最终结果。"""
-        if not self._pcb_engine:
+    def _draw_roi_overlay(self, frame: np.ndarray) -> np.ndarray:
+        """模板定位启用时，主画面只绘制搜索 ROI 矩形。"""
+        if self._roi_engine is None or not bool(
+            getattr(self.config, "roi_template_enabled", False)
+        ):
             return frame
-        pcb_class = self._pcb_overlay_parent_class or getattr(self.config, "pcb_class_name", "pcb")
-        comp_names = list(self._pcb_overlay_child_classes)
-
-        # 找到画面中的 PCB 检测
-        for det in overlay.detections:
-            if det.label != pcb_class or det.track_id is None:
-                continue
-            tid = det.track_id
-            state = self._pcb_engine.pcb_states.get(tid)
-            if state is None:
-                continue
-
-            # 在 PCB OBB 中心上方绘制 PCB ID 和状态
-            cx, cy = int(det.center[0]), int(det.center[1])
-            label_y = cy - 30
-
-            # 状态颜色
-            if state.result.value == "pass":
-                color = (0, 200, 0)   # 绿色
-            elif state.result.value == "fail":
-                color = (0, 0, 255)   # 红色
-            else:
-                color = (255, 200, 0) # 橙色
-
-            parent_points = np.array(det.polygon, dtype=np.int32)
-            cv2.polylines(frame, [parent_points], True, color, 3)
-
-            # 父区域 ID
-            cv2.putText(frame, f"区域 #{tid}", (cx - 40, label_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-            # 结果标签
-            if state.result.value == "pass":
-                cv2.putText(frame, "PASS", (cx - 25, label_y + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            elif state.result.value == "fail":
-                missing = "/".join(state.missing_classes[:3])
-                cv2.putText(frame, f"NG 数量:{missing}", (cx - 60, label_y + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            else:
-                # 显示连续 FAIL 帧数和已识别槽位
-                identified = sum(
-                    1 for s in state.last_slot_states.values() if s.present
-                )
-                total = len(comp_names)
-                cv2.putText(frame, f"{identified}/{total} FAIL:{state.consecutive_fail}",
-                            (cx - 50, label_y + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
+        search_mapping = getattr(self.config, "roi_template_search_rect", None)
+        if not search_mapping:
+            return frame
+        height, width = frame.shape[:2]
+        try:
+            search_rect = NormalizedRect.from_mapping(search_mapping)
+        except ValueError:
+            return frame
+        x, y, rect_width, rect_height = search_rect.to_pixel_rect((width, height))
+        p1 = (int(round(x)), int(round(y)))
+        p2 = (int(round(x + rect_width)), int(round(y + rect_height)))
+        cv2.rectangle(frame, p1, p2, (71, 181, 255), 2)
         return frame
 
     def _draw_tip_and_holes(self, frame: np.ndarray, overlay) -> np.ndarray:
@@ -681,6 +672,18 @@ class MainWindow(QMainWindow):
         self._notice_label.setText(text)
         self._notice_label.setVisible(bool(text))
 
+    def _clear_stale_roi_notice(self) -> None:
+        text = self._notice_label.text()
+        roi_error_markers = (
+            "识别 ROI 未配置",
+            "模板 ROI 未配置",
+            "搜索 ROI 未配置",
+            "ROI 检测配置无法初始化",
+            "请检查定位模板、识别 ROI",
+        )
+        if any(marker in text for marker in roi_error_markers):
+            self._set_notice("")
+
     def _start_next_round_after_pass(self) -> None:
         if not self.step_engine:
             return
@@ -773,138 +776,51 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _handle_pcb_ng_feedback(
-        self,
-        result,
-        frame_id: int,
-        *,
-        save_evidence: bool = True,
-    ) -> None:
-        """PCB FAIL 时播放声音和保存证据。"""
-        self._play_fail_feedback(
-            (
-                "region",
-                int(result.track_id),
-                int(getattr(result, "attempt_id", 0)),
-                "fail",
+    def _save_roi_fail_evidence(self, result, frame_id: int) -> None:
+        if not getattr(self.config, "fail_evidence_enabled", True):
+            return
+        try:
+            frame, _ = self._get_feedback_frame()
+            data = self._last_overlay_data or {}
+            context = FailEvidenceContext(
+                round_id=int(result.round_id),
+                action_ng_step=-1,
+                step_name=f"ROI 数量异常: {'/'.join(result.failed_categories)}",
+                source_frame_id=int(frame_id),
+                detections=list(data.get("detections", []) or []),
+                model_path=str(data.get("model_path", "")),
+                timestamp=float(result.timestamp or time.time()),
             )
-        )
-        if save_evidence and getattr(self.config, "fail_evidence_enabled", True):
-            try:
-                frame, _ = self._get_feedback_frame()
-                data = self._last_overlay_data or {}
-                context = FailEvidenceContext(
-                    round_id=int(result.track_id),
-                    action_ng_step=-1,
-                    step_name=f"区域 #{result.track_id} 数量异常: {'/'.join(result.missing_classes)}",
-                    source_frame_id=int(frame_id),
-                    detections=list(data.get("detections", []) or []),
-                    model_path=str(data.get("model_path", "")),
-                    timestamp=float(result.timestamp or time.time()),
-                )
-                self._fail_evidence_saver.save_fail_event(frame, context)
-            except Exception:
-                pass
+            self._fail_evidence_saver.save_fail_event(frame, context)
+        except Exception:
+            pass
 
-    def _sync_region_step_cards(self, result) -> None:
-        """首类别区域检查结果同步到右侧步骤卡片，并在间隔期保持颜色。"""
-        if not getattr(self.config, "first_category_region_check_enabled", False):
+    def _sync_roi_cards(self) -> None:
+        """把 ROI 平级类别的实时数量和锁存状态同步到识别列表。"""
+        if self._roi_engine is None:
             return
-        missing = set(getattr(result, "missing_classes", []) or [])
-        child_names = set(self._pcb_overlay_child_classes)
-        observed_counts = dict(getattr(result, "observed_counts", {}) or {})
-        required_counts = dict(getattr(result, "required_counts", {}) or {})
-        recognized_count = 1 if self._step_cards else 0
-        for index, card in enumerate(self._step_cards):
-            if index == 0:
-                card.setVisible(True)
-                card.set_quantity_progress(1, 1)
-                if result.result == PcbResult.PASS:
-                    card.set_step_state("pass", hint=f"区域 #{result.track_id} 检查通过")
-                else:
-                    card.set_step_state("ng", hint=f"区域 #{result.track_id} 子控件数量不符")
-                continue
+        snapshot = self._roi_engine.snapshot
+        recognized_count = 0
+        for card in self._step_cards:
             name = card._name_label.text() if hasattr(card, "_name_label") else ""
-            current = observed_counts.get(name, 0)
-            required = required_counts.get(name, 1)
-            should_show = current > 0 or name in missing
-            card.setVisible(should_show)
-            card.set_quantity_progress(current, required)
-            recognized_count += int(should_show)
-            if name in child_names and name not in missing:
-                card.set_step_state("pass", hint="已识别")
-            elif name in missing:
-                card.set_step_state("ng", hint="数量不符")
-            else:
-                card.set_step_state("waiting")
-        self._sync_recognition_empty_state(recognized_count)
-
-    def _sync_region_observation_cards(self) -> None:
-        """显示当前轮次父类的步骤，不把历史观测或旧 FAIL ID 混进来。"""
-        if self._pcb_engine is None:
-            return
-        current_id = self._pcb_engine.current_round_id
-        if current_id is None:
-            self._clear_region_step_cards()
-            return
-        state = self._pcb_engine.pcb_states.get(current_id)
-        if state is None or state.status == PcbStatus.RETIRED:
-            self._clear_region_step_cards()
-            return
-        if current_id not in self._pcb_engine.current_parent_ids:
-            self._clear_region_step_cards()
-            return
-
-        recognized_count = 1 if self._step_cards else 0
-        for index, card in enumerate(self._step_cards):
-            if index == 0:
-                card.setVisible(True)
-                if state.result == PcbResult.FAIL:
-                    card.set_step_state("ng", hint=f"区域 #{state.track_id} 数量异常")
-                elif state.result == PcbResult.PASS:
-                    card.set_step_state("pass", hint=f"区域 #{state.track_id} 检查通过")
-                elif state.status == PcbStatus.COOLDOWN:
-                    card.set_step_state("active", hint=f"区域 #{state.track_id} 等待下一轮间隔")
-                else:
-                    card.set_step_state("active", hint=f"区域 #{state.track_id} 检查中")
-                card.set_quantity_progress(1, 1)
-                continue
-            name = card._name_label.text() if hasattr(card, "_name_label") else ""
-            slot = state.last_slot_states.get(name)
-            if slot is None:
+            category = snapshot.category_states.get(name)
+            if category is None:
                 card.setVisible(False)
-                card.set_step_state("waiting")
                 continue
-            should_show = (
-                slot.observed_count > 0
-                or slot.present
-                or slot.status in (SlotStatus.MISMATCHING, SlotStatus.NG_LATCHED, SlotStatus.COMPLETED)
-                or name in state.missing_classes
-            )
-            card.setVisible(should_show)
-            card.set_quantity_progress(slot.observed_count, slot.required_count)
-            recognized_count += int(should_show)
-            if slot.status == SlotStatus.COMPLETED:
-                card.set_step_state("pass", hint="数量匹配")
-            elif slot.status == SlotStatus.NG_LATCHED or (name in state.missing_classes and state.result == PcbResult.FAIL):
+            card.setVisible(True)
+            card.set_quantity_progress(category.observed_count, category.required_count)
+            recognized_count += int(category.observed_count > 0 or category.passed)
+            if category.passed:
+                card.set_step_state("pass", hint="数量匹配并已锁存")
+            elif snapshot.result and name in snapshot.result.failed_categories:
                 card.set_step_state("ng", hint="数量不符")
-            elif slot.status == SlotStatus.MATCHING:
-                card.set_step_state("active", hint="数量匹配中")
-            elif slot.status == SlotStatus.MISMATCHING or slot.observed_count > 0:
-                card.set_step_state("active", hint="数量不符")
+            elif snapshot.phase == RoundPhase.WAITING_FOR_LOCATOR:
+                card.set_step_state("waiting", hint="等待定位")
+            elif snapshot.phase == RoundPhase.RESULT_HOLD:
+                card.set_step_state("waiting", hint="等待下一轮")
             else:
-                card.set_step_state("waiting")
+                card.set_step_state("active", hint="数量判定中")
         self._sync_recognition_empty_state(recognized_count)
-
-    def _clear_region_step_cards(self) -> None:
-        counts = getattr(self.config, "category_counts", []) or []
-        for index, card in enumerate(self._step_cards):
-            engine_index = self._card_to_engine_index(index)
-            required = counts[engine_index] if 0 <= engine_index < len(counts) else 1
-            card.set_quantity_progress(0, required)
-            card.set_step_state("waiting")
-            card.setVisible(False)
-        self._sync_recognition_empty_state(0)
 
     def _get_feedback_frame(self):
         try:
@@ -1033,6 +949,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_error(self, msg: str) -> None:
+        self._runtime_logger.error("runtime_error=%s", msg)
         self._status_label.setText(f"错误: {msg}")
         self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
         self._set_notice(msg)
@@ -1054,15 +971,62 @@ class MainWindow(QMainWindow):
             ))
 
         state = None
-        if self._pcb_engine is not None:
-            # 首类别区域检查模式
-            image_size = data.get("image_size")
-            pcb_results = self._pcb_engine.update(obb_dets, image_size=image_size)
-            obb_dets = self._pcb_engine.last_resolved_detections
-            self._last_overlay_data["detections"] = [detection.to_dict() for detection in obb_dets]
-            self._handle_pcb_results(pcb_results, data.get("source_frame_id", 0))
-            if not pcb_results:
-                self._sync_region_observation_cards()
+        if self._roi_engine is not None:
+            raw_image_size = tuple(data.get("image_size") or ())
+            image_size = raw_image_size if len(raw_image_size) == 2 else ()
+            image_size_source = "overlay"
+            if not image_size or any(float(value) <= 0 for value in image_size):
+                display_frame, _ = self.worker.get_display_frame()
+                if display_frame is not None:
+                    frame_height, frame_width = display_frame.shape[:2]
+                    image_size = (int(frame_width), int(frame_height))
+                    image_size_source = "display_frame"
+                else:
+                    image_size_source = "unavailable"
+
+            sample_centers = []
+            for d in detections[:3]:
+                c = d.get("center", d.get("center_px", (0, 0)))
+                if c:
+                    sample_centers.append((float(c[0]), float(c[1])))
+            self._runtime_logger.info(
+                "roi_overlay_received frame_id=%s det_count=%d image_size=%s image_size_source=%s "
+                "sample_centers=%s labels=%s",
+                data.get("source_frame_id", 0),
+                len(detections),
+                tuple(image_size) if image_size else None,
+                image_size_source,
+                sample_centers,
+                {d.get("label", ""): 1 for d in detections},
+            )
+
+            roi_results = []
+            if image_size:
+                template_match = {
+                    "matched": data.get("template_matched", False),
+                    "score": data.get("template_score", 0.0),
+                    "center": data.get("template_center"),
+                    "angle": data.get("template_angle"),
+                }
+                previous_round_id = self._roi_engine.snapshot.round_id
+                roi_results = self._roi_engine.update(
+                    obb_dets,
+                    image_size=image_size,
+                    source_frame_id=data.get("source_frame_id", 0),
+                    timestamp=data.get("timestamp") or None,
+                    template_match=template_match,
+                )
+                if self._roi_engine.snapshot.round_id != previous_round_id and not roi_results:
+                    self._clear_result_label()
+                    self._set_notice("")
+            else:
+                self._runtime_logger.error(
+                    "roi_update=skipped reason=image_size_unavailable frame_id=%s",
+                    data.get("source_frame_id", 0),
+                )
+                self._set_notice("ROI 定位失败：无法获取原始帧尺寸")
+            self._handle_roi_results(roi_results, data.get("source_frame_id", 0))
+            self._sync_roi_cards()
         elif self.step_engine:
             try:
                 state = self.step_engine.update(obb_dets, frame_id=data.get("source_frame_id", 0))
@@ -1085,59 +1049,67 @@ class MainWindow(QMainWindow):
         self._record_coordinate_log(overlay, state)
         self._update_display()
 
-    def _handle_pcb_results(self, results: list, frame_id: int) -> None:
-        """处理 PCB 检查结果，接入声音/证据/统计。"""
+    def _handle_roi_results(self, results: list, frame_id: int) -> None:
+        """整轮结果只接入一次统计、声音和证据。"""
         for result in results:
-            result_key = (
-                "region-result",
-                int(result.track_id),
-                int(getattr(result, "attempt_id", 0)),
-                result.result.value,
-            )
+            result_key = ("roi-result", result.feedback_key)
             is_new_result = self._remember_result_key(
-                self._handled_region_result_keys,
+                self._handled_roi_result_keys,
                 result_key,
             )
-            if result.result == PcbResult.PASS:
-                if is_new_result:
-                    self._stats_manager.record_pass()
-                self._play_pass_feedback(
-                    (
-                        "region",
-                        int(result.track_id),
-                        int(getattr(result, "attempt_id", 0)),
-                        "pass",
-                    )
-                )
+            if not is_new_result:
+                continue
+            if result.outcome == InspectionOutcome.PASS:
+                self._stats_manager.record_pass()
+                self._play_pass_feedback(("roi", result.feedback_key))
                 self._set_result_label("PASS", "#4CAF50")
-                self._status_label.setText(f"区域 #{result.track_id} PASS")
-                self._sync_region_step_cards(result)
+                self._status_label.setText("ROI 轮次 PASS")
                 self._set_notice("")
-            elif result.result == PcbResult.FAIL:
-                is_new_fail_signature = bool(
-                    getattr(result, "is_new_fail_signature", False)
-                )
-                should_report_fail = is_new_result and is_new_fail_signature
-                if should_report_fail:
-                    self._stats_manager.record_ng()
-                self._handle_pcb_ng_feedback(
-                    result,
-                    frame_id,
-                    save_evidence=should_report_fail,
-                )
+            elif result.outcome == InspectionOutcome.FAIL:
+                self._stats_manager.record_ng()
+                self._save_roi_fail_evidence(result, frame_id)
+                failed = " / ".join(result.failed_categories)
                 self._set_result_label("NG", "#F44336")
-                self._status_label.setText(
-                    f"区域 #{result.track_id} NG 数量异常: {'/'.join(result.missing_classes)}"
-                )
-                self._sync_region_step_cards(result)
-                self._set_notice(f"区域检查数量异常：{' / '.join(result.missing_classes)}")
-            if (
-                self._pcb_engine is not None
-                and self._pcb_engine.current_round_id is not None
-                and self._pcb_engine.current_round_id != result.track_id
-            ):
-                self._sync_region_observation_cards()
+                self._status_label.setText(f"ROI 轮次 NG：{failed}")
+                self._set_notice(f"识别 ROI 数量异常：{failed}")
+                self._show_roi_fail_alert(result)
             self._update_kpi()
+
+    def _show_roi_fail_alert(self, result) -> None:
+        """FAIL 时弹出告警窗口并循环播放声音；弹窗已开则刷新画面+追加摘要。"""
+        summary = self._build_roi_fail_summary(result)
+        frame, _ = self._get_feedback_frame()
+        if frame is not None:
+            frame = self._draw_roi_overlay(frame.copy())
+
+        if self._roi_fail_alert is not None and self._roi_fail_alert.isVisible():
+            self._roi_fail_alert.refresh(frame, summary)
+            return
+
+        self._sound_feedback.play_fail_loop()
+        self._roi_fail_alert = RoiFailAlertDialog(self)
+        self._roi_fail_alert.alert_closed.connect(self._close_roi_fail_alert)
+        self._roi_fail_alert.refresh(frame, summary)
+        self._roi_fail_alert.show()
+
+    @staticmethod
+    def _build_roi_fail_summary(result) -> str:
+        """生成单行失败摘要：第N轮 NG: 类别A 1/2, 类别B 0/1。"""
+        parts = []
+        for name in result.failed_categories:
+            observed = result.actual_counts.get(name, 0)
+            required = result.required_counts.get(name, 0)
+            parts.append(f"{name} {observed}/{required}")
+        detail = ", ".join(parts) if parts else "未知异常"
+        return f"第{result.round_id}轮 NG: {detail}"
+
+    def _close_roi_fail_alert(self) -> None:
+        """关闭 FAIL 告警弹窗并停止循环声音。"""
+        dialog = self._roi_fail_alert
+        self._roi_fail_alert = None
+        if dialog is not None:
+            dialog.alert_closed.disconnect(self._close_roi_fail_alert)
+        self._sound_feedback.stop_loop()
 
     @Slot(dict)
     def _on_stats_updated(self, stats: dict) -> None:
@@ -1172,15 +1144,19 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_toggle_camera(self) -> None:
         if self.state.camera_on:
+            self._runtime_logger.info("camera_action=close")
             self._close_camera_session()
             self._status_label.setText("READY")
             self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
         else:
+            self._runtime_logger.info("camera_action=open")
             if self.worker.open_camera():
+                self._runtime_logger.info("camera_open=ok")
                 self._display_timer.start(33)
                 self._status_label.setText("预览中")
                 self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
             else:
+                self._runtime_logger.error("camera_open=failed")
                 self._status_label.setText("相机打开失败")
                 self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
         self._sync_button_states()
@@ -1188,33 +1164,228 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_toggle_detect(self) -> None:
         if self.state.inference_on:
+            self._runtime_logger.info("detection_action=stop")
             self.worker.stop_inference()
             self._round_pass_timer.stop()
+            self._stop_template_diagnostics()
             self._status_label.setText("已停止")
             self._status_label.setStyleSheet(text_style(TEXT_SECONDARY, size=14, weight=500))
         else:
             if not self.state.camera_on:
+                self._runtime_logger.warning("detection_start=rejected reason=camera_not_open")
                 self._status_label.setText("请先打开相机")
                 self._status_label.setStyleSheet("color: #FF9800; font-weight: bold;")
                 self._sync_button_states()
                 return
             if self.processor is None:
+                self._runtime_logger.error(
+                    "detection_start=rejected reason=processor_unavailable log_path=%s",
+                    self._runtime_log_path or "unavailable",
+                )
                 self._status_label.setText("处理器未加载，无法检测")
                 self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+                self._show_processor_log_notice()
                 self._sync_button_states()
                 return
-            if self.step_engine:
+            template_runtime_error = self._template_runtime_validation_error()
+            if template_runtime_error:
+                self._runtime_logger.error(
+                    "detection_start=rejected reason=template_runtime_invalid error=%s",
+                    template_runtime_error,
+                )
+                self._status_label.setText(template_runtime_error)
+                self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+                self._set_notice(template_runtime_error)
+                self._sync_button_states()
+                return
+            config_errors = self.config.inspection_validation_errors(
+                self._current_model_class_names()
+            )
+            if config_errors:
+                message = "；".join(config_errors)
+                self._runtime_logger.error(
+                    "detection_start=rejected reason=invalid_config errors=%s",
+                    message,
+                )
+                self._status_label.setText(config_errors[0])
+                self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+                self._set_notice(message)
+                self._sync_button_states()
+                return
+            if getattr(self.config, "roi_inspection_enabled", False):
+                self._init_roi_engine()
+                if self._roi_engine is None:
+                    self._status_label.setText("ROI 检测配置无法初始化")
+                    self._set_notice("请检查定位模板、识别 ROI、待检类别和数量配置")
+                    self._sync_button_states()
+                    return
+                self._sync_roi_cards()
+            elif self.step_engine:
                 self.step_engine.start_round()
                 self._round_start_time = time.time()
                 self._round_id_reset()
                 self._last_counted_pass_round = -1
                 self._last_counted_ng_key = None
                 self._update_step_display(self.step_engine.get_state())
+            self._start_template_diagnostics()
             self.worker.start_inference()
+            self._clear_stale_roi_notice()
+            self._runtime_logger.info(
+                "detection_start=ok processor=%s",
+                type(self.processor).__name__,
+            )
             self._status_label.setText("检测中")
             self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
             self._clear_result_label()
         self._sync_button_states()
+
+    # ------------------------------------------------------------------
+    # 模板匹配诊断会话
+    # ------------------------------------------------------------------
+    def _start_template_diagnostics(self) -> None:
+        """开始检测时按配置启动模板诊断会话。失败只提示，不阻断检测。"""
+        recorder = get_template_diagnostics()
+        if recorder.active:
+            return
+        enabled = bool(
+            getattr(self.config, "template_diagnostics_enabled", False)
+            and getattr(self.config, "roi_inspection_enabled", False)
+            and getattr(self.config, "roi_template_enabled", False)
+        )
+        recorder.configure(
+            enabled=enabled,
+            log_dir=getattr(self.config, "template_diagnostics_dir", "logs/template_sessions"),
+            base_dir=self._app_base_dir,
+            shadow_enabled=bool(
+                getattr(self.config, "template_diagnostics_shadow_enabled", True)
+            ),
+            sample_frames=int(getattr(self.config, "template_diagnostics_sample_frames", 120)),
+            max_queue=int(getattr(self.config, "template_diagnostics_max_queue", 600)),
+        )
+        if not enabled:
+            self._set_template_diagnostics_status("诊断日志：未启用")
+            return
+        session_id = recorder.start_session(context=self._template_diagnostics_context())
+        if session_id:
+            self._set_template_diagnostics_status(f"诊断日志记录中：{recorder.log_path}")
+        else:
+            message = recorder.last_error or "模板诊断日志无法创建"
+            self._set_template_diagnostics_status(f"诊断日志启动失败：{message}", warning=True)
+            self._set_notice(message)
+
+    def _stop_template_diagnostics(self) -> None:
+        recorder = get_template_diagnostics()
+        if not recorder.active:
+            return
+        summary = recorder.stop_session()
+        frames = summary.get("frames", 0)
+        matched_rate = float(summary.get("matched_rate") or 0.0)
+        sampled = summary.get("sampled_frames", 0)
+        self._set_template_diagnostics_status(
+            f"诊断日志已保存：{recorder.summary_path}\n"
+            f"共 {frames} 帧，命中率 {matched_rate * 100:.1f}%，抽样 {sampled} 帧"
+        )
+        self._runtime_logger.info(
+            "template_diagnostics_session=closed frames=%s matched_rate=%.3f summary=%s",
+            frames,
+            matched_rate,
+            recorder.summary_path,
+        )
+
+    def _template_diagnostics_context(self) -> dict:
+        """把定位相关配置一并写进日志，避免事后对不上参数。"""
+        config = self.config
+        return {
+            "model_path": str(getattr(config, "yolo_model_path", "")),
+            "yolo_conf_threshold": float(getattr(config, "yolo_conf_threshold", 0.0)),
+            "template_path": str(getattr(config, "roi_template_path", "")),
+            "match_threshold": float(getattr(config, "roi_template_match_threshold", 0.6)),
+            "angle_range": float(getattr(config, "roi_template_angle_range", 15.0)),
+            "angle_step": float(getattr(config, "roi_template_angle_step", 1.0)),
+            "template_rect": getattr(config, "roi_template_rect", None),
+            "search_rect": getattr(config, "roi_template_search_rect", None),
+            "inspection_rect": getattr(config, "roi_inspection_rect", None),
+            "category_names": list(getattr(config, "category_names", []) or []),
+            "category_counts": list(config.get_runtime_category_counts()),
+            "pass_stable_frames": int(getattr(config, "action_pass_stable_frames", 1)),
+            "ng_stable_frames": int(getattr(config, "action_ng_stable_frames", 10)),
+            "round_cooldown_seconds": float(getattr(config, "round_cooldown_seconds", 0.0)),
+            "camera_sn": str(getattr(config, "mvsdk_camera_sn", "")),
+            "camera_exposure_us": int(getattr(config, "camera_manual_exposure_us", 0)),
+            "processor": type(self.processor).__name__ if self.processor else "None",
+        }
+
+    def _set_template_diagnostics_status(self, text: str, *, warning: bool = False) -> None:
+        if self._config_page is not None:
+            self._config_page.set_template_diagnostics_status(text, warning=warning)
+
+    def _sync_template_diagnostics_status(self) -> None:
+        """打开配置页时回显当前诊断状态和上一次会话路径。"""
+        recorder = get_template_diagnostics()
+        status = recorder.get_status()
+        if status.get("active"):
+            self._set_template_diagnostics_status(
+                f"诊断日志记录中：{status.get('log_path')}\n"
+                f"已写入 {status.get('written')} 帧，抽样 {status.get('sampled_frames')} 帧"
+            )
+        elif status.get("summary_path"):
+            self._set_template_diagnostics_status(
+                f"上次诊断日志：{status.get('summary_path')}"
+            )
+        elif not getattr(self.config, "template_diagnostics_enabled", False):
+            self._set_template_diagnostics_status("诊断日志：未启用")
+        else:
+            self._set_template_diagnostics_status("诊断日志：将在开始检测时创建")
+
+    def _restart_template_diagnostics_if_running(self) -> None:
+        """保存配置后让诊断开关立即生效，无需重启检测。"""
+        if not self.state.inference_on:
+            return
+        self._stop_template_diagnostics()
+        self._start_template_diagnostics()
+
+    def _template_runtime_validation_error(self) -> str:
+        """模板启用时确认当前处理器和磁盘模板都真实可用。"""
+        if not bool(getattr(self.config, "roi_inspection_enabled", False)):
+            return ""
+        if not bool(getattr(self.config, "roi_template_enabled", False)):
+            return ""
+
+        from template_matching.template_store import load_shape_model
+        from yolo_runtime.template_gated_processor import TemplateGatedProcessor
+
+        if not isinstance(self.processor, TemplateGatedProcessor):
+            return "模板定位处理器未加载，请完成三种 ROI 后点击验证并保存"
+        if self.worker.frame_processor is not self.processor:
+            return "相机线程未使用模板定位处理器，请完成三种 ROI 后点击验证并保存"
+        try:
+            model = load_shape_model(self.config, self._app_base_dir)
+        except Exception as exc:
+            return f"定位模型不可用：{exc}"
+
+        # 搜索框余量必须够，否则运行期会因旋转候选被丢弃而随机不触发。
+        search = getattr(self.config, "roi_template_search_rect", None)
+        if not search:
+            return "搜索 ROI 未配置，请先创建并保存搜索 ROI"
+        frame = self.worker.get_latest_preview_frame()
+        if frame is not None:
+            height, width = frame.shape[:2]
+            roi_w = float(search.get("width", 0.0)) * width
+            roi_h = float(search.get("height", 0.0)) * height
+            travel = model.center_travel((int(roi_w), int(roi_h)))
+            need = max(
+                int(getattr(self.config, "roi_template_min_travel_px", 40)),
+                int(round(min(model.template_size)
+                          * float(getattr(self.config, "roi_template_min_travel_ratio", 0.30)))),
+            )
+            if travel[0] < need or travel[1] < need:
+                required = model.min_search_size(need)
+                return (
+                    f"搜索框太小：当前 {int(roi_w)}×{int(roi_h)}，"
+                    f"只剩 {travel[0]}×{travel[1]}px 平移余量，"
+                    f"至少需要 {required[0]}×{required[1]}"
+                )
+        return ""
 
     def _round_id_reset(self) -> None:
         """开始检测时重置本轮去重键（round_id 由 start_round 自增）。"""
@@ -1224,7 +1395,11 @@ class MainWindow(QMainWindow):
     def _on_config_clicked(self) -> None:
         if self._config_page is None:
             from ui.config_page import ConfigPage
-            self._config_page = ConfigPage(self.config, stats_manager=self._stats_manager)
+            self._config_page = ConfigPage(
+                self.config,
+                stats_manager=self._stats_manager,
+                roi_frame_provider=self.worker.get_latest_preview_frame,
+            )
             self._config_page.back_clicked.connect(self._on_config_back)
             self._config_page.stats_changed.connect(self._on_stats_changed)
             self._config_page.config_saved.connect(self._on_config_saved)
@@ -1237,6 +1412,7 @@ class MainWindow(QMainWindow):
             self._camera_enumeration_error,
         )
         self._config_page.refresh_stats_display()
+        self._sync_template_diagnostics_status()
         self._stacked.setCurrentWidget(self._config_page)
         self._status_label.setText("配置页")
         self._status_label.setStyleSheet("color: #9C27B0; font-weight: bold;")
@@ -1260,11 +1436,11 @@ class MainWindow(QMainWindow):
             )
 
     def _on_config_back(self) -> None:
-        """从配置页返回主界面：刷新动态步骤卡片和 PCB 引擎。"""
+        """从配置页返回主界面并刷新对应模式引擎。"""
         self._stacked.setCurrentWidget(self._main_page)
         self._apply_feedback_config()
         self._apply_step_engine_config()
-        self._apply_pcb_engine_config()
+        self._apply_roi_engine_config()
         self._sync_button_states()
         self._update_kpi()
         self._status_label.setText("READY" if not self.state.camera_on else "预览中")
@@ -1276,21 +1452,26 @@ class MainWindow(QMainWindow):
         if self._config_page is not None:
             self._config_page.refresh_stats_display()
 
-    def _on_config_saved(self) -> None:
+    def _on_config_saved(self) -> bool:
         """配置页保存后立即应用运行时配置。"""
         camera_switch_result = self._apply_camera_selection()
         self._apply_feedback_config()
         model_ok = self._apply_runtime_model_config()
         self._apply_step_engine_config()
-        self._apply_pcb_engine_config()
+        self._init_roi_engine()
         self._sync_button_states()
         self._update_kpi()
         if not model_ok:
             self._status_label.setText(self._last_model_reload_error or "模型加载失败")
             self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+            return False
         elif camera_switch_result is None and not self.state.inference_on:
             self._status_label.setText("配置已应用")
             self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+        self._restart_template_diagnostics_if_running()
+        self._sync_template_diagnostics_status()
+        self._clear_stale_roi_notice()
+        return True
 
     def _apply_camera_selection(self) -> Optional[bool]:
         """Apply a saved SN change only when a camera session is currently open."""
@@ -1323,6 +1504,7 @@ class MainWindow(QMainWindow):
             self.worker.stop_inference()
         self._display_timer.stop()
         self._round_pass_timer.stop()
+        self._stop_template_diagnostics()
         if self._coordinate_logger.active:
             self._coordinate_logger.stop_session()
         self.worker.close_camera()
@@ -1344,7 +1526,7 @@ class MainWindow(QMainWindow):
         self._clear_result_label()
         self._set_notice("")
         self._rebuild_step_engine()
-        self._init_pcb_engine()
+        self._init_roi_engine()
         self._refresh_steps()
 
     def _apply_feedback_config(self) -> None:
@@ -1359,10 +1541,7 @@ class MainWindow(QMainWindow):
     def _step_engine_config_signature(config) -> tuple:
         """Configuration fields that require resetting the normal step engine."""
         names = tuple(str(name).strip() for name in (getattr(config, "category_names", []) or []))
-        counts = tuple(
-            max(1, int(count))
-            for count in (getattr(config, "category_counts", []) or [])
-        )
+        counts = tuple(config.get_runtime_category_counts())
         return (
             names,
             counts,
@@ -1373,29 +1552,36 @@ class MainWindow(QMainWindow):
         )
 
     @staticmethod
-    def _pcb_engine_config_signature(config) -> tuple:
-        """Configuration fields that require resetting first-category tracking."""
-        enabled = bool(getattr(config, "first_category_region_check_enabled", False))
+    def _roi_engine_config_signature(config) -> tuple:
+        """影响 ROI 轮次运行态的配置字段。"""
+        enabled = bool(getattr(config, "roi_inspection_enabled", False))
         if not enabled:
             return (False,)
-        parent, children = config.get_first_category_region_classes()
         names = list(getattr(config, "category_names", []) or [])
-        counts = list(getattr(config, "category_counts", []) or [])
+        counts = config.get_runtime_category_counts()
         required_counts = []
         for index, name in enumerate(names):
             normalized = str(name).strip()
-            if normalized in children:
+            if normalized:
                 count = counts[index] if index < len(counts) else 1
                 required_counts.append((normalized, max(1, int(count))))
+        inspection_rect = getattr(config, "roi_inspection_rect", None) or {}
+        template_rect = getattr(config, "roi_template_rect", None) or {}
+        search_rect = getattr(config, "roi_template_search_rect", None) or {}
         return (
             True,
-            str(parent).strip(),
-            tuple(str(child).strip() for child in children),
+            bool(getattr(config, "roi_template_enabled", False)),
+            str(getattr(config, "roi_template_path", "")).strip(),
+            float(getattr(config, "roi_template_match_threshold", 0.6)),
+            float(getattr(config, "roi_template_angle_range", 15.0)),
+            float(getattr(config, "roi_template_angle_step", 1.0)),
+            tuple(sorted(template_rect.items())),
+            tuple(sorted(search_rect.items())),
+            tuple(sorted(inspection_rect.items())),
             tuple(required_counts),
             int(getattr(config, "action_pass_stable_frames", 1)),
             int(getattr(config, "action_ng_stable_frames", 1)),
             float(getattr(config, "round_cooldown_seconds", 0.0)),
-            float(getattr(config, "pcb_assignment_margin_ratio", 0.15)),
         )
 
     def _apply_step_engine_config(self) -> bool:
@@ -1406,17 +1592,16 @@ class MainWindow(QMainWindow):
         self._refresh_steps()
         return True
 
-    def _apply_pcb_engine_config(self) -> bool:
-        new_signature = self._pcb_engine_config_signature(self.config)
-        if new_signature == self._pcb_engine_signature:
+    def _apply_roi_engine_config(self) -> bool:
+        new_signature = self._roi_engine_config_signature(self.config)
+        if new_signature == self._roi_engine_signature:
             return False
-        self._init_pcb_engine()
+        self._init_roi_engine()
         self._refresh_steps()
         return True
 
-    @staticmethod
-    def _model_runtime_signature(config) -> tuple:
-        """影响推理处理器实例的配置签名。"""
+    def _model_runtime_signature(self, config) -> tuple:
+        """影响最终运行处理器实例的模型和模板配置签名。"""
         return (
             str(getattr(config, "yolo_model_path", "")),
             float(getattr(config, "yolo_conf_threshold", 0.0)),
@@ -1426,6 +1611,14 @@ class MainWindow(QMainWindow):
             str(getattr(config, "ultralytics_tracker", "")),
             int(getattr(config, "ultralytics_max_det", 0)),
             bool(getattr(config, "ultralytics_track_persist", True)),
+            bool(getattr(config, "roi_inspection_enabled", False)),
+            bool(getattr(config, "roi_template_enabled", False)),
+            str(getattr(config, "roi_template_path", "") or "").strip(),
+            float(getattr(config, "roi_template_match_threshold", 0.6)),
+            float(getattr(config, "roi_template_angle_range", 15.0)),
+            float(getattr(config, "roi_template_angle_step", 1.0)),
+            tuple(sorted((getattr(config, "roi_template_search_rect", None) or {}).items())),
+            template_file_signature(config, self._app_base_dir),
         )
 
     def _create_processor_from_config(self):
@@ -1453,6 +1646,10 @@ class MainWindow(QMainWindow):
         try:
             new_processor = self._create_processor_from_config()
         except Exception as exc:
+            self._runtime_logger.exception(
+                "processor_reload=failed configured_model=%s",
+                getattr(self.config, "yolo_model_path", ""),
+            )
             self._last_model_reload_error = f"模型加载失败: {exc}"
             if was_inference_on and self.processor is not None and self.state.camera_on:
                 self.worker.start_inference()
@@ -1466,6 +1663,13 @@ class MainWindow(QMainWindow):
         self._runtime_model_signature = new_signature
         self._last_model_reload_error = ""
         self._last_overlay_data = {}
+        self._runtime_logger.info(
+            "processor_reload=ok type=%s configured_model=%s",
+            type(new_processor).__name__,
+            getattr(self.config, "yolo_model_path", ""),
+        )
+        if self._notice_label.text().startswith("处理器未加载"):
+            self._set_notice("")
 
         if was_inference_on and self.state.camera_on:
             self.worker.start_inference()
@@ -1482,7 +1686,7 @@ class MainWindow(QMainWindow):
             return
         self.step_engine = StepSequenceEngine(
             step_class_names=self.config.category_names,
-            step_counts=getattr(self.config, "category_counts", None),
+            step_counts=self.config.get_runtime_category_counts(),
             enter_stable_frames=self.config.action_pass_stable_frames,
             out_of_order_frames=self.config.action_ng_stable_frames,
             leave_stable_frames=getattr(self.config, "action_leave_stable_frames", 4),

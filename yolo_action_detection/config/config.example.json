@@ -1,4 +1,5 @@
 {
+  "config_schema_version": 4,
   "model_task": "ultralytics_obb",
   "yolo_model_path": "../models/best.pt",
   "yolo_conf_threshold": 0.7,
@@ -16,6 +17,16 @@
     "5号",
     ""
   ],
+  "category_counts": [1, 1, 1, 1, 1, 1],
+  "roi_inspection_enabled": false,
+  "roi_inspection_rect": null,
+  "roi_template_enabled": false,
+  "roi_template_path": "locator_template.png",
+  "roi_template_match_threshold": 0.6,
+  "roi_template_angle_range": 15.0,
+  "roi_template_angle_step": 1.0,
+  "roi_template_rect": null,
+  "roi_template_search_rect": null,
   "camera_index": 0,
   "mvsdk_friendly_name": "",
   "mvsdk_camera_sn": "",
