@@ -9,6 +9,7 @@ import time
 from types import SimpleNamespace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -155,6 +156,16 @@ class FrameMvSdk(FakeMvSdk):
         return 0
 
 
+class SequencedFrameMvSdk(FrameMvSdk):
+    def __init__(self, devices) -> None:
+        super().__init__(devices)
+        self._frame_value = 0
+
+    def CameraImageProcess(self, _handle, _raw, output, frame_head):
+        self._frame_value = (self._frame_value + 1) % 255
+        ctypes.memset(output, self._frame_value, frame_head.uBytes)
+
+
 class EchoProcessor:
     def process_frame(self, _frame, *, source_frame_id):
         return DetectionOverlayState(
@@ -165,6 +176,15 @@ class EchoProcessor:
 
     def get_class_names(self):
         return {}
+
+
+class RecordingEchoProcessor(EchoProcessor):
+    def __init__(self) -> None:
+        self.frames_by_id = {}
+
+    def process_frame(self, frame, *, source_frame_id):
+        self.frames_by_id[source_frame_id] = frame.copy()
+        return super().process_frame(frame, source_frame_id=source_frame_id)
 
 
 def wait_until(predicate, timeout_s: float = 1.0) -> bool:
@@ -324,6 +344,50 @@ def test_camera_worker_close_clears_all_frames_and_runtime_overlay(qapp, monkeyp
     assert worker.get_display_frame() == (None, 0)
     assert worker.get_latest_overlay() == DetectionOverlayState()
     assert worker.get_pipeline_stats()["infer_latency_ms"] == 0.0
+
+
+def test_camera_worker_overlay_payload_keeps_the_exact_inference_frame(qapp, monkeypatch):
+    selected = FakeDeviceInfo("MV-Camera", "USB3", "SN-B")
+    sdk = SequencedFrameMvSdk([selected])
+    monkeypatch.setattr(mvsdk_camera_module, "get_mvsdk", lambda: sdk)
+    config = ConfigManager()
+    config.mvsdk_camera_sn = "SN-B"
+    worker = CameraWorker(config, AppState())
+    processor = RecordingEchoProcessor()
+    worker.set_frame_processor(processor)
+    payloads = []
+    captured = []
+    worker.overlay_state_updated.connect(lambda payload: payloads.append(payload))
+
+    try:
+        assert worker.open_camera() is True
+        worker.start_inference()
+        assert wait_until(
+            lambda: (qapp.processEvents() or len(payloads) >= 2),
+            timeout_s=2.0,
+        )
+        captured = list(payloads[:2])
+        assert len(captured) == 2
+        assert captured[0]["source_frame_id"] != captured[1]["source_frame_id"]
+        assert not np.array_equal(
+            captured[0]["source_frame"],
+            captured[1]["source_frame"],
+        )
+        for payload in captured:
+            frame_id = payload["source_frame_id"]
+            assert np.array_equal(
+                payload["source_frame"],
+                processor.frames_by_id[frame_id],
+            )
+    finally:
+        worker.close_camera()
+
+    for payload in captured:
+        frame_id = payload["source_frame_id"]
+        assert np.array_equal(
+            payload["source_frame"],
+            processor.frames_by_id[frame_id],
+        )
 
 
 def test_camera_config_lists_devices_and_saves_selected_sn(

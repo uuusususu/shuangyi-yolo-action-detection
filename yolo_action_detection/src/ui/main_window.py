@@ -1,6 +1,7 @@
 """YOLO OBB 动作检测主界面。"""
 from __future__ import annotations
 
+from copy import deepcopy
 import time
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -426,22 +427,40 @@ class MainWindow(QMainWindow):
     # 显示与状态同步
     # ------------------------------------------------------------------
     def _update_display(self) -> None:
-        # 成熟 YOLO 实时项目的关键策略是“追最新帧、丢旧帧”：
-        # 主画面底图始终来自最新预览帧，推理结果只作为有时效的覆盖层。
-        frame = self.worker.get_latest_preview_frame()
+        frame, frame_id = self._resolve_display_source()
         if frame is None:
             return
-        overlay = self._latest_runtime_overlay
-        if not getattr(overlay, "detections", None):
-            overlay = self.worker.get_latest_overlay()
-        if self._overlay_is_fresh(overlay):
+        overlay = self._current_display_overlay()
+        if self._should_draw_runtime_overlay(overlay, frame_id):
             frame = self._draw_overlay(frame, overlay)
         elif self._roi_engine is not None:
             frame = self._draw_roi_overlay(frame)
         self._show_frame(frame)
 
+    def _resolve_display_source(self) -> tuple:
+        """检测中显示被推理的同帧画面，预览时才追最新相机帧。"""
+        if self.state.inference_on:
+            frame, frame_id = self.worker.get_display_frame()
+            if frame is not None:
+                return frame, int(frame_id or 0)
+        return self.worker.get_latest_preview_frame(), 0
+
+    def _current_display_overlay(self):
+        overlay = self._latest_runtime_overlay
+        if getattr(overlay, "detections", None):
+            return overlay
+        return self.worker.get_latest_overlay()
+
+    def _should_draw_runtime_overlay(self, overlay, frame_id: int) -> bool:
+        if not overlay or not getattr(overlay, "detections", None):
+            return False
+        if self.state.inference_on:
+            overlay_id = int(getattr(overlay, "source_frame_id", 0) or 0)
+            return overlay_id > 0 and overlay_id == int(frame_id)
+        return self._overlay_is_fresh(overlay)
+
     def _overlay_is_fresh(self, overlay) -> bool:
-        """判断 overlay 是否还能叠加到最新预览帧上。"""
+        """预览模式下判断 overlay 是否还能叠加到最新相机帧上。"""
         if not overlay or not getattr(overlay, "detections", None):
             return False
         timestamp = float(getattr(overlay, "timestamp", 0.0) or 0.0)
@@ -496,6 +515,25 @@ class MainWindow(QMainWindow):
         p2 = (int(round(x + rect_width)), int(round(y + rect_height)))
         cv2.rectangle(frame, p1, p2, (71, 181, 255), 2)
         return frame
+
+    @staticmethod
+    def _draw_roi_ng_detection_outlines(
+        frame: np.ndarray,
+        detections: list,
+    ) -> np.ndarray:
+        """在 NG 同帧副本上只绘制全部有效 YOLO OBB 轮廓。"""
+        rendered = frame.copy()
+        for detection in detections:
+            if not isinstance(detection, dict):
+                continue
+            try:
+                points = np.asarray(detection.get("polygon", []), dtype=np.int32).reshape(-1, 2)
+            except (TypeError, ValueError):
+                continue
+            if len(points) < 4:
+                continue
+            cv2.polylines(rendered, [points], True, (0, 255, 128), 2)
+        return rendered
 
     def _draw_tip_and_holes(self, frame: np.ndarray, overlay) -> np.ndarray:
         """绘制枪头点、洞口中心、内外圈和距离。"""
@@ -776,25 +814,6 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _save_roi_fail_evidence(self, result, frame_id: int) -> None:
-        if not getattr(self.config, "fail_evidence_enabled", True):
-            return
-        try:
-            frame, _ = self._get_feedback_frame()
-            data = self._last_overlay_data or {}
-            context = FailEvidenceContext(
-                round_id=int(result.round_id),
-                action_ng_step=-1,
-                step_name=f"ROI 数量异常: {'/'.join(result.failed_categories)}",
-                source_frame_id=int(frame_id),
-                detections=list(data.get("detections", []) or []),
-                model_path=str(data.get("model_path", "")),
-                timestamp=float(result.timestamp or time.time()),
-            )
-            self._fail_evidence_saver.save_fail_event(frame, context)
-        except Exception:
-            pass
-
     def _sync_roi_cards(self) -> None:
         """把 ROI 平级类别的实时数量和锁存状态同步到识别列表。"""
         if self._roi_engine is None:
@@ -1025,7 +1044,10 @@ class MainWindow(QMainWindow):
                     data.get("source_frame_id", 0),
                 )
                 self._set_notice("ROI 定位失败：无法获取原始帧尺寸")
-            self._handle_roi_results(roi_results, data.get("source_frame_id", 0))
+            self._handle_roi_results(
+                roi_results,
+                data,
+            )
             self._sync_roi_cards()
         elif self.step_engine:
             try:
@@ -1049,7 +1071,11 @@ class MainWindow(QMainWindow):
         self._record_coordinate_log(overlay, state)
         self._update_display()
 
-    def _handle_roi_results(self, results: list, frame_id: int) -> None:
+    def _handle_roi_results(
+        self,
+        results: list,
+        overlay_data: dict,
+    ) -> None:
         """整轮结果只接入一次统计、声音和证据。"""
         for result in results:
             result_key = ("roi-result", result.feedback_key)
@@ -1067,41 +1093,229 @@ class MainWindow(QMainWindow):
                 self._set_notice("")
             elif result.outcome == InspectionOutcome.FAIL:
                 self._stats_manager.record_ng()
-                self._save_roi_fail_evidence(result, frame_id)
+                self._save_roi_fail_evidence(result, overlay_data)
                 failed = " / ".join(result.failed_categories)
                 self._set_result_label("NG", "#F44336")
                 self._status_label.setText(f"ROI 轮次 NG：{failed}")
                 self._set_notice(f"识别 ROI 数量异常：{failed}")
-                self._show_roi_fail_alert(result)
+                self._show_roi_fail_alert(result, overlay_data)
             self._update_kpi()
 
-    def _show_roi_fail_alert(self, result) -> None:
-        """FAIL 时弹出告警窗口并循环播放声音；弹窗已开则刷新画面+追加摘要。"""
-        summary = self._build_roi_fail_summary(result)
-        frame, _ = self._get_feedback_frame()
-        if frame is not None:
-            frame = self._draw_roi_overlay(frame.copy())
+    def _prepare_roi_ng_annotated_frame(
+        self,
+        result,
+        overlay_data: dict,
+        *,
+        log_key: str,
+    ) -> Optional[tuple[np.ndarray, list[dict], dict[str, int]]]:
+        """生成同帧识别 ROI 裁剪图、局部 detections 和原图 ROI。"""
+        result_frame_id = int(getattr(result, "source_frame_id", 0) or 0)
+        event_frame_id = int(overlay_data.get("source_frame_id", 0) or 0)
+        source_frame = overlay_data.get("source_frame")
+        if result_frame_id != event_frame_id:
+            self._runtime_logger.error(
+                f"{log_key}=skipped reason=frame_id_mismatch "
+                "result_frame_id=%s event_frame_id=%s",
+                result_frame_id,
+                event_frame_id,
+            )
+            return None
+        if not isinstance(source_frame, np.ndarray) or source_frame.size == 0:
+            self._runtime_logger.error(
+                f"{log_key}=skipped reason=source_frame_unavailable frame_id=%s",
+                event_frame_id,
+            )
+            return None
+
+        try:
+            inspection_roi = NormalizedRect.from_mapping(
+                getattr(self.config, "roi_inspection_rect", None)
+            )
+        except ValueError as exc:
+            self._runtime_logger.error(
+                f"{log_key}=skipped reason=invalid_inspection_roi "
+                "frame_id=%s error=%s",
+                event_frame_id,
+                exc,
+            )
+            return None
+
+        source_height, source_width = source_frame.shape[:2]
+        roi_x, roi_y, roi_width, roi_height = inspection_roi.to_pixel_rect(
+            (source_width, source_height)
+        )
+        left = max(0, min(source_width, int(round(roi_x))))
+        top = max(0, min(source_height, int(round(roi_y))))
+        right = max(0, min(source_width, int(round(roi_x + roi_width))))
+        bottom = max(0, min(source_height, int(round(roi_y + roi_height))))
+        if right <= left or bottom <= top:
+            self._runtime_logger.error(
+                f"{log_key}=skipped reason=empty_inspection_roi frame_id=%s "
+                "pixel_rect=(%s,%s,%s,%s) source_size=(%s,%s)",
+                event_frame_id,
+                left,
+                top,
+                right,
+                bottom,
+                source_width,
+                source_height,
+            )
+            return None
+
+        local_detections = []
+        for detection in list(overlay_data.get("detections", []) or []):
+            if not isinstance(detection, dict):
+                continue
+            center = detection.get("center", detection.get("center_px"))
+            try:
+                if center is None or len(center) < 2:
+                    continue
+                center_point = (float(center[0]), float(center[1]))
+            except (TypeError, ValueError):
+                continue
+            if not inspection_roi.contains_pixel_point(
+                center_point,
+                (source_width, source_height),
+            ):
+                continue
+            local_detections.append(
+                self._translate_detection_to_roi(detection, left, top)
+            )
+
+        cropped_frame = source_frame[top:bottom, left:right].copy()
+        rendered = self._draw_roi_ng_detection_outlines(
+            cropped_frame,
+            local_detections,
+        )
+        source_roi = {
+            "x": left,
+            "y": top,
+            "width": right - left,
+            "height": bottom - top,
+            "source_width": source_width,
+            "source_height": source_height,
+        }
+        return rendered, local_detections, source_roi
+
+    @staticmethod
+    def _translate_detection_to_roi(
+        detection: dict,
+        offset_x: int,
+        offset_y: int,
+    ) -> dict:
+        """深复制 detection 并把像素坐标平移到 ROI 局部坐标。"""
+        translated = deepcopy(detection)
+
+        polygon = translated.get("polygon")
+        if isinstance(polygon, (list, tuple)):
+            translated_polygon = []
+            for point in polygon:
+                try:
+                    if len(point) < 2:
+                        translated_polygon.append(point)
+                        continue
+                    translated_polygon.append(
+                        [point[0] - offset_x, point[1] - offset_y]
+                    )
+                except (TypeError, ValueError):
+                    translated_polygon.append(point)
+            translated["polygon"] = translated_polygon
+
+        box = translated.get("box")
+        if isinstance(box, (list, tuple)) and len(box) >= 4:
+            try:
+                translated["box"] = [
+                    box[0] - offset_x,
+                    box[1] - offset_y,
+                    box[2] - offset_x,
+                    box[3] - offset_y,
+                ]
+            except (TypeError, ValueError):
+                pass
+
+        for center_key in ("center", "center_px"):
+            center = translated.get(center_key)
+            if isinstance(center, (list, tuple)) and len(center) >= 2:
+                try:
+                    translated[center_key] = [
+                        center[0] - offset_x,
+                        center[1] - offset_y,
+                    ]
+                except (TypeError, ValueError):
+                    pass
+        return translated
+
+    def _save_roi_fail_evidence(self, result, overlay_data: dict) -> None:
+        """保存产生本次 ROI FAIL 的同帧绿色 OBB 图和元数据。"""
+        if not getattr(self.config, "fail_evidence_enabled", True):
+            return
+        event_frame_id = int(overlay_data.get("source_frame_id", 0) or 0)
+        try:
+            prepared = self._prepare_roi_ng_annotated_frame(
+                result,
+                overlay_data,
+                log_key="roi_ng_evidence",
+            )
+            if prepared is None:
+                return
+            frame, detections, source_roi = prepared
+            context = FailEvidenceContext(
+                round_id=int(result.round_id),
+                action_ng_step=-1,
+                step_name=f"ROI 数量异常: {'/'.join(result.failed_categories)}",
+                source_frame_id=event_frame_id,
+                detections=detections,
+                model_path=str(overlay_data.get("model_path", "")),
+                timestamp=float(
+                    overlay_data.get("timestamp")
+                    or getattr(result, "timestamp", 0.0)
+                    or time.time()
+                ),
+                source_roi=source_roi,
+            )
+            saved_path = self._fail_evidence_saver.save_fail_event(frame, context)
+            if saved_path is None:
+                self._runtime_logger.error(
+                    "roi_ng_evidence=save_failed round_id=%s frame_id=%s",
+                    int(result.round_id),
+                    event_frame_id,
+                )
+        except Exception as exc:
+            self._runtime_logger.error(
+                "roi_ng_evidence=save_failed reason=exception round_id=%s "
+                "frame_id=%s error=%s",
+                int(getattr(result, "round_id", 0) or 0),
+                event_frame_id,
+                exc,
+            )
+
+    def _show_roi_fail_alert(self, result, overlay_data: dict) -> None:
+        """使用产生本次 FAIL 的同帧图像和 detections 显示纯框告警。"""
+        prepared = self._prepare_roi_ng_annotated_frame(
+            result,
+            overlay_data,
+            log_key="roi_ng_alert",
+        )
+        if prepared is None:
+            self._play_fail_feedback(
+                (
+                    "roi-alert-unavailable",
+                    int(getattr(result, "round_id", 0) or 0),
+                    int(getattr(result, "source_frame_id", 0) or 0),
+                )
+            )
+            return
+        frame, _detections, _source_roi = prepared
 
         if self._roi_fail_alert is not None and self._roi_fail_alert.isVisible():
-            self._roi_fail_alert.refresh(frame, summary)
+            self._roi_fail_alert.refresh(frame)
             return
 
         self._sound_feedback.play_fail_loop()
         self._roi_fail_alert = RoiFailAlertDialog(self)
         self._roi_fail_alert.alert_closed.connect(self._close_roi_fail_alert)
-        self._roi_fail_alert.refresh(frame, summary)
+        self._roi_fail_alert.refresh(frame)
         self._roi_fail_alert.show()
-
-    @staticmethod
-    def _build_roi_fail_summary(result) -> str:
-        """生成单行失败摘要：第N轮 NG: 类别A 1/2, 类别B 0/1。"""
-        parts = []
-        for name in result.failed_categories:
-            observed = result.actual_counts.get(name, 0)
-            required = result.required_counts.get(name, 0)
-            parts.append(f"{name} {observed}/{required}")
-        detail = ", ".join(parts) if parts else "未知异常"
-        return f"第{result.round_id}轮 NG: {detail}"
 
     def _close_roi_fail_alert(self) -> None:
         """关闭 FAIL 告警弹窗并停止循环声音。"""

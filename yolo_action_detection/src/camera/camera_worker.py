@@ -291,14 +291,15 @@ class CameraWorker(QObject):
                     break
                 with self._overlay_lock:
                     self._latest_overlay = overlay
-                # 同帧：保存推理完成的帧和 overlay
+                # 同帧：同一个快照既供按需读取，也随 overlay 事件交给界面。
+                source_frame = frame.copy()
                 with self._display_lock:
-                    self._latest_display_frame = frame.copy()
+                    self._latest_display_frame = source_frame
                     self._latest_display_frame_id = fid
                 image_size = (int(frame.shape[1]), int(frame.shape[0]))
-                self.overlay_state_updated.emit(
-                    self._overlay_to_dict(overlay, image_size=image_size)
-                )
+                overlay_payload = self._overlay_to_dict(overlay, image_size=image_size)
+                overlay_payload["source_frame"] = source_frame
+                self.overlay_state_updated.emit(overlay_payload)
                 self._infer_count += 1
                 if dropped:
                     self._pipeline_stats.dropped_for_infer += dropped

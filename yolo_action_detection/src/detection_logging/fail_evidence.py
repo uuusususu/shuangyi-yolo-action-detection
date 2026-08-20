@@ -23,6 +23,7 @@ class FailEvidenceContext:
     detections: list[Any] = field(default_factory=list)
     model_path: str = ""
     timestamp: float = 0.0
+    source_roi: dict[str, int] | None = None
 
 
 class FailEvidenceSaver:
@@ -74,7 +75,7 @@ class FailEvidenceSaver:
         timestamp: float,
         image_name: str,
     ) -> dict[str, Any]:
-        return {
+        metadata = {
             "event": "ACTION_NG",
             "round_id": int(context.round_id),
             "action_ng_step": int(context.action_ng_step),
@@ -87,6 +88,9 @@ class FailEvidenceSaver:
             "image": image_name,
             "detections": _serialize_detections(context.detections),
         }
+        if context.source_roi is not None:
+            metadata["source_roi"] = _json_safe_dict(context.source_roi)
+        return metadata
 
 
 def _serialize_detections(detections: Iterable[Any]) -> list[dict[str, Any]]:

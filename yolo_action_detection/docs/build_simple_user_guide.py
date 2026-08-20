@@ -257,7 +257,7 @@ def add_title_block(doc: Document) -> None:
     subtitle.paragraph_format.space_before = Pt(0)
     subtitle.paragraph_format.space_after = Pt(14)
     set_run_font(
-        subtitle.add_run("简易操作手册  |  版本日期：2026-07-24"),
+        subtitle.add_run("简易操作手册  |  版本日期：2026-07-30"),
         size=11,
         color=MUTED,
     )
@@ -294,10 +294,21 @@ def build_document() -> Document:
 
     doc.add_heading("ROI 模式检测异常告警", level=2)
     add_numbered_step(doc, detect_num, "ROI 模式下，当某轮判定为 NG 时，系统会自动弹出异常告警窗口。")
-    add_numbered_step(doc, detect_num, "告警窗口上半部分显示 NG 发生时的画面；启用模板定位时画面只显示搜索 ROI 框。下半部分显示失败摘要，例如“第1轮 NG: 螺丝 0/2”。")
-    add_numbered_step(doc, detect_num, "告警期间 FAIL 提示音会循环播放，检测不会停止；若连续多轮 NG，窗口画面会刷新为最新一轮，摘要逐行追加。")
+    add_numbered_step(doc, detect_num, "告警窗口冻结真正触发本轮 NG 的同一张 YOLO 推理画面，并严格裁剪为当前识别 ROI，不显示 ROI 外画面。")
+    add_numbered_step(doc, detect_num, "裁剪图只用绿色旋转框标出中心点位于识别 ROI 内的目标；框线越过 ROI 边界时会自然裁掉。")
+    add_numbered_step(doc, detect_num, "弹窗内容区只显示带框画面，不显示类别名、置信度、跟踪 ID、ROI 框、数量摘要或操作提示。")
+    add_numbered_step(doc, detect_num, "识别 ROI 裁剪图保持宽高比，并自动放大到告警窗口的可用区域；正常主页面仍显示整张相机画面。")
+    add_numbered_step(doc, detect_num, "告警期间 FAIL 提示音会循环播放，检测不会停止；若连续多轮 NG，窗口只替换为最新一轮对应的同帧检测画面。")
     add_numbered_step(doc, detect_num, "处理完毕后，按下键盘回车键（主键盘或小键盘均可）关闭告警窗口并停止声音。")
     add_callout(doc, "告警窗口弹出后检测继续进行，回车键只关闭窗口和声音，不会影响检测结果或统计。")
+
+    doc.add_heading("保存 ROI NG 带框图片", level=2)
+    add_numbered_step(doc, detect_num, "如需保存图片，在配置页“操作反馈”中开启“失败证据保存”，再点击“验证并保存”。未开启时不会保存 NG 图片。")
+    add_numbered_step(doc, detect_num, "每个完成的 ROI NG 轮次只保存一张 frame.jpg；图片与弹窗使用同一推理帧和同一识别 ROI 裁剪，只显示 ROI 内目标的绿色旋转框。")
+    add_numbered_step(doc, detect_num, "保存图片不显示类别名、置信度、跟踪 ID、ROI 或其他文字，也不会另外保存第二张无框原图。")
+    add_numbered_step(doc, detect_num, "如果识别 ROI 内没有检测到任何目标，系统仍保存这张同帧无框裁剪图，不会生成虚拟框。")
+    add_numbered_step(doc, detect_num, "metadata.json 只记录识别 ROI 内目标；目标坐标从裁剪图左上角开始，并记录裁剪区域在原图中的位置。")
+    add_callout(doc, "保存图片位于 outputs/evidence 的日期与轮次目录中；图片保存失败不会影响检测、统计或报警。")
 
     doc.add_heading("三、选择相机与调整画面亮度", level=1)
     add_picture(doc, CONFIG_SCREENSHOT, 5.1, "YOLO 动作检测系统配置界面")
@@ -374,6 +385,11 @@ def build_document() -> Document:
         "完成一轮间隔（秒）",
         "只统计一轮",
         "异常告警",
+        "绿色旋转框",
+        "识别 ROI 裁剪图",
+        "失败证据保存",
+        "frame.jpg",
+        "outputs/evidence",
         "回车键",
     ):
         if required not in all_text:
