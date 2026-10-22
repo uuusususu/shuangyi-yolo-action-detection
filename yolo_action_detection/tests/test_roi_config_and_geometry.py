@@ -8,7 +8,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from config import CURRENT_CONFIG_SCHEMA_VERSION, ConfigManager
-from roi_inspection.geometry import NormalizedRect
+from roi_inspection.geometry import (
+    FULL_FRAME_RECT,
+    NormalizedRect,
+    usable_normalized_rect,
+)
+from roi_inspection.models import RoiInspectionConfig
 
 
 def _valid_roi_config() -> ConfigManager:
@@ -132,25 +137,46 @@ def test_valid_roi_configuration_has_no_errors():
     assert config.inspection_validation_errors(["散热片", "螺丝"]) == []
 
 
-def test_draft_validation_allows_only_missing_roi_rects():
+def test_missing_inspection_roi_is_not_a_start_error():
     config = _valid_roi_config()
     config.roi_inspection_rect = None
 
-    strict_errors = config.inspection_validation_errors(["散热片", "螺丝"])
-    draft_errors = config.inspection_validation_errors(
-        ["散热片", "螺丝"],
-        require_roi_rects=False,
-    )
+    assert config.inspection_validation_errors(["散热片", "螺丝"]) == []
 
-    assert "识别 ROI 未配置" in strict_errors
-    assert draft_errors == []
-
-    # 草稿模式仅豁免缺失的 ROI；其他真实错误仍然报告。
     config.category_counts[0] = 0
     assert "待检数量无效：类别 '散热片' 必须为正整数" in config.inspection_validation_errors(
         ["散热片", "螺丝"],
-        require_roi_rects=False,
     )
+
+
+def test_usable_normalized_rect_treats_invalid_as_empty():
+    assert usable_normalized_rect(None) is None
+    assert usable_normalized_rect({"x": -0.1, "y": 0.0, "width": 0.5, "height": 0.5}) is None
+    assert usable_normalized_rect("bad") is None
+    rect = usable_normalized_rect({"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4})
+    assert rect == NormalizedRect(0.1, 0.2, 0.3, 0.4)
+    assert usable_normalized_rect(
+        {"x": -0.1, "y": 0.0, "width": 0.5, "height": 0.5},
+        warn_label="识别 ROI",
+    ) is None
+
+
+def test_from_config_uses_full_frame_and_follows_gate_flag():
+    config = _valid_roi_config()
+    config.roi_inspection_rect = None
+    config.roi_template_enabled = True
+    config.roi_template_search_rect = None
+
+    empty = RoiInspectionConfig.from_config(config, template_gate_active=False)
+    assert empty.inspection_roi == FULL_FRAME_RECT
+    assert empty.template_enabled is False
+
+    gated = RoiInspectionConfig.from_config(config, template_gate_active=True)
+    assert gated.template_enabled is True
+
+    config.roi_inspection_rect = {"x": -0.2, "y": 0.0, "width": 0.5, "height": 1.0}
+    leftover = RoiInspectionConfig.from_config(config, template_gate_active=False)
+    assert leftover.inspection_roi == FULL_FRAME_RECT
 
 
 def test_schema_and_quantities_must_be_actual_integers():
@@ -229,12 +255,13 @@ def test_template_enabled_but_angle_negative_reports_error():
     assert any("旋转角度范围" in error for error in errors)
 
 
-def test_template_search_roi_is_required_but_need_not_contain_template_roi():
+def test_template_search_roi_missing_is_not_a_validation_error():
     config = _valid_roi_config()
     config.roi_template_enabled = True
     config.roi_template_rect = {"x": 0.2, "y": 0.2, "width": 0.4, "height": 0.4}
 
-    assert "搜索 ROI 未配置" in config.inspection_validation_errors(["散热片", "螺丝"])
+    errors = config.inspection_validation_errors(["散热片", "螺丝"])
+    assert "搜索 ROI 未配置" not in errors
 
     config.roi_template_search_rect = {"x": 0.7, "y": 0.7, "width": 0.2, "height": 0.2}
     errors = config.inspection_validation_errors(["散热片", "螺丝"])

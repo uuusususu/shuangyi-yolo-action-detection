@@ -257,7 +257,7 @@ def add_title_block(doc: Document) -> None:
     subtitle.paragraph_format.space_before = Pt(0)
     subtitle.paragraph_format.space_after = Pt(14)
     set_run_font(
-        subtitle.add_run("简易操作手册  |  版本日期：2026-07-30"),
+        subtitle.add_run("简易操作手册  |  版本日期：2026-08-27"),
         size=11,
         color=MUTED,
     )
@@ -310,25 +310,33 @@ def build_document() -> Document:
     add_numbered_step(doc, detect_num, "metadata.json 只记录识别 ROI 内目标；目标坐标从裁剪图左上角开始，并记录裁剪区域在原图中的位置。")
     add_callout(doc, "保存图片位于 outputs/evidence 的日期与轮次目录中；图片保存失败不会影响检测、统计或报警。")
 
-    doc.add_heading("三、选择相机与调整画面亮度", level=1)
+    doc.add_heading("三、配置界面怎么用", level=1)
     add_picture(doc, CONFIG_SCREENSHOT, 5.1, "YOLO 动作检测系统配置界面")
     doc.add_paragraph("图 2  配置界面", style="Caption")
+    config_num = add_decimal_numbering(doc)
+    add_numbered_step(doc, config_num, "点击主界面右上角“配置”。左侧六个分区：模型与步骤、动作判定、工业相机、显示与反馈、ROI 配置、生产统计。")
+    add_numbered_step(doc, config_num, "切换分区不会丢掉尚未保存的输入。左侧或底部“返回检测”回到主界面；未点“验证并保存”的数字和开关不会生效。")
+    add_numbered_step(doc, config_num, "底部“验证并保存”统一提交模型、类别、相机、节拍、声音和开关。它不会用画面上未点过“保存当前 ROI”的框覆盖已保存的三种 ROI。")
+    add_numbered_step(doc, config_num, "三种 ROI 必须在编辑器下方分别点击“保存当前 ROI”。下拉框选中哪种，就只保存哪种。")
+    add_callout(doc, "正确顺序：三种 ROI 各自点一次“保存当前 ROI”，再点底部“验证并保存”。只拖框不点“保存当前 ROI”，检测仍用旧区域。")
+
+    doc.add_heading("四、选择相机与调整画面亮度", level=1)
     camera_num = add_decimal_numbering(doc)
-    add_numbered_step(doc, camera_num, "点击主界面右上角“配置”，再选择左侧“工业相机”。")
-    add_numbered_step(doc, camera_num, "点击“刷新设备”，在“迈德相机”下拉框中按设备 SN 选择现场相机。")
-    add_numbered_step(doc, camera_num, "需要调整画面亮度时，将“参数模式”选择为 manual。")
+    add_numbered_step(doc, camera_num, "进入左侧“工业相机”，点击“刷新设备”，在“迈德相机”下拉框中按设备 SN 选择现场相机。")
     add_numbered_step(doc, camera_num, "调整“手动曝光（us）”：数值增大画面变亮，数值减小画面变暗。建议小幅调整后观察画面。")
     add_numbered_step(doc, camera_num, "点击“验证并保存”，再点击“返回检测”。相机选择和曝光参数保存后才会应用。")
+    add_callout(doc, "换相机 SN 且相机已打开时，程序会停止检测并切换相机，但不会清零生产统计。相机参数统一走 preserve，不覆盖相机端已有参数。")
 
     doc.add_page_break()
-    doc.add_heading("四、选择模型", level=1)
+    doc.add_heading("五、选择模型", level=1)
     model_num = add_decimal_numbering(doc)
-    add_numbered_step(doc, model_num, "点击“配置”，进入左侧“模型与步骤”。")
+    add_numbered_step(doc, model_num, "进入左侧“模型与步骤”。")
     add_numbered_step(doc, model_num, "在“模型文件路径”右侧点击“浏览”，选择需要使用的 .onnx 或 .pt 模型。")
+    add_numbered_step(doc, model_num, "按需要调整置信度阈值和 IoU 阈值。")
     add_numbered_step(doc, model_num, "确认路径正确后点击“验证并保存”，程序会重新加载所选模型。")
-    add_callout(doc, "模型文件保存后不要移动、改名或删除；配置类别必须与模型中的类别名称一致。")
+    add_callout(doc, "模型文件保存后不要移动、改名或删除；配置类别必须与模型中的类别名称一致。选 .onnx 时，跟踪器和 Track ID 相关项会变灰，改了也不生效。")
 
-    doc.add_heading("五、配置类别与数量", level=1)
+    doc.add_heading("六、配置类别与数量", level=1)
     category_num = add_decimal_numbering(doc)
     add_numbered_step(doc, category_num, "在“模型与步骤”页面向下找到“类别步骤与数量”。")
     add_numbered_step(doc, category_num, "填写需要检查的类别名称；名称必须与当前模型类别完全一致。ROI 模式下各类别平级，不看填写顺序。")
@@ -337,27 +345,35 @@ def build_document() -> Document:
     add_callout(doc, "待检类别必须与当前模型类别完全一致，名称填写错误会导致检测无法开始。")
 
     doc.add_page_break()
-    doc.add_heading("六、配置 ROI 定位检测", level=1)
+    doc.add_heading("七、配置 ROI 定位检测", level=1)
     roi_num = add_decimal_numbering(doc)
     add_numbered_step(doc, roi_num, "先打开相机，再进入“配置”并选择左侧“ROI 配置”。")
-    add_numbered_step(doc, roi_num, "点击“刷新画面”，使用相机最新静态画面配置区域。")
-    add_numbered_step(doc, roi_num, "在“ROI 类型”下拉框选择“识别 ROI”，点击“创建/替换 ROI”，框住需要统计全部待检类别的固定区域，再点击编辑器下方“保存当前 ROI”。")
+    add_numbered_step(doc, roi_num, "点击“刷新画面”，使用相机最新静态画面配置区域。没有画面时无法创建 ROI。")
+    add_numbered_step(doc, roi_num, "在“ROI 类型”下拉框选择“识别 ROI”，点击“创建/替换 ROI”，拖动框内部可移动，拖右下角可缩放，框住需要统计全部待检类别的固定区域，再点击编辑器下方“保存当前 ROI”。")
     add_numbered_step(doc, roi_num, "选择“模板 ROI”，点击“创建/替换 ROI”并框住一个轮廓清晰的定位目标，然后点击“保存当前 ROI”。保存模板 ROI 不要求搜索 ROI 或识别 ROI 已经配置。")
     add_numbered_step(doc, roi_num, "模板保存成功后，确认静态原图直接显示绿色真实轮廓、绿色外框和“创建得分”；显示红色失败原因时，旧模板和旧配置仍继续有效，可重新框选后再次保存。")
-    add_numbered_step(doc, roi_num, "选择“搜索 ROI”，点击“创建/替换 ROI”并框住运行时允许查找模板的范围，再点击“保存当前 ROI”。三种 ROI 完全独立，不要求重叠或相互包含。")
-    add_numbered_step(doc, roi_num, "设置模板匹配参数：“匹配分数阈值”（0-1，越高越严格，默认 0.6）、“旋转角度范围”（允许的旋转±度数，默认 15）、“角度步进”（默认 1）。")
+    add_numbered_step(doc, roi_num, "选择“搜索 ROI”，点击“创建/替换 ROI”并框住运行时允许查找模板的范围，再点击“保存当前 ROI”。三种 ROI 完全独立，不要求重叠或相互包含。搜索框必须明显大于模板，给停位留出平移余量。")
+    add_numbered_step(doc, roi_num, "设置模板匹配参数：“匹配分数阈值”（越高越严格，默认 0.7，得分约等于可见轮廓比例）、“旋转角度范围”（允许的旋转±度数，默认 15）、“角度步进”（填 0 表示自动推算，推荐）。")
     add_numbered_step(doc, roi_num, "三种 ROI 分别保存完成后，开启“ROI 定位检测”和“模板匹配定位”，再点击页面底部“验证并保存”统一应用运行配置。")
-    add_callout(doc, "模板定位启用时，每帧只在搜索 ROI 内做固定比例边缘匹配；命中后才对整图运行 YOLO，再用固定识别 ROI 判断类别和数量。主画面只显示搜索 ROI 框。模板缺失、有效边缘不足或搜索 ROI 缺失时会阻止检测。相机位置、镜头、硬件裁剪或视野变化后，必须刷新画面并重新框选三种 ROI、创建模板。")
+    add_callout(doc, "模板定位启用时，每帧只在搜索 ROI 内做固定比例边缘匹配；命中后才对整图运行 YOLO，再用固定识别 ROI 判断类别和数量。主画面只显示搜索 ROI 框。模板缺失、有效边缘不足、搜索 ROI 缺失或搜索框太小时会阻止检测。“删除 ROI”只清掉当前静图上的框，要更新已保存区域必须重新框选并再点“保存当前 ROI”。相机位置、镜头、硬件裁剪或视野变化后，必须刷新画面并重新框选三种 ROI、创建模板。")
 
-    doc.add_heading("七、设置检测节奏", level=1)
+    doc.add_heading("八、设置检测节奏", level=1)
     rhythm_num = add_decimal_numbering(doc)
     add_numbered_step(doc, rhythm_num, "进入“动作判定”，设置“通过稳定帧数”。某类连续达到正确数量后会在本轮锁存 PASS。")
     add_numbered_step(doc, rhythm_num, "设置“NG 稳定帧数”。任意未完成类别连续数量不符达到该帧数，整轮判定 NG。")
     add_numbered_step(doc, rhythm_num, "设置“完成一轮间隔（秒）”。PASS 或 NG 后按该时间保持结果，间隔到期后允许下一轮。")
+    add_numbered_step(doc, rhythm_num, "普通动作模式下，若第 1 步到位后当前步必须马上数量正确，打开“类别/数量失败重试”。它复用上面的“NG 稳定帧数”：连续不对满该帧数即报 NG。空工位（第 1 步从未出现）不会因此报 NG。ROI 模式不使用此开关。")
     add_numbered_step(doc, rhythm_num, "输送速度变化后，只需要重新调整完成一轮间隔，并现场连续检查节拍。")
     add_callout(doc, "每次 PASS 或 NG 只统计一轮；完成一轮间隔结束后才开始下一轮。")
 
-    doc.add_heading("八、正常关闭", level=1)
+    doc.add_heading("九、显示、声音与生产统计", level=1)
+    extra_num = add_decimal_numbering(doc)
+    add_numbered_step(doc, extra_num, "进入“显示与反馈”。需要看分数时打开“显示置信度”；PASS / FAIL 提示音和“失败证据保存”按现场需要开关。")
+    add_numbered_step(doc, extra_num, "进入“生产统计”可查看当前批次开始时间、总数、OK、NG、良率。")
+    add_numbered_step(doc, extra_num, "换批次时点击“归零并归档”，确认后系统先保存当前记录再清零。无计数时只刷新开始时间。换相机不会自动清零。")
+    add_callout(doc, "失败证据位于 outputs/evidence 的日期与轮次目录中；图片保存失败不会影响检测、统计或报警。")
+
+    doc.add_heading("十、正常关闭", level=1)
     close_num = add_decimal_numbering(doc)
     add_numbered_step(doc, close_num, "先点击“停止检测”。")
     add_numbered_step(doc, close_num, "再点击“关闭相机”。")
@@ -374,6 +390,9 @@ def build_document() -> Document:
         "匹配分数阈值",
         "旋转角度范围",
         "角度步进",
+        "类别/数量失败重试",
+        "显示与反馈",
+        "归零并归档",
         "ROI 类型",
         "识别 ROI",
         "模板 ROI",

@@ -24,6 +24,8 @@ class OnnxObbProcessor:
         max_det: int = 300,
         providers: Optional[Sequence[str]] = None,
         session_factory: Optional[Callable[..., object]] = None,
+        intra_op_threads: int = 0,
+        graph_optimization: str = "all",
     ) -> None:
         self._model_path = model_path
         self._conf_threshold = float(conf_threshold)
@@ -31,6 +33,8 @@ class OnnxObbProcessor:
         self._max_det = int(max_det)
         self._providers = list(providers) if providers else ["CPUExecutionProvider"]
         self._session_factory = session_factory
+        self._intra_op_threads = max(0, int(intra_op_threads))
+        self._graph_optimization = str(graph_optimization or "all")
 
         self._session = None
         self._input_name = ""
@@ -47,7 +51,11 @@ class OnnxObbProcessor:
         if self._session_factory is None:
             import onnxruntime as ort
 
-            self._session = ort.InferenceSession(str(path), providers=self._providers)
+            self._session = ort.InferenceSession(
+                str(path),
+                sess_options=self._build_session_options(ort),
+                providers=self._providers,
+            )
         else:
             self._session = self._session_factory(str(path), providers=self._providers)
 
@@ -62,6 +70,30 @@ class OnnxObbProcessor:
         self._output_names = [out.name for out in outputs]
         self._input_size = self._resolve_input_size(inputs[0].shape)
         self._class_names = self._resolve_class_names()
+
+    def describe_session_options(self) -> dict:
+        """当前生效的会话参数，供启动日志与配置页回显。"""
+        return {
+            "intra_op_threads": self._intra_op_threads,
+            "graph_optimization": self._graph_optimization,
+            "providers": list(self._providers),
+        }
+
+    def _build_session_options(self, ort):
+        """把配置里的会话参数翻译成 ONNX Runtime 的 SessionOptions。"""
+        options = ort.SessionOptions()
+        if self._intra_op_threads > 0:
+            options.intra_op_num_threads = self._intra_op_threads
+        levels = {
+            "disabled": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
+            "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
+            "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
+            "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+        }
+        options.graph_optimization_level = levels.get(
+            self._graph_optimization, ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
+        return options
 
     def get_class_names(self) -> dict:
         """Return model class name mapping."""
@@ -97,6 +129,7 @@ class OnnxObbProcessor:
                 latency_ms=(time.perf_counter() - t0) * 1000,
             )
 
+        elapsed_ms = (time.perf_counter() - t0) * 1000
         return DetectionOverlayState(
             source_frame_id=source_frame_id,
             timestamp=time.time(),
@@ -104,7 +137,8 @@ class OnnxObbProcessor:
             task_type="onnx_obb",
             detections=detections,
             round_id=round_id,
-            latency_ms=(time.perf_counter() - t0) * 1000,
+            latency_ms=elapsed_ms,
+            yolo_ms=elapsed_ms,
         )
 
     def _resolve_input_size(self, shape: Sequence[object]) -> Tuple[int, int]:

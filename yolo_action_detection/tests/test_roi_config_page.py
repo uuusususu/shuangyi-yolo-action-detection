@@ -208,8 +208,29 @@ def test_roi_type_dropdown_creates_and_deletes_selected_kind(qapp):
     assert page._roi_editor.roi_rect(RoiKind.SEARCH) is None
 
 
-def test_template_roi_save_rejected_without_search_roi(qapp, tmp_path, monkeypatch):
-    """没有搜索框就无法校验余量，保存必须失败并提示。"""
+def test_fresh_roi_page_has_no_boxes_until_create(qapp):
+    page = ConfigPage(ConfigManager(), roi_frame_provider=lambda: _textured_frame())
+    page._refresh_roi_frame()
+
+    assert page._roi_editor.roi_rect(RoiKind.LOCATOR) is None
+    assert page._roi_editor.roi_rect(RoiKind.SEARCH) is None
+    assert page._roi_editor.roi_rect(RoiKind.INSPECTION) is None
+
+
+def test_create_roi_does_not_persist_until_save(qapp, tmp_path):
+    config = ConfigManager()
+    config._config_path = str(tmp_path / "config.json")
+    page = ConfigPage(config, roi_frame_provider=lambda: _textured_frame())
+    page._refresh_roi_frame()
+    _select_roi(page, RoiKind.SEARCH)
+    page._create_roi_btn.click()
+
+    assert page._roi_editor.roi_rect(RoiKind.SEARCH) is not None
+    assert config.roi_template_search_rect is None
+    assert (tmp_path / "config.json").exists() is False
+
+
+def test_template_roi_saves_without_search_roi(qapp, tmp_path, monkeypatch):
     config = ConfigManager()
     config._config_path = str(tmp_path / "config.json")
     page = ConfigPage(config, roi_frame_provider=lambda: _textured_frame())
@@ -220,13 +241,21 @@ def test_template_roi_save_rejected_without_search_roi(qapp, tmp_path, monkeypat
     page._roi_editor.set_rect(RoiKind.LOCATOR, NormalizedRect(0.15, 0.20, 0.20, 0.20))
     page._save_roi_btn.click()
 
-    assert warnings and "搜索 ROI" in warnings[-1]
-    assert (tmp_path / "locator_template.png").exists() is False
-    assert (tmp_path / "locator_model.npz").exists() is False
+    assert warnings == []
+    assert (tmp_path / "locator_template.png").is_file()
+    assert (tmp_path / "locator_model.npz").is_file()
+    saved = json.loads(Path(config.get_config_path()).read_text(encoding="utf-8"))
+    assert saved["roi_template_rect"] == {
+        "x": 0.15,
+        "y": 0.20,
+        "width": 0.20,
+        "height": 0.20,
+    }
+    assert saved["roi_template_search_rect"] is None
+    assert page._roi_editor.roi_rect(RoiKind.SEARCH) is None
 
 
-def test_template_roi_save_rejected_when_search_roi_too_small(qapp, tmp_path, monkeypatch):
-    """框太小必须拒绝并给出所需尺寸——现场就是栽在这一条上。"""
+def test_template_roi_save_ignores_small_search_draft(qapp, tmp_path, monkeypatch):
     config = ConfigManager()
     config._config_path = str(tmp_path / "config.json")
     page = ConfigPage(config, roi_frame_provider=lambda: _textured_frame())
@@ -239,10 +268,10 @@ def test_template_roi_save_rejected_when_search_roi_too_small(qapp, tmp_path, mo
     _select_roi(page, RoiKind.LOCATOR)
     page._save_roi_btn.click()
 
-    assert warnings
-    assert "搜索框太小" in warnings[-1]
-    assert "需要至少" in warnings[-1]
-    assert (tmp_path / "locator_template.png").exists() is False
+    assert warnings == []
+    assert (tmp_path / "locator_template.png").is_file()
+    saved = json.loads(Path(config.get_config_path()).read_text(encoding="utf-8"))
+    assert saved["roi_template_search_rect"] is None
 
 
 def test_template_roi_saves_with_adequate_search_roi_and_shows_feedback(
@@ -408,6 +437,27 @@ def test_save_current_roi_only_persists_selected_kind(qapp, tmp_path):
     assert saved["roi_inspection_rect"] == new_inspection.to_mapping()
 
 
+def test_delete_search_roi_clears_saved_rect_only(qapp, tmp_path):
+    config = ConfigManager()
+    config._config_path = str(tmp_path / "config.json")
+    config.roi_template_rect = {"x": 0.2, "y": 0.2, "width": 0.2, "height": 0.2}
+    config.roi_template_search_rect = {"x": 0.1, "y": 0.1, "width": 0.3, "height": 0.3}
+    config.roi_inspection_rect = {"x": 0.5, "y": 0.0, "width": 0.5, "height": 1.0}
+    page = ConfigPage(config, roi_frame_provider=lambda: _textured_frame())
+    page._refresh_roi_frame()
+    _select_roi(page, RoiKind.SEARCH)
+
+    page._delete_roi_btn.click()
+
+    saved = json.loads(Path(config.get_config_path()).read_text(encoding="utf-8"))
+    assert config.roi_template_search_rect is None
+    assert saved["roi_template_search_rect"] is None
+    assert saved["roi_inspection_rect"] == {"x": 0.5, "y": 0.0, "width": 0.5, "height": 1.0}
+    assert saved["roi_template_rect"] == {"x": 0.2, "y": 0.2, "width": 0.2, "height": 0.2}
+    assert page._roi_editor.roi_rect(RoiKind.SEARCH) is None
+    assert "已删除" in page._roi_frame_status.text()
+
+
 def test_roi_page_saves_new_schema_and_template_config(qapp, tmp_path, monkeypatch):
     config = ConfigManager()
     config._config_path = str(tmp_path / "config.json")
@@ -434,6 +484,7 @@ def test_roi_page_saves_new_schema_and_template_config(qapp, tmp_path, monkeypat
 
     emitted = []
     page.config_saved.connect(lambda: emitted.append(True))
+    page._action_order_cb.setChecked(False)
     page._on_save()
 
     saved = json.loads(Path(config.get_config_path()).read_text(encoding="utf-8"))
@@ -477,6 +528,7 @@ def test_roi_page_can_save_draft_before_rects_are_drawn(qapp, tmp_path, monkeypa
 
     emitted = []
     page.config_saved.connect(lambda: emitted.append(True))
+    page._action_order_cb.setChecked(False)
     page._on_save()
 
     assert warnings == []

@@ -150,7 +150,7 @@ def test_config_page_preserves_native_control_types_and_binary_api(themed_app):
     assert isinstance(page._model_path_input, QLineEdit)
     assert isinstance(page._tracker_input, QComboBox)
     assert isinstance(page._conf_input, QDoubleSpinBox)
-    assert isinstance(page._max_det_input, QSpinBox)
+    assert isinstance(page._cam_exp_input, QSpinBox)
     assert isinstance(page._roi_enabled_cb, QCheckBox)
     assert page._roi_enabled_cb.styleSheet() == ""
 
@@ -172,3 +172,13 @@ def test_main_window_uses_theme_button_roles_without_local_styles(themed_app):
     assert window._btn_close.isDefault() is False
     assert window._btn_camera.property("buttonRole") == "primary"
     assert window._btn_detect.property("buttonRole") == "primary"
+
+
+def test_project_tokens_do_not_restyle_standard_control_chrome():
+    from ui.runtime_ui_tokens import frame_style, text_style
+
+    panel_qss = frame_style() + text_style()
+    assert "QPushButton" not in panel_qss
+    assert "QLineEdit" not in panel_qss
+    assert "QComboBox" not in panel_qss
+    assert "QCheckBox" not in panel_qss

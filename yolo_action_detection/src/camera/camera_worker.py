@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict, deque
+from copy import deepcopy
 from typing import Optional
 
 import cv2
 import numpy as np
 from PySide6.QtCore import QObject, Signal
-from PySide6.QtGui import QImage
 
 from camera.mvsdk_camera import MvSdkCamera, MvSdkCapture, MvSdkDevice
+from hand_tracking.mediapipe_hands import landmarks_to_payload
 from runtime_diagnostics import get_runtime_logger
 from yolo_runtime.yolo_result_models import DetectionOverlayState, PipelineStats
 
@@ -18,13 +20,13 @@ from yolo_runtime.yolo_result_models import DetectionOverlayState, PipelineStats
 class CameraWorker(QObject):
     """Coordinate camera capture, inference scheduling, and runtime events."""
 
-    frame_ready = Signal(QImage)
     error_occurred = Signal(str)
     state_changed = Signal(str, bool)
     fps_updated = Signal(float)
     overlay_state_updated = Signal(dict)
     pipeline_stats_updated = Signal(dict)
     camera_params_updated = Signal(dict)
+    _ACTION_EVIDENCE_LIMIT = 16
 
     def __init__(self, config, state) -> None:
         super().__init__()
@@ -51,6 +53,11 @@ class CameraWorker(QObject):
         self._overlay_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self._display_lock = threading.Lock()
+        self._runtime_lock = threading.RLock()
+        self.runtime_generation = 0
+        self._evidence_lock = threading.Lock()
+        self._action_evidence = OrderedDict()
+        self._action_event_evidence = deque(maxlen=4)
 
         self._latest_preview_frame: Optional[np.ndarray] = None
         self._latest_infer_frame: Optional[np.ndarray] = None
@@ -71,6 +78,41 @@ class CameraWorker(QObject):
         self._infer_fps_start = time.time()
         self._preview_count = 0
         self._preview_fps_start = time.time()
+
+        self._hand_lock = threading.Lock()
+        self._hand_overlay_enabled = False
+        self._hand_tracker = None
+        self._hand_tracker_failed = False
+        self._hand_runtime_error = ""
+        self._hand_tracker_factory = self._create_runtime_hands
+        self._action_lock = threading.Lock()
+        self._action_session = None
+
+    @staticmethod
+    def _create_runtime_hands():
+        from lstm_workbench.model_registry import create_hands_tracker
+
+        return create_hands_tracker()
+
+    def get_action_session(self):
+        with self._action_lock:
+            return self._action_session
+
+    def replace_runtime(self, config, processor, action_session) -> None:
+        """在停推理状态一次切换已准备好的依赖，不在提交阶段装载模型。"""
+        with self._runtime_lock:
+            if self.state.inference_on:
+                raise RuntimeError("请先停止推理，再切换模型配置")
+            with self._action_lock:
+                self.config = config
+                self.frame_processor = processor
+                self._action_session = action_session
+                self.runtime_generation += 1
+            with self._hand_lock:
+                self._release_hand_tracker_locked()
+                self._hand_tracker_failed = False
+                self._hand_runtime_error = ""
+            self._clear_action_evidence()
 
     def set_frame_processor(self, processor) -> None:
         self.frame_processor = processor
@@ -109,15 +151,12 @@ class CameraWorker(QObject):
                 exposure_us=getattr(self.config, "camera_manual_exposure_us", 30000),
                 auto_exposure=getattr(self.config, "camera_manual_ae", False),
             )
-            param_mode = getattr(self.config, "camera_parameter_mode", "preserve")
-            param_group = getattr(self.config, "camera_parameter_group", 0)
-            param_file = getattr(self.config, "camera_parameter_file", "")
             opened = self._mvsdk_camera.open(
                 sn=target_sn,
                 friendly_name=legacy_name if not target_sn else "",
-                parameter_mode=param_mode,
-                parameter_group=param_group,
-                parameter_file=param_file,
+                parameter_mode="preserve",
+                parameter_group=0,
+                parameter_file="",
             )
             if not opened:
                 raise RuntimeError(
@@ -179,6 +218,7 @@ class CameraWorker(QObject):
             except Exception:
                 pass
         self.cap = None
+        self._release_hand_tracker()
         self._clear_session_buffers()
 
     def _wait_for_threads_to_stop(self, timeout_s: float = 1.0) -> None:
@@ -189,6 +229,16 @@ class CameraWorker(QObject):
                 thread.join(timeout=timeout_s)
             if thread is None or not thread.is_alive():
                 setattr(self, attr_name, None)
+
+    def set_hand_overlay_enabled(self, enabled: bool) -> None:
+        """顺序模式检测中才开 Hands。关闭时释放会话，便于下次重新初始化。"""
+        enabled = bool(enabled)
+        with self._hand_lock:
+            self._hand_overlay_enabled = enabled
+            if not enabled:
+                self._release_hand_tracker_locked()
+                self._hand_tracker_failed = False
+                self._hand_runtime_error = ""
 
     def start_inference(self) -> None:
         self._runtime_logger.info(
@@ -221,6 +271,7 @@ class CameraWorker(QObject):
     def _capture_loop(self, generation: int) -> None:
         while self.running and generation == self._session_generation and self.cap:
             try:
+                read_started = time.perf_counter()
                 ret, frame = self.cap.read()
                 if not ret or frame is None:
                     now = time.monotonic()
@@ -249,13 +300,21 @@ class CameraWorker(QObject):
                         frame.dtype,
                     )
                     self._first_frame_logged = True
+                # 相机层已经返回独立副本，这里把同一份快照标记为只读后共享给预览和推理，
+                # 省掉每帧两次整幅拷贝；取用方各自 copy，写入方只换引用不改内容。
+                frame.flags.writeable = False
                 with self._preview_lock:
                     self._next_frame_id += 1
                     frame_id = self._next_frame_id
-                    self._latest_preview_frame = frame.copy()
+                    self._latest_preview_frame = frame
                 with self._infer_lock:
-                    self._latest_infer_frame = frame.copy()
+                    self._latest_infer_frame = frame
                     self._latest_infer_frame_id = frame_id
+                    self._latest_infer_captured_at = time.monotonic()
+                    self._latest_infer_captured_wall_time = time.time()
+                self._pipeline_stats.capture_ms = (
+                    time.perf_counter() - read_started
+                ) * 1000.0
                 self._capture_count += 1
                 self._update_capture_fps()
             except Exception as exc:
@@ -276,6 +335,8 @@ class CameraWorker(QObject):
             with self._infer_lock:
                 frame = self._latest_infer_frame
                 fid = self._latest_infer_frame_id
+                captured_at = getattr(self, "_latest_infer_captured_at", None)
+                captured_wall_time = getattr(self, "_latest_infer_captured_wall_time", None)
             if frame is None:
                 time.sleep(0.01)
                 continue
@@ -284,26 +345,45 @@ class CameraWorker(QObject):
                 continue
             dropped = max(0, fid - self._last_inferred_frame_id - 1)
             self._last_inferred_frame_id = fid
+            self._runtime_lock.acquire()
             try:
+                if not self.state.inference_on:
+                    continue
                 overlay = self.frame_processor.process_frame(frame, source_frame_id=fid)
+                overlay.source_frame_id = int(fid)
                 self._record_inference_diagnostics(overlay)
                 if not self.running or generation != self._session_generation:
                     break
-                with self._overlay_lock:
-                    self._latest_overlay = overlay
-                # 同帧：同一个快照既供按需读取，也随 overlay 事件交给界面。
-                source_frame = frame.copy()
-                with self._display_lock:
-                    self._latest_display_frame = source_frame
-                    self._latest_display_frame_id = fid
-                image_size = (int(frame.shape[1]), int(frame.shape[0]))
-                overlay_payload = self._overlay_to_dict(overlay, image_size=image_size)
-                overlay_payload["source_frame"] = source_frame
-                self.overlay_state_updated.emit(overlay_payload)
+                action_session = self.get_action_session()
+                uses_hands = bool(getattr(getattr(action_session, "bundle", None), "hands_in_training", action_session is not None))
+                hand_landmarks = self._hand_landmarks_payload(
+                    frame,
+                    force=uses_hands,
+                )
+                if hand_landmarks is not None:
+                    overlay.hand_landmarks = hand_landmarks
+                detections = self._action_detections(frame, overlay, fid)
+                observed_at = float(captured_at if captured_at is not None else time.monotonic())
+                self._cache_action_evidence(
+                    frame, fid, observed_at, detections, overlay.model_path,
+                    wall_time=captured_wall_time,
+                )
+                action_report = self._observe_action(
+                    frame,
+                    fid,
+                    observed_at,
+                    overlay,
+                    hand_landmarks,
+                    detections=detections,
+                )
+                self._prune_action_evidence(action_report)
+                self._publish_inference_result(frame, fid, overlay, action_report)
                 self._infer_count += 1
                 if dropped:
                     self._pipeline_stats.dropped_for_infer += dropped
                 self._pipeline_stats.infer_latency_ms = float(overlay.latency_ms or 0.0)
+                self._pipeline_stats.template_ms = float(overlay.template_ms or 0.0)
+                self._pipeline_stats.yolo_ms = float(overlay.yolo_ms or 0.0)
                 self._update_infer_fps()
             except Exception as exc:
                 error_key = f"loop:{type(exc).__name__}:{exc}"
@@ -314,7 +394,31 @@ class CameraWorker(QObject):
                         exc,
                     )
                     self._logged_inference_errors.add(error_key)
+                action_report = self._fault_action(str(exc))
+                self._prune_action_evidence(action_report)
+                if self.running and generation == self._session_generation:
+                    failed = DetectionOverlayState(source_frame_id=fid, error=str(exc), status="error")
+                    self._publish_inference_result(frame, fid, failed, action_report)
                 self.error_occurred.emit(f"推理异常: {exc}")
+            finally:
+                self._runtime_lock.release()
+
+    def _publish_inference_result(self, frame, frame_id: int, overlay, action_report) -> None:
+        """同一次输入的图片、帧号和结果一起发布，包括故障结果。"""
+        overlay.source_frame_id = int(frame_id)
+        with self._overlay_lock:
+            self._latest_overlay = overlay
+        with self._display_lock:
+            self._latest_display_frame = frame
+            self._latest_display_frame_id = int(frame_id)
+        payload = self._overlay_to_dict(overlay, image_size=(frame.shape[1], frame.shape[0]))
+        if overlay.hand_landmarks:
+            payload["hand_landmarks"] = overlay.hand_landmarks
+        if action_report is not None:
+            payload["lstm_action"] = action_report
+        payload["source_frame"] = frame
+        payload["runtime_generation"] = self.runtime_generation
+        self.overlay_state_updated.emit(payload)
 
     def _record_inference_diagnostics(self, overlay: DetectionOverlayState) -> None:
         if overlay.error:
@@ -338,6 +442,8 @@ class CameraWorker(QObject):
             self._first_inference_logged = True
 
     def _clear_session_buffers(self) -> None:
+        self.runtime_generation += 1
+        self._clear_action_evidence()
         self._first_frame_logged = False
         self._first_inference_logged = False
         self._capture_wait_started_at = None
@@ -381,6 +487,13 @@ class CameraWorker(QObject):
                 return self._latest_display_frame.copy(), self._latest_display_frame_id
         return None, 0
 
+    def get_display_frame_id(self) -> int:
+        """只取同帧推理结果的帧号，供界面在拷贝前判断内容是否变化。"""
+        with self._display_lock:
+            if self._latest_display_frame is None:
+                return 0
+            return int(self._latest_display_frame_id)
+
     def get_camera_params(self) -> dict:
         """读取当前相机参数。"""
         if self._mvsdk_camera:
@@ -393,6 +506,11 @@ class CameraWorker(QObject):
 
     def get_pipeline_stats(self) -> dict:
         return self._pipeline_stats.to_dict()
+
+    def record_render_latency(self, elapsed_ms: float) -> None:
+        """界面线程回报一次渲染耗时，让分段统计覆盖到显示这一段。"""
+        with self._stats_lock:
+            self._pipeline_stats.render_ms = float(elapsed_ms)
 
     def _update_capture_fps(self) -> None:
         now = time.time()
@@ -410,6 +528,212 @@ class CameraWorker(QObject):
             self._infer_count = 0
             self._infer_fps_start = now
             self.pipeline_stats_updated.emit(self._pipeline_stats.to_dict())
+
+    def set_action_session(self, session) -> None:
+        """推理线程持有连续动作会话。传 None 就停止动作推理。"""
+        with self._runtime_lock:
+            with self._action_lock:
+                self._action_session = session
+                self.runtime_generation += 1
+            self._clear_action_evidence()
+
+    def reset_action_session(self) -> None:
+        """停止或关相机时清掉未结束的动作，不把尾段补成 PASS。"""
+        with self._runtime_lock:
+            with self._action_lock:
+                session = self._action_session
+            if session is not None:
+                session.reset()
+            self.runtime_generation += 1
+            self._clear_action_evidence()
+
+    def _clear_action_evidence(self) -> None:
+        with self._evidence_lock:
+            self._action_evidence.clear()
+            self._action_event_evidence.clear()
+
+    def _cache_action_evidence(self, frame, frame_id: int, timestamp: float, detections, model_path: str, *, wall_time=None) -> None:
+        if self.get_action_session() is None:
+            return
+        owned = frame.copy()
+        owned.setflags(write=False)
+        captured_wall = float(wall_time) if wall_time is not None else time.time() + float(timestamp) - time.monotonic()
+        with self._evidence_lock:
+            self._action_evidence[int(frame_id)] = (
+                owned,
+                deepcopy(detections),
+                {
+                    "source_frame_id": int(frame_id), "timestamp": captured_wall,
+                    "capture_monotonic": float(timestamp), "model_path": str(model_path),
+                },
+            )
+            while len(self._action_evidence) > self._ACTION_EVIDENCE_LIMIT:
+                self._action_evidence.popitem(last=False)
+
+    def _prune_action_evidence(self, report) -> None:
+        """仅保留流会话要求的真实边界与最近两帧，长动作不增长图片缓存。"""
+        report = report or {}
+        keep = {int(value) for value in report.get("evidence_frames", [])}
+        with self._evidence_lock:
+            for event in report.get("events", []):
+                boundaries = {
+                    int(event[key]) for key in ("end_frame", "decision_frame")
+                    if event.get(key) is not None
+                }
+                if boundaries:
+                    self._action_event_evidence.append(boundaries)
+            for boundaries in self._action_event_evidence:
+                keep.update(boundaries)
+            keep.update(list(self._action_evidence)[-2:])
+            for frame_id in list(self._action_evidence):
+                if frame_id not in keep:
+                    del self._action_evidence[frame_id]
+
+    def get_action_boundary_evidence(self, frame_id: int):
+        """半开结束帧指后继的真实源帧；没有该帧就返回 None，不替换图片编号。"""
+        with self._evidence_lock:
+            evidence = self._action_evidence.get(int(frame_id))
+            if evidence is None:
+                return None
+            frame, detections, metadata = evidence
+            return frame.copy(), deepcopy(detections), dict(metadata)
+
+    def _fault_action(self, reason: str):
+        session = self.get_action_session()
+        if session is None:
+            return None
+        return session.set_fault(str(reason))
+
+    def _action_detections(self, frame, overlay, frame_id: int):
+        """动作特征用整帧 YOLO。模板没对上时不能拿空检测代替。"""
+        with self._action_lock:
+            if self._action_session is None:
+                return getattr(overlay, "detections", []) or []
+        if getattr(overlay, "error", ""):
+            raise RuntimeError(str(overlay.error))
+        inner = getattr(self.frame_processor, "_inner", None)
+        if inner is not None and not getattr(overlay, "template_matched", True):
+            try:
+                detected = inner.process_frame(frame, source_frame_id=frame_id)
+            except Exception as exc:
+                self._runtime_logger.exception("lstm_action=yolo_failed error=%s", exc)
+                raise RuntimeError(f"动作 YOLO 推理失败: {exc}") from exc
+            if getattr(detected, "error", ""):
+                raise RuntimeError(f"动作 YOLO 推理失败: {detected.error}")
+            return getattr(detected, "detections", []) or []
+        return getattr(overlay, "detections", []) or []
+
+    def _observe_action(self, frame, frame_id: int, captured_at: float, overlay, hand_landmarks, detections=None):
+        with self._action_lock:
+            session = self._action_session
+        if session is None:
+            return None
+        if getattr(overlay, "error", ""):
+            return self._fault_action(str(overlay.error))
+        uses_hands = bool(getattr(getattr(session, "bundle", None), "hands_in_training", True))
+        if not uses_hands:
+            hand_landmarks = []
+        elif hand_landmarks is None:
+            hand_landmarks = []
+        fault = ""
+        if uses_hands and (self._hand_tracker_failed or self._hand_runtime_error):
+            fault = self._hand_runtime_error or "手部模型不可用"
+        if detections is None:
+            detections = []
+            for item in getattr(overlay, "detections", []) or []:
+                detections.append({
+                    "label": getattr(item, "label", ""),
+                    "conf": getattr(item, "conf", 0.0),
+                    "box": getattr(item, "box", (0, 0, 0, 0)),
+                })
+        else:
+            detections = [
+                item if isinstance(item, dict) else {
+                    "label": getattr(item, "label", ""),
+                    "conf": getattr(item, "conf", 0.0),
+                    "box": getattr(item, "box", (0, 0, 0, 0)),
+                }
+                for item in detections
+            ]
+        try:
+            return session.observe_frame(
+                source_frame=int(frame_id),
+                timestamp=float(captured_at),
+                detections=detections,
+                hands=hand_landmarks,
+                frame_w=int(frame.shape[1]),
+                frame_h=int(frame.shape[0]),
+                hand_fault=fault,
+            )
+        except Exception as exc:
+            self._runtime_logger.exception("lstm_action=failed error=%s", exc)
+            return self._fault_action(str(exc))
+
+    def _hand_landmarks_payload(self, frame, *, force: bool = False) -> Optional[list]:
+        """启用时返回 list（无手为空列表）；未启用返回 None，不往 overlay 写字段。"""
+        with self._hand_lock:
+            if not self._hand_overlay_enabled and not force:
+                return None
+            if self._hand_tracker_failed:
+                return []
+            if self._hand_tracker is None:
+                try:
+                    tracker = self._hand_tracker_factory()
+                except Exception as exc:
+                    self._hand_tracker_failed = True
+                    self._hand_runtime_error = str(exc)
+                    self._runtime_logger.exception(
+                        "hand_overlay=factory_failed error=%s",
+                        exc,
+                    )
+                    return []
+                if not getattr(tracker, "available", False):
+                    self._hand_tracker_failed = True
+                    self._hand_runtime_error = getattr(tracker, "error", "") or "手部模型初始化失败"
+                    self._runtime_logger.error(
+                        "hand_overlay=unavailable error=%s",
+                        getattr(tracker, "error", "") or "init_failed",
+                    )
+                    try:
+                        tracker.close()
+                    except Exception:
+                        pass
+                    return []
+                self._hand_tracker = tracker
+            tracker = self._hand_tracker
+            try:
+                hands = tracker.process(frame)
+                if getattr(tracker, "error", "") or not getattr(tracker, "available", True):
+                    raise RuntimeError(getattr(tracker, "error", "") or "手部模型不可用")
+            except Exception as exc:
+                self._hand_tracker_failed = True
+                self._hand_runtime_error = str(exc)
+                self._runtime_logger.exception(
+                    "hand_overlay=process_failed error=%s",
+                    exc,
+                )
+                return []
+        try:
+            self._hand_runtime_error = ""
+            return landmarks_to_payload(hands)
+        except Exception as exc:
+            self._hand_tracker_failed = True
+            self._hand_runtime_error = f"手部特征转换失败: {exc}"
+            return []
+
+    def _release_hand_tracker(self) -> None:
+        with self._hand_lock:
+            self._release_hand_tracker_locked()
+
+    def _release_hand_tracker_locked(self) -> None:
+        tracker = self._hand_tracker
+        self._hand_tracker = None
+        if tracker is None:
+            return
+        try:
+            tracker.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _overlay_to_dict(
@@ -433,6 +757,8 @@ class CameraWorker(QObject):
             "error": overlay.error,
             "round_id": overlay.round_id,
             "latency_ms": overlay.latency_ms,
+            "template_ms": float(overlay.template_ms),
+            "yolo_ms": float(overlay.yolo_ms),
             "template_matched": bool(overlay.template_matched),
             "template_score": float(overlay.template_score),
             "template_center": list(overlay.template_center) if overlay.template_center else None,

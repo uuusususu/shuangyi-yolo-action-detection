@@ -21,11 +21,24 @@ from detection_logging.fail_evidence import FailEvidenceContext, FailEvidenceSav
 from roi_inspection.models import InspectionOutcome, RoundPhase
 from step_sequence.step_sequence_engine import StepSequenceEngine
 from ui.main_window import MainWindow
+from yolo_runtime.template_gated_processor import TemplateGatedProcessor
 
 
 class DummyProcessor:
     def get_class_names(self):
         return {0: "A", 1: "B"}
+
+
+class DummyGatedProcessor(TemplateGatedProcessor):
+    """只用于让引擎认为门控已挂上，不跑真实匹配。"""
+
+    def __init__(self):
+        self._inner = DummyProcessor()
+        self._template_model = object()
+        self._search_rect = {"x": 0.1, "y": 0.1, "width": 0.3, "height": 0.3}
+
+    def get_class_names(self):
+        return self._inner.get_class_names()
 
 
 class SoundSpy:
@@ -90,18 +103,19 @@ def _enable_template(config: ConfigManager) -> ConfigManager:
     return config
 
 
-def _window(qapp, config, *, sound=None, evidence=None):
+def _window(qapp, config, *, sound=None, evidence=None, processor=None):
+    runtime_processor = processor or DummyProcessor()
     return MainWindow(
         config,
         AppState(),
-        processor=DummyProcessor(),
+        processor=runtime_processor,
         step_engine=StepSequenceEngine(
             step_class_names=config.category_names,
             step_counts=config.get_runtime_category_counts(),
         ),
         sound_feedback=sound,
         fail_evidence_saver=evidence,
-        processor_factory=lambda *args, **kwargs: DummyProcessor(),
+        processor_factory=lambda *args, **kwargs: runtime_processor,
     )
 
 
@@ -571,7 +585,7 @@ def test_invalid_roi_configuration_blocks_detection_start(qapp, tmp_path, monkey
 
     assert calls == []
     assert "待检数量" in window._status_label.text()
-    assert "识别 ROI" in window._notice_label.text()
+    assert "识别 ROI" not in window._notice_label.text()
     assert "待检数量" in window._notice_label.text()
 
 
@@ -620,16 +634,16 @@ def test_runtime_reset_clears_roi_round_but_preserves_production_stats(qapp, tmp
     assert window._stats_manager.batch.total == 1
 
 
-def test_runtime_overlay_draws_only_template_search_roi(qapp, tmp_path):
+def test_runtime_overlay_draws_search_and_inspection_roi(qapp, tmp_path):
     config = _enable_template(_roi_config(tmp_path))
     window = _window(qapp, config)
     frame = np.zeros((1000, 1000, 3), dtype=np.uint8)
 
     rendered = window._draw_roi_overlay(frame)
 
-    # 搜索 ROI 边界可见，识别 ROI 边界及内部得分/数量文字均不绘制。
+    # 搜索 ROI 与识别 ROI 边界可见；框内不画得分/数量文字。
     assert tuple(int(value) for value in rendered[100, 100]) != (0, 0, 0)
-    assert tuple(int(value) for value in rendered[0, 500]) == (0, 0, 0)
+    assert tuple(int(value) for value in rendered[0, 500]) != (0, 0, 0)
     assert tuple(int(value) for value in rendered[150, 150]) == (0, 0, 0)
 
 
@@ -875,10 +889,10 @@ def test_roi_pass_does_not_open_alert_dialog(qapp, tmp_path):
 
 
 def test_template_match_trigger_via_overlay(qapp, tmp_path):
-    """模板匹配 overlay 携带 matched=True 时触发本轮。"""
+    """门控已挂上时，overlay 携带 matched=True 才触发本轮。"""
     config = _enable_template(_roi_config(tmp_path))
     sound = SoundSpy()
-    window = _window(qapp, config, sound=sound)
+    window = _window(qapp, config, sound=sound, processor=DummyGatedProcessor())
     passing = [_det("A", 600, 100), _det("B", 700, 100)]
 
     # 模板匹配成功 + YOLO 检测到 A 和 B -> PASS
@@ -890,10 +904,10 @@ def test_template_match_trigger_via_overlay(qapp, tmp_path):
 
 
 def test_template_not_matched_does_not_trigger(qapp, tmp_path):
-    """模板匹配未命中时不触发本轮。"""
+    """门控已挂上且未命中时不触发本轮。"""
     config = _enable_template(_roi_config(tmp_path))
     sound = SoundSpy()
-    window = _window(qapp, config, sound=sound)
+    window = _window(qapp, config, sound=sound, processor=DummyGatedProcessor())
     passing = [_det("A", 600, 100), _det("B", 700, 100)]
 
     window._on_overlay_updated(_payload(passing, 1, template_matched=False, template_score=0.3))

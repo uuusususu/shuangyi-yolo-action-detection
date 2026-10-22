@@ -306,6 +306,83 @@ def test_reports_best_score_even_when_below_threshold(model_and_scene):
     assert result.score > 0.5, result.score
 
 
+def test_only_the_search_window_is_converted_to_gray(model_and_scene, monkeypatch):
+    """搜索框只占画面一小块时，不应该为它把整幅图灰度化。"""
+    import template_matching.shape_model as sm
+
+    model, _scene, _template = model_and_scene
+    scene = make_scene(width=1920, height=1440, cx=960.0, cy=720.0)
+    rect = roi_around(model, 960, 720, 50, 1920, 1440)
+
+    converted = []
+    original = sm.cv2.cvtColor
+    monkeypatch.setattr(
+        sm.cv2, "cvtColor",
+        lambda src, code, *a, **k: (converted.append(src.shape[:2]), original(src, code, *a, **k))[1],
+    )
+
+    result = model.find(scene, rect)
+
+    assert result.matched, result.failure
+    assert converted, "搜索窗仍然需要一次灰度化"
+    roi = result.search_roi_px
+    expected = (roi[3] - roi[1], roi[2] - roi[0])
+    assert converted == [expected]
+    assert expected[0] * expected[1] < 1920 * 1440 * 0.1
+
+
+def test_invalid_channel_count_is_rejected_before_cropping(model_and_scene):
+    """通道非法时的报错时机与消息不能因为裁剪前移而改变。"""
+    model, _scene, _template = model_and_scene
+    bogus = np.zeros((480, 640, 5), np.uint8)
+
+    with pytest.raises(ValueError, match="图像必须是灰度、BGR 或 BGRA"):
+        model.find(bogus, {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0})
+
+
+def test_rotated_bbox_is_computed_once_per_model(monkeypatch):
+    """旋转包围盒只取决于点集与角度范围，逐帧重算是纯浪费。"""
+    import template_matching.shape_model as sm
+
+    scene = make_scene()
+    model = sm.ShapeModel(scene[175:305, 225:415].copy(), sm.ShapeModelSettings.from_legacy(
+        match_threshold=0.6, angle_range=15.0))
+
+    rotations = []
+    original = sm._rotate
+    monkeypatch.setattr(
+        sm, "_rotate",
+        lambda values, angle: (rotations.append(1), original(values, angle))[1],
+    )
+
+    first = model.rotated_bbox(0)
+    after_first = len(rotations)
+    second = model.rotated_bbox(0)
+
+    assert after_first > 0
+    assert second == first
+    assert len(rotations) == after_first
+
+
+def test_angle_curve_can_be_skipped_without_changing_the_match(model_and_scene):
+    """诊断关闭时省掉角度曲线，匹配结果本身必须一字不差。"""
+    model, scene, _template = model_and_scene
+    height, width = scene.shape[:2]
+    rect = roi_around(model, 320, 240, 50, width, height)
+
+    full = model.find(scene, rect)
+    lean = model.find(scene, rect, collect_angle_curve=False)
+
+    assert full.angle_scores
+    assert lean.angle_scores == ()
+    assert lean.matched == full.matched
+    assert lean.score == pytest.approx(full.score, abs=1e-6)
+    assert lean.center == pytest.approx(full.center, abs=1e-2)
+    assert lean.angle == pytest.approx(full.angle, abs=1e-3)
+    assert lean.level_candidates == full.level_candidates
+    assert lean.search_roi_px == full.search_roi_px
+
+
 def test_angle_curve_is_reported_for_diagnostics(model_and_scene):
     model, scene, _template = model_and_scene
     height, width = scene.shape[:2]

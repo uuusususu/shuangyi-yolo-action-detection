@@ -10,7 +10,6 @@ from ui.runtime_ui_tokens import (
     BTN_DANGER_BG,
     BTN_DANGER_BORDER,
     BTN_PRIMARY_BG,
-    BTN_PRIMARY_BORDER,
     BTN_PRIMARY_HOVER,
     INPUT_BG,
     PANEL_BG_DARK,
@@ -56,12 +55,12 @@ QPushButton:disabled {{
 QPushButton[buttonRole="primary"] {{
     color: #FFFFFF;
     background-color: {BTN_PRIMARY_BG};
-    border-color: {BTN_PRIMARY_BORDER};
+    border-color: {TEXT_ACCENT};
     font-weight: 700;
 }}
 QPushButton[buttonRole="primary"]:hover {{
     background-color: {BTN_PRIMARY_HOVER};
-    border-color: {TEXT_ACCENT};
+    border-color: #7FE8FF;
 }}
 QPushButton[buttonRole="danger"] {{
     color: #FFFFFF;

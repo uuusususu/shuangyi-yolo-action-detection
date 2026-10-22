@@ -68,6 +68,27 @@ def test_portable_config_preserves_v4_roi_and_timing_fields(tmp_path):
             assert saved[key] == value
 
 
+def test_portable_config_rejects_stripped_pcb_and_first_category_keys(tmp_path):
+    model_dir = tmp_path / "config"
+    model_dir.mkdir()
+    (model_dir / "best.onnx").write_bytes(b"model")
+    source = tmp_path / "legacy-keys.json"
+    source.write_text(
+        json.dumps(
+            {
+                "config_schema_version": 4,
+                "yolo_model_path": "best.onnx",
+                "pcb_inspection_enabled": True,
+                "first_category_region_check_enabled": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Legacy region fields"):
+        prepare_portable_config(source, tmp_path / "dist" / "config.json", model_dir)
+
+
 def test_portable_config_rejects_legacy_schema_instead_of_migrating(tmp_path):
     model_dir = tmp_path / "config"
     model_dir.mkdir()
@@ -111,3 +132,19 @@ def test_build_script_preserves_existing_user_template():
     assert backup in script
     assert restore in script
     assert script.index(backup) < script.index(build) < script.index(restore)
+
+
+def test_build_script_does_not_overwrite_existing_portable_models():
+    script = (PACKAGING_DIR / "build_yolo.bat").read_text(encoding="utf-8")
+    backup = 'copy /Y "%DIST_DIR%\\config\\*.onnx" "%PRESERVED_MODELS%\\"'
+    build = '"%PYINSTALLER%" packaging\\yolo_action_detection.spec --noconfirm --clean'
+    restore = 'copy /Y "%PRESERVED_MODELS%\\*.*" "%DIST_DIR%\\config\\"'
+
+    assert 'set "PRESERVED_MODELS=' in script
+    assert "if defined HAS_PRESERVED_MODELS" in script
+    assert "Kept existing model" in script
+    assert backup in script
+    assert restore in script
+    assert script.index(backup) < script.index(build) < script.index(restore)
+    overwrite_all = script.find('copy /Y "%APP_DIR%\\config\\*.onnx" "%DIST_DIR%\\config\\"')
+    assert overwrite_all > script.index(") else (")

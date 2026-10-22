@@ -1,5 +1,8 @@
 """YOLO OBB 配置管理器。"""
 import json
+import os
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -22,10 +25,8 @@ class ConfigManager:
     yolo_model_path: str = DEFAULT_YOLO_MODEL_PATH
     yolo_conf_threshold: float = 0.7
     yolo_iou_threshold: float = 0.5
-    ultralytics_device: str = ""
     ultralytics_half: bool = False
     ultralytics_tracker: str = "bytetrack.yaml"
-    ultralytics_max_det: int = 300
     ultralytics_track_persist: bool = True
 
     category_names: List[str] = field(default_factory=lambda: ["1号", "2号", "3号", "4号", "5号", ""])
@@ -37,10 +38,7 @@ class ConfigManager:
     mvsdk_friendly_name: str = ""
     mvsdk_camera_sn: str = ""
 
-    # 相机参数模式: preserve / load_group / load_file / manual
-    camera_parameter_mode: str = "preserve"
-    camera_parameter_group: int = 0
-    camera_parameter_file: str = ""
+    # 相机手动曝光（us）；参数加载统一走 preserve（不覆盖相机端已有参数）。
     camera_manual_ae: bool = False
     camera_manual_exposure_us: int = 30000
     camera_manual_gain: int = 0
@@ -65,6 +63,11 @@ class ConfigManager:
     action_ng_stable_frames: int = 10
     action_leave_stable_frames: int = 4
     action_order_constraint_enabled: bool = True
+    lstm_action_enabled: bool = False
+    lstm_contract_path: str = ""
+    lstm_bundle_path: str = ""
+    action_fail_retry_enabled: bool = False
+    action_fail_retry_frames: int = 10
 
     # 旧版融合判定字段保留加载/保存兼容，生产路径不再使用。
     fusion_iou_threshold: float = 0.10
@@ -92,7 +95,8 @@ class ConfigManager:
     track_step_leave_frames: int = 4
 
     round_cooldown_seconds: float = 2.0
-    today_target_capacity: int = 300
+    # 切到下一个动作后，新动作连续保持这么久，上一个动作才结算。换掉模型里的最短动作时长。
+    action_switch_confirm_seconds: float = 0.5
     show_confidence_overlay: bool = True
     show_track_id_overlay: bool = True
     display_result_max_age_ms: int = 250
@@ -149,10 +153,15 @@ class ConfigManager:
         self.action_overlap_threshold = max(0.0, min(1.0, self.action_overlap_threshold))
         self.action_pass_stable_frames = max(1, int(self.action_pass_stable_frames))
         self.action_ng_stable_frames = max(1, int(self.action_ng_stable_frames))
+        self.action_fail_retry_enabled = _coerce_bool(self.action_fail_retry_enabled)
+        self.action_fail_retry_frames = max(1, min(100, int(self.action_fail_retry_frames)))
         self.fusion_iou_threshold = max(0.01, min(1.0, self.fusion_iou_threshold))
         self.fusion_center_dist_threshold = max(10, min(500, int(self.fusion_center_dist_threshold)))
         self.display_result_max_age_ms = max(0, int(self.display_result_max_age_ms))
         self.round_cooldown_seconds = max(0.0, float(self.round_cooldown_seconds))
+        self.action_switch_confirm_seconds = max(
+            0.1, min(5.0, float(self.action_switch_confirm_seconds))
+        )
         self.pass_sound_enabled = _coerce_bool(self.pass_sound_enabled)
         self.fail_sound_enabled = _coerce_bool(self.fail_sound_enabled)
         self.sound_feedback_enabled = self.fail_sound_enabled
@@ -230,8 +239,22 @@ class ConfigManager:
                 continue
             data[k] = v
         data["model_task"] = ULTRALYTICS_OBB_TASK
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            ) as f:
+                temporary_path = Path(f.name)
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if path.exists():
+                shutil.copy2(path, Path(str(path) + ".bak"))
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def get_config_path(self) -> str:
         return self._config_path or ""
@@ -286,40 +309,35 @@ class ConfigManager:
             count = counts[index] if index < len(counts) else 0
             if not _is_positive_int(count):
                 errors.append(f"待检数量无效：类别 '{name}' 必须为正整数")
+                continue
+            action_mode = (
+                not bool(getattr(self, "roi_inspection_enabled", False))
+                and bool(getattr(self, "action_order_constraint_enabled", False))
+            )
+            if action_mode and int(count) != 1:
+                errors.append(f"动作步骤「{name}」的数量必须为 1")
+                continue
+            if action_mode:
+                continue
             if available is not None and name not in available:
                 errors.append(f"待检类别 '{name}' 不属于当前模型")
 
-        if not self.roi_inspection_enabled:
+        if not getattr(self, "roi_template_enabled", False):
             return errors
 
-        if require_roi_rects or self.roi_inspection_rect is not None:
-            self._append_roi_error(errors, "识别 ROI", self.roi_inspection_rect)
-
-        if getattr(self, "roi_template_enabled", False):
-            template_path = str(getattr(self, "roi_template_path", "") or "").strip()
-            if not template_path:
-                errors.append("定位模板文件名不能为空")
-            elif require_roi_rects:
-                # 模板文件存在性检查在严格模式下执行（运行时路径解析由调用方负责）。
-                pass
-            threshold = _as_float(getattr(self, "roi_template_match_threshold", 0.6))
-            if threshold is None or not 0.0 < threshold <= 1.0:
-                errors.append("匹配分数阈值必须在 0 到 1 之间")
-            angle_range = _as_float(getattr(self, "roi_template_angle_range", 15.0))
-            if angle_range is None or not 0.0 <= angle_range <= 180.0:
-                errors.append("旋转角度范围必须在 0 到 180 度之间")
-            # 0 表示按模板尺寸自动推算步进（金字塔下不需要手动指定）。
-            angle_step = _as_float(getattr(self, "roi_template_angle_step", 0.0))
-            if angle_step is None or not 0.0 <= angle_step <= 180.0:
-                errors.append("模板角度步进必须在 0 到 180 度之间（0 表示自动）")
-            polarity = str(getattr(self, "roi_template_polarity", "use") or "use")
-            if polarity not in ("use", "ignore_global"):
-                errors.append("模板极性只支持 use 或 ignore_global")
-
-            if require_roi_rects or self.roi_template_rect is not None:
-                self._append_roi_error(errors, "模板 ROI", self.roi_template_rect)
-            if require_roi_rects or self.roi_template_search_rect is not None:
-                self._append_roi_error(errors, "搜索 ROI", self.roi_template_search_rect)
+        threshold = _as_float(getattr(self, "roi_template_match_threshold", 0.6))
+        if threshold is None or not 0.0 < threshold <= 1.0:
+            errors.append("匹配分数阈值必须在 0 到 1 之间")
+        angle_range = _as_float(getattr(self, "roi_template_angle_range", 15.0))
+        if angle_range is None or not 0.0 <= angle_range <= 180.0:
+            errors.append("旋转角度范围必须在 0 到 180 度之间")
+        # 0 表示按模板尺寸自动推算步进（金字塔下不需要手动指定）。
+        angle_step = _as_float(getattr(self, "roi_template_angle_step", 0.0))
+        if angle_step is None or not 0.0 <= angle_step <= 180.0:
+            errors.append("模板角度步进必须在 0 到 180 度之间（0 表示自动）")
+        polarity = str(getattr(self, "roi_template_polarity", "use") or "use")
+        if polarity not in ("use", "ignore_global"):
+            errors.append("模板极性只支持 use 或 ignore_global")
         return errors
 
     def require_valid_inspection_config(

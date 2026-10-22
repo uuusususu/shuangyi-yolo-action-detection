@@ -1,8 +1,11 @@
 """ROI 归一化坐标和显示映射。"""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Mapping, Tuple
+from typing import Mapping, Optional, Tuple
+
+logger = logging.getLogger("yolo_action_detection.runtime")
 
 
 Size = Tuple[int, int]
@@ -93,3 +96,22 @@ class NormalizedRect:
 def detection_center_in_rect(detection, rect: NormalizedRect, frame_size: Size) -> bool:
     """按检测框中心点判断目标是否位于 ROI 内。"""
     return rect.contains_pixel_point(detection.center, frame_size)
+
+
+FULL_FRAME_RECT = NormalizedRect(0.0, 0.0, 1.0, 1.0)
+
+
+def usable_normalized_rect(
+    value,
+    *,
+    warn_label: Optional[str] = None,
+) -> Optional[NormalizedRect]:
+    """有效归一化矩形；None、空对象、校验失败都当空。"""
+    if value is None:
+        return None
+    try:
+        return NormalizedRect.from_mapping(value)
+    except (TypeError, ValueError) as exc:
+        if warn_label:
+            logger.warning("%s 无效，按空处理: %s value=%s", warn_label, exc, value)
+        return None

@@ -187,6 +187,7 @@ class ShapeModel:
             ok, encoded = cv2.imencode(".png", template_image)
             self._template_png = encoded.tobytes() if ok else b""
         self._kernel_cache: dict[tuple[int, float], tuple] = {}
+        self._bbox_cache: dict[int, Tuple[int, int]] = {}
         logger.info(
             "shape_model=ready size=%s levels=%d points=%s base_angle_step=%.3f polarity=%s",
             self._template_size,
@@ -350,14 +351,23 @@ class ShapeModel:
         )
 
     def rotated_bbox(self, level: int = 0) -> Tuple[int, int]:
-        """该层在整个角度范围内的最大旋转包围盒（宽, 高）。"""
+        """该层在整个角度范围内的最大旋转包围盒（宽, 高）。
+
+        只取决于点集与角度范围，两者在模型建好后都不再变，因此按层缓存。
+        每次 find() 至少要问两遍，逐帧重算等于白跑几十次点集旋转。
+        """
+        cached = self._bbox_cache.get(level)
+        if cached is not None:
+            return cached
         lv = self._levels[level]
         best_w = best_h = 0
         for angle in self._level_angles(lv):
             rotated = _rotate(lv.points, angle)
             best_w = max(best_w, int(math.ceil(rotated[:, 0].max() - rotated[:, 0].min())) + 3)
             best_h = max(best_h, int(math.ceil(rotated[:, 1].max() - rotated[:, 1].min())) + 3)
-        return (best_w, best_h)
+        result = (best_w, best_h)
+        self._bbox_cache[level] = result
+        return result
 
     def min_search_size(self, travel_px: int = 0) -> Tuple[int, int]:
         """给定期望的停位波动余量，返回搜索 ROI 至少需要多大。
@@ -481,11 +491,15 @@ class ShapeModel:
         search_rect: object | None,
         *,
         min_score: Optional[float] = None,
+        collect_angle_curve: bool = True,
     ) -> ShapeMatchResult:
         """在 search_rect 这个框内查找最佳位姿。
 
         语义与操作员直觉一致：模型必须完整落在框内。框太小时不再静默丢弃旋转候选，
         而是返回 `search_roi_too_small` 并给出所需尺寸。
+
+        `collect_angle_curve` 只影响 `angle_scores` 这一项诊断输出，匹配结果不受影响；
+        诊断未开启时关掉它可以省下整条角度响应曲线的采样。
         """
         started = time.perf_counter()
         threshold = float(min_score if min_score is not None else self._settings.min_score)
@@ -496,8 +510,12 @@ class ShapeModel:
                 failure=ShapeFailure.EMPTY_FRAME,
                 rotated_bbox_px=(bbox_w, bbox_h),
             )
-        gray = _as_gray(frame)
-        frame_h, frame_w = gray.shape[:2]
+        # 只有搜索窗参与运算，所以先按原始帧尺寸算出窗口再转灰度。
+        # 灰度转换是逐像素的，先裁后转与先转后裁结果完全一致，但整幅转换在高像素
+        # 相机上要读写几十 MB，而搜索窗通常只占其中很小一块。
+        # 通道合法性仍在裁剪前校验，保持与整幅灰度化时相同的报错时机。
+        _ensure_gray_convertible(frame)
+        frame_h, frame_w = frame.shape[:2]
 
         try:
             rx0, ry0, rx1, ry1 = _pixel_rect(search_rect, (frame_w, frame_h))
@@ -548,7 +566,7 @@ class ShapeModel:
             rotated_bbox_px=(bbox_w, bbox_h),
         )
 
-        window = gray[wy0:wy1, wx0:wx1]
+        window = _as_gray(frame[wy0:wy1, wx0:wx1])
         fields, gradient_pixels = self._build_search_fields(window)
         levels_used = min(len(fields), len(self._levels))
         if gradient_pixels <= 0:
@@ -608,7 +626,7 @@ class ShapeModel:
         score, bx, by, bangle, outside = self._subpixel(
             fields[0], level0, bx, by, bangle, score
         )
-        curve = self._angle_curve(fields[0], level0, bx, by)
+        curve = self._angle_curve(fields[0], level0, bx, by) if collect_angle_curve else ()
 
         center = (float(bx + wx0), float(by + wy0))
         failure = ShapeFailure.NONE
@@ -730,22 +748,38 @@ class ShapeModel:
             best_observed,
         )
 
+    @staticmethod
+    def _rotated_points_cache(level: _Level):
+        """按角度缓存旋转后的点集与方向，键用原始 float，保证复用与重算逐位一致。"""
+        cache: dict[float, tuple] = {}
+
+        def rotated(angle: float):
+            hit = cache.get(angle)
+            if hit is None:
+                hit = (_rotate(level.points, angle), _rotate(level.dirs, angle))
+                cache[angle] = hit
+            return hit
+
+        return rotated
+
     def _refine(self, field, level: _Level, candidates, level_index: int, threshold: float):
         """把上一层候选映射到本层，在 ±2px、±1 角度步进内细化。"""
         nx, ny = field
         gate = threshold * (1.0 - float(self._settings.level_slack) * 0.5)
         parent_step = self._levels[level_index + 1].angle_step
+        polarity = self._settings.polarity
+        rotated = self._rotated_points_cache(level)
         refined: list[tuple[float, float, float, float]] = []
         for score, x, y, angle in candidates:
             base_x, base_y = x * 2.0, y * 2.0
             best = None
             for delta in (-parent_step * 0.5, 0.0, parent_step * 0.5):
                 candidate_angle = angle + delta
+                rp, rd = rotated(candidate_angle)
                 for dy in (-2.0, -1.0, 0.0, 1.0, 2.0):
                     for dx in (-2.0, -1.0, 0.0, 1.0, 2.0):
-                        value, _outside = _score_at(
-                            nx, ny, level, base_x + dx, base_y + dy,
-                            candidate_angle, self._settings.polarity,
+                        value, _outside = _score_at_rotated(
+                            nx, ny, rp, rd, base_x + dx, base_y + dy, polarity,
                         )
                         if best is None or value > best[0]:
                             best = (value, base_x + dx, base_y + dy, candidate_angle)
@@ -760,23 +794,32 @@ class ShapeModel:
         nx, ny = field
         polarity = self._settings.polarity
         step = max(1e-3, level.angle_step)
+        rotated = self._rotated_points_cache(level)
 
+        rp, rd = rotated(angle)
         grid = np.empty((3, 3), dtype=np.float64)
         for j, dy in enumerate((-1.0, 0.0, 1.0)):
             for i, dx in enumerate((-1.0, 0.0, 1.0)):
-                grid[j, i], _ = _score_at(nx, ny, level, x + dx, y + dy, angle, polarity)
+                grid[j, i], _ = _score_at_rotated(
+                    nx, ny, rp, rd, x + dx, y + dy, polarity
+                )
         offset_x = _parabola_vertex(grid[1, 0], grid[1, 1], grid[1, 2])
         offset_y = _parabola_vertex(grid[0, 1], grid[1, 1], grid[2, 1])
         best_x, best_y = x + offset_x, y + offset_y
 
-        low, _ = _score_at(nx, ny, level, best_x, best_y, angle - step, polarity)
-        mid, _ = _score_at(nx, ny, level, best_x, best_y, angle, polarity)
-        high, _ = _score_at(nx, ny, level, best_x, best_y, angle + step, polarity)
+        low_rp, low_rd = rotated(angle - step)
+        high_rp, high_rd = rotated(angle + step)
+        low, _ = _score_at_rotated(nx, ny, low_rp, low_rd, best_x, best_y, polarity)
+        mid, _ = _score_at_rotated(nx, ny, rp, rd, best_x, best_y, polarity)
+        high, _ = _score_at_rotated(nx, ny, high_rp, high_rd, best_x, best_y, polarity)
         best_angle = angle + _parabola_vertex(low, mid, high) * step
-        final, outside = _score_at(nx, ny, level, best_x, best_y, best_angle, polarity)
+        best_rp, best_rd = rotated(best_angle)
+        final, outside = _score_at_rotated(
+            nx, ny, best_rp, best_rd, best_x, best_y, polarity
+        )
         if final < max(score, mid):
             # 拟合没有带来提升时退回整数位姿，避免亚像素反而变差
-            final, outside = _score_at(nx, ny, level, x, y, angle, polarity)
+            final, outside = _score_at_rotated(nx, ny, rp, rd, x, y, polarity)
             return float(final), float(x), float(y), float(angle), float(outside)
         return float(final), float(best_x), float(best_y), float(best_angle), float(outside)
 
@@ -784,9 +827,12 @@ class ShapeModel:
         """在最佳位置上给出逐角度得分，供现场诊断（角度响应宽度）。"""
         nx, ny = field
         top = self._levels[-1]
+        polarity = self._settings.polarity
+        rotated = self._rotated_points_cache(level)
         curve = []
         for angle in self._level_angles(top):
-            value, _ = _score_at(nx, ny, level, x, y, angle, self._settings.polarity)
+            rp, rd = rotated(angle)
+            value, _ = _score_at_rotated(nx, ny, rp, rd, x, y, polarity)
             curve.append((float(angle), float(value)))
         return tuple(curve)
 
@@ -815,6 +861,15 @@ def _as_gray(image: np.ndarray) -> np.ndarray:
         return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     if image.ndim == 3 and image.shape[2] == 4:
         return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+    raise ValueError("图像必须是灰度、BGR 或 BGRA")
+
+
+def _ensure_gray_convertible(image: np.ndarray) -> None:
+    """只校验通道数，不做转换，供裁剪前先行拦截非法图像。"""
+    if image.ndim == 2:
+        return
+    if image.ndim == 3 and image.shape[2] in (3, 4):
+        return
     raise ValueError("图像必须是灰度、BGR 或 BGRA")
 
 
@@ -850,7 +905,16 @@ def _rotate(values: np.ndarray, angle_deg: float) -> np.ndarray:
 
 def _bilinear(field: np.ndarray, xs: np.ndarray, ys: np.ndarray):
     """双线性采样。返回 (值, 是否在图内)。"""
-    height, width = field.shape[:2]
+    values, _, inside = _bilinear_pair(field, None, xs, ys)
+    return values, inside
+
+
+def _bilinear_pair(field_x: np.ndarray, field_y, xs: np.ndarray, ys: np.ndarray):
+    """在同一组坐标上采样两个场。返回 (x 场值, y 场值, 是否在图内)。
+
+    两个梯度分量永远采在同一组点上，索引与权重算一次即可，运算顺序与逐场采样一致。
+    """
+    height, width = field_x.shape[:2]
     inside = (xs >= 0) & (ys >= 0) & (xs <= width - 1) & (ys <= height - 1)
     xc = np.clip(xs, 0, width - 1)
     yc = np.clip(ys, 0, height - 1)
@@ -860,19 +924,32 @@ def _bilinear(field: np.ndarray, xs: np.ndarray, ys: np.ndarray):
     y1 = np.minimum(y0 + 1, height - 1)
     fx = (xc - x0).astype(np.float32)
     fy = (yc - y0).astype(np.float32)
-    top = field[y0, x0] * (1.0 - fx) + field[y0, x1] * fx
-    bottom = field[y1, x0] * (1.0 - fx) + field[y1, x1] * fx
-    return top * (1.0 - fy) + bottom * fy, inside
+
+    def sample(field):
+        top = field[y0, x0] * (1.0 - fx) + field[y0, x1] * fx
+        bottom = field[y1, x0] * (1.0 - fx) + field[y1, x1] * fx
+        return top * (1.0 - fy) + bottom * fy
+
+    values_y = None if field_y is None else sample(field_y)
+    return sample(field_x), values_y, inside
 
 
 def _score_at(nx, ny, level: _Level, cx: float, cy: float, angle: float, polarity: str):
     """在指定位姿上直接采样评分。返回 (得分, 越界点比例)。"""
     rp = _rotate(level.points, angle)
     rd = _rotate(level.dirs, angle)
+    return _score_at_rotated(nx, ny, rp, rd, cx, cy, polarity)
+
+
+def _score_at_rotated(nx, ny, rp: np.ndarray, rd: np.ndarray, cx: float, cy: float, polarity: str):
+    """已知旋转后的点集与方向时的打分。
+
+    同一角度下的多个平移候选共用一份旋转结果：细化阶段每个候选要试 25 个平移，
+    逐次重算点集旋转是纯浪费。
+    """
     xs = rp[:, 0] + float(cx)
     ys = rp[:, 1] + float(cy)
-    sx, inside = _bilinear(nx, xs, ys)
-    sy, _ = _bilinear(ny, xs, ys)
+    sx, sy, inside = _bilinear_pair(nx, ny, xs, ys)
     products = rd[:, 0] * sx + rd[:, 1] * sy
     if polarity != "use":
         products = np.abs(products)

@@ -210,6 +210,8 @@ def test_portable_smoke_rejects_plain_processor_when_template_gate_is_enabled(
         "width": 0.6,
         "height": 0.6,
     }
+    config.roi_template_path = "locator_template.png"
+    (tmp_path / "locator_template.png").write_bytes(b"template")
     config_path = tmp_path / "config.json"
     config.save(config_path)
     model_path = tmp_path / "config" / "model.onnx"

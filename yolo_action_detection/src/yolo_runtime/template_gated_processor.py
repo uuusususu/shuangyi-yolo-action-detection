@@ -53,7 +53,11 @@ class TemplateGatedProcessor:
         round_id: int = 0,
     ) -> DetectionOverlayState:
         t0 = time.perf_counter()
-        result = self._template_model.find(frame, self._search_rect)
+        recorder = get_recorder()
+        diagnostics_active = bool(recorder.active)
+        result = self._template_model.find(
+            frame, self._search_rect, collect_angle_curve=diagnostics_active
+        )
 
         if not result.matched:
             overlay = DetectionOverlayState(
@@ -68,24 +72,33 @@ class TemplateGatedProcessor:
                 template_matched=False,
                 template_score=result.score,
                 latency_ms=(time.perf_counter() - t0) * 1000,
+                template_ms=float(result.total_ms),
+                yolo_ms=0.0,
             )
         else:
             overlay = self._inner.process_frame(
                 frame, source_frame_id=source_frame_id, round_id=round_id
             )
+            overlay.template_ms = float(result.total_ms)
+            overlay.yolo_ms = float(overlay.latency_ms or 0.0)
+            overlay.latency_ms = (time.perf_counter() - t0) * 1000
             overlay.template_matched = True
             overlay.template_score = result.score
             overlay.template_center = result.center
             overlay.template_angle = result.angle
 
-        self._record_diagnostics(frame, result, overlay, source_frame_id, round_id)
+        if diagnostics_active:
+            self._record_diagnostics(
+                frame, result, overlay, source_frame_id, round_id, recorder
+            )
         return overlay
 
     # ------------------------------------------------------------------
     # 诊断
     # ------------------------------------------------------------------
-    def _record_diagnostics(self, frame, result, overlay, source_frame_id, round_id) -> None:
-        recorder = get_recorder()
+    def _record_diagnostics(
+        self, frame, result, overlay, source_frame_id, round_id, recorder
+    ) -> None:
         if not recorder.active:
             return
         try:
@@ -174,6 +187,6 @@ class TemplateGatedProcessor:
             "ran": True,
             "det_count": len(overlay.detections or []),
             "labels": labels,
-            "latency_ms": float(overlay.latency_ms or 0.0),
+            "latency_ms": float(overlay.yolo_ms or 0.0),
             "error": str(overlay.error or ""),
         }

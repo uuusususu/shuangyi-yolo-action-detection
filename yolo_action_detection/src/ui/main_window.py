@@ -1,14 +1,16 @@
 """YOLO OBB 动作检测主界面。"""
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
 import time
+import hashlib
 from pathlib import Path
 from typing import Callable, List, Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import Qt, QEvent, QTimer, Slot
 from PySide6.QtGui import QImage, QPixmap, QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -24,26 +26,37 @@ from detection_logging.coordinate_logger import (
     build_coordinate_frame_record,
 )
 from detection_logging.audio_feedback import SoundFeedback
+from detection_logging.action_trace import trace
 from detection_logging.fail_evidence import FailEvidenceContext, FailEvidenceSaver
 from detection_logging.production_stats import ProductionStatsManager
 from runtime_diagnostics import get_runtime_logger
 from roi_inspection.engine import RoiInspectionEngine
-from roi_inspection.geometry import NormalizedRect
+from roi_inspection.geometry import (
+    NormalizedRect,
+    detection_center_in_rect,
+    usable_normalized_rect,
+)
 from roi_inspection.models import InspectionOutcome, RoiInspectionConfig, RoundPhase
 from template_matching.match_diagnostics import get_recorder as get_template_diagnostics
 from ui.roi_fail_alert_dialog import RoiFailAlertDialog
+from lstm_action.engine import LstmActionEngine
 from step_sequence.step_sequence_engine import StepSequenceEngine, RoundResult, StepStatus
 from ui.runtime_ui_tokens import (
+    FONT_MICRO,
     FONT_TITLE,
     FONT_SMALL,
+    MONO_FAMILY,
     PAGE_BG,
     PAGE_MARGIN,
     PANEL_BG,
     PANEL_BG_DARK,
     PRIMARY_CONTROL_HEIGHT,
+    STEP_NG_BORDER,
+    STEP_PASS_BORDER,
     STROKE_MAIN,
     TEXT_ACCENT,
     TEXT_DANGER,
+    TEXT_MUTED,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
     TOP_BAR_HEIGHT,
@@ -52,12 +65,22 @@ from ui.runtime_ui_tokens import (
     scroll_area_style,
     text_style,
 )
+from hand_tracking.mediapipe_hands import draw_hand_landmarks
+from ui.frame_text import draw_bgr_texts
 from ui.widgets.native_panels import (
     KpiRow,
     RecognitionListItem,
 )
 from yolo_runtime.yolo_result_models import DetectionOverlayState, ObbDetection
-from template_matching.template_store import resolve_template_path, template_file_signature
+from template_matching.template_store import resolve_template_path, template_file_signature, restore_file
+
+
+def _status_badge_style(color: str) -> str:
+    """顶栏主态徽章：描边 + 同色文字，取代裸文字状态。"""
+    return (
+        f"color: {color}; border: 1px solid {color}; border-radius: 6px; "
+        "padding: 3px 12px; font-size: 13px; font-weight: 700; background: transparent;"
+    )
 
 
 class MainWindow(QMainWindow):
@@ -83,6 +106,7 @@ class MainWindow(QMainWindow):
         self.state = state
         self.processor = processor
         self.step_engine = step_engine
+        self.lstm_action = LstmActionEngine()
         self._processor_factory = processor_factory
         self._app_base_dir = (
             Path(app_base_dir)
@@ -101,6 +125,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(f"QMainWindow {{ background-color: {PAGE_BG}; }}")
 
         self.worker = CameraWorker(config, state)
+        self._configure_lstm_action()
         self._camera_devices = []
         self._camera_enumeration_error = ""
         self._refresh_camera_devices()
@@ -119,11 +144,15 @@ class MainWindow(QMainWindow):
         self._roi_engine: Optional[RoiInspectionEngine] = None
         self._roi_fail_alert: Optional[RoiFailAlertDialog] = None
         self._latest_runtime_overlay = DetectionOverlayState()
+        self._last_render_key: Optional[tuple] = None
         self._init_roi_engine()
         # 下一轮启动定时器：完成一轮后保持当前步骤框颜色，到间隔结束再开始新一轮。
         self._round_pass_timer = QTimer(self)
         self._round_pass_timer.setSingleShot(True)
         self._round_pass_timer.timeout.connect(self._on_round_pass_settled)
+        self._lstm_progress_step = -1
+        self._lstm_progress_round = None
+        self._pending_step_engine_rebuild = False
 
         # 保留 _step_cards 名称以兼容现有状态映射和测试，实际控件为紧凑识别项。
         self._step_cards: List[RecognitionListItem] = []
@@ -165,6 +194,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
         self._refresh_steps()
+        self._update_kpi()
         self._sync_button_states()
         self._runtime_logger.info(
             "main_window=ready processor_available=%s log_path=%s",
@@ -190,7 +220,14 @@ class MainWindow(QMainWindow):
             return
         if self.config.inspection_validation_errors(self._current_model_class_names()):
             return
-        self._roi_engine = RoiInspectionEngine(RoiInspectionConfig.from_config(self.config))
+        from yolo_runtime.template_gated_processor import TemplateGatedProcessor
+
+        self._roi_engine = RoiInspectionEngine(
+            RoiInspectionConfig.from_config(
+                self.config,
+                template_gate_active=isinstance(self.processor, TemplateGatedProcessor),
+            )
+        )
 
     def _current_model_class_names(self) -> List[str]:
         if self.processor is None or not hasattr(self.processor, "get_class_names"):
@@ -242,8 +279,17 @@ class MainWindow(QMainWindow):
             f"background-color: #0B2343; border: 1px solid {TEXT_ACCENT}; border-radius: 7px; "
             f"color: {TEXT_PRIMARY}; font-size: 20px; font-weight: 700;"
         )
+        self._module_tag = QLabel("VISION MODULE · 01", self._header)
+        self._module_tag.setStyleSheet(
+            text_style(
+                TEXT_MUTED,
+                size=FONT_MICRO,
+                weight=700,
+                extra=f"font-family: '{MONO_FAMILY}'; letter-spacing: 0.12em;",
+            )
+        )
         self._status_label = QLabel("READY")
-        self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+        self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
         self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._result_label = QLabel("")
         self._result_label.setFont(QFont("Microsoft YaHei UI", 14, QFont.Bold))
@@ -267,6 +313,9 @@ class MainWindow(QMainWindow):
         actions_layout.addWidget(self._btn_config, 0, Qt.AlignmentFlag.AlignVCenter)
         actions_layout.addWidget(self._btn_close, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        self._header_layout.addWidget(
+            self._module_tag, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
         self._header_layout.addWidget(self._title_label, 0, 1, Qt.AlignmentFlag.AlignCenter)
         self._header_layout.addWidget(actions, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         main_layout.addWidget(self._header)
@@ -288,6 +337,15 @@ class MainWindow(QMainWindow):
         self._video_label.setMinimumSize(640, 480)
         self._video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         video_layout.addWidget(self._video_label)
+        self._timing_label = QLabel("")
+        self._timing_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._timing_label.setStyleSheet(text_style(TEXT_SECONDARY, size=12, weight=600))
+        self._timing_label.setVisible(False)
+        video_layout.addWidget(self._timing_label)
+        self._video_frame = video_frame
+        self._build_viewfinder_overlays(video_frame)
         mid_layout.addWidget(video_frame, 7)
 
         # 右侧业务面板
@@ -333,6 +391,10 @@ class MainWindow(QMainWindow):
         self._steps_scroll.setWidget(self._steps_container)
         right_layout.addWidget(self._steps_scroll, 1)
 
+        self._lstm_status_label = QLabel("时序动作：未启用")
+        self._lstm_status_label.setWordWrap(True)
+        self._lstm_status_label.setStyleSheet(text_style(TEXT_SECONDARY, size=FONT_SMALL, weight=600))
+        right_layout.addWidget(self._lstm_status_label)
         self._notice_label = QLabel("")
         self._notice_label.setWordWrap(True)
         self._notice_label.setVisible(False)
@@ -365,7 +427,6 @@ class MainWindow(QMainWindow):
         self._stacked.addWidget(self._main_page)
 
     def _connect_signals(self) -> None:
-        self.worker.frame_ready.connect(self._on_frame_ready)
         self.worker.error_occurred.connect(self._on_error)
         self.worker.overlay_state_updated.connect(self._on_overlay_updated)
         self.worker.pipeline_stats_updated.connect(self._on_stats_updated)
@@ -420,22 +481,56 @@ class MainWindow(QMainWindow):
 
         self._recognized_count_label.setText(f"0 / {len(self._step_cards)}")
 
-        self._update_step_display(self.step_engine.get_state() if self.step_engine else None)
+        if self._roi_engine is not None:
+            self._sync_roi_cards()
+        else:
+            self._update_step_display(self.step_engine.get_state() if self.step_engine else None)
         self._last_step_focus_key = None
 
     # ------------------------------------------------------------------
     # 显示与状态同步
     # ------------------------------------------------------------------
     def _update_display(self) -> None:
+        overlay = self._current_display_overlay()
+        render_key = self._display_render_key(overlay)
+        if render_key == self._last_render_key:
+            return
+        render_started = time.perf_counter()
         frame, frame_id = self._resolve_display_source()
         if frame is None:
             return
-        overlay = self._current_display_overlay()
         if self._should_draw_runtime_overlay(overlay, frame_id):
             frame = self._draw_overlay(frame, overlay)
-        elif self._roi_engine is not None:
+        else:
             frame = self._draw_roi_overlay(frame)
         self._show_frame(frame)
+        self._last_render_key = render_key
+        self.worker.record_render_latency((time.perf_counter() - render_started) * 1000.0)
+
+    def _display_render_key(self, overlay) -> tuple:
+        """渲染内容的标识。内容未变时跳过渲染，避免定时器空转重复绘制。"""
+        label_size = self._video_label.size()
+        return (
+            bool(self.state.inference_on),
+            self._display_source_id(),
+            int(getattr(overlay, "source_frame_id", 0) or 0),
+            label_size.width(),
+            label_size.height(),
+            tuple(sorted((getattr(self.config, "roi_template_search_rect", None) or {}).items())),
+            tuple(sorted((getattr(self.config, "roi_inspection_rect", None) or {}).items())),
+        )
+
+    def _display_source_id(self) -> int:
+        """待显示帧的编号，取值口径与 `_resolve_display_source` 一致。"""
+        if self.state.inference_on:
+            display_id = int(self.worker.get_display_frame_id() or 0)
+            if display_id > 0:
+                return display_id
+        return int(self.worker.get_latest_preview_frame_id() or 0)
+
+    def _invalidate_render_cache(self) -> None:
+        """绘制内容的外部依赖变化后强制下一次重绘。"""
+        self._last_render_key = None
 
     def _resolve_display_source(self) -> tuple:
         """检测中显示被推理的同帧画面，预览时才追最新相机帧。"""
@@ -447,73 +542,83 @@ class MainWindow(QMainWindow):
 
     def _current_display_overlay(self):
         overlay = self._latest_runtime_overlay
-        if getattr(overlay, "detections", None):
+        if getattr(overlay, "detections", None) or getattr(overlay, "hand_landmarks", None):
             return overlay
         return self.worker.get_latest_overlay()
 
     def _should_draw_runtime_overlay(self, overlay, frame_id: int) -> bool:
-        if not overlay or not getattr(overlay, "detections", None):
+        """检测停止后立即停止画框：预览帧持续推进，旧框贴上去必然错位。"""
+        if not self.state.inference_on:
             return False
-        if self.state.inference_on:
-            overlay_id = int(getattr(overlay, "source_frame_id", 0) or 0)
-            return overlay_id > 0 and overlay_id == int(frame_id)
-        return self._overlay_is_fresh(overlay)
+        has_detections = bool(overlay and getattr(overlay, "detections", None))
+        has_hands = bool(overlay and getattr(overlay, "hand_landmarks", None))
+        if not has_detections and not has_hands:
+            return False
+        overlay_id = int(getattr(overlay, "source_frame_id", 0) or 0)
+        return overlay_id > 0 and overlay_id == int(frame_id)
 
-    def _overlay_is_fresh(self, overlay) -> bool:
-        """预览模式下判断 overlay 是否还能叠加到最新相机帧上。"""
-        if not overlay or not getattr(overlay, "detections", None):
-            return False
-        timestamp = float(getattr(overlay, "timestamp", 0.0) or 0.0)
-        if timestamp <= 0:
-            return True
-        max_age_ms = float(getattr(self.config, "display_result_max_age_ms", 250) or 0)
-        if max_age_ms <= 0:
-            return True
-        return (time.time() - timestamp) * 1000 <= max_age_ms
+    def _sequential_ng_labels(self) -> set[str]:
+        """顺序模式本轮 ACTION_NG 对应的类别名；冷却未开新轮前保持，供画红框。"""
+        if self._roi_engine is not None or self.step_engine is None:
+            return set()
+        state = self.step_engine.get_state()
+        if getattr(state, "round_result", None) != RoundResult.ACTION_NG:
+            return set()
+        idx = int(getattr(state, "action_ng_step", -1))
+        steps = getattr(state, "steps", None) or []
+        if 0 <= idx < len(steps):
+            name = str(getattr(steps[idx], "class_name", "") or "").strip()
+            if name:
+                return {name}
+        return set()
+
+    def _overlay_box_color(self, label: str) -> tuple[int, int, int]:
+        if str(label or "").strip() in self._sequential_ng_labels():
+            return (0, 0, 255)
+        return (0, 255, 128)
 
     def _draw_overlay(self, frame: np.ndarray, overlay) -> np.ndarray:
         if overlay:
             show_conf = self.config.show_confidence_overlay
             show_tid = self.config.show_track_id_overlay
+            ng_labels = self._sequential_ng_labels()
+            labels: list[tuple[str, tuple[int, int], tuple[int, int, int]]] = []
             for det in overlay.detections:
                 if len(det.polygon) < 4:
                     continue
                 pts = np.array(det.polygon, dtype=np.int32)
-                cv2.polylines(frame, [pts], True, (0, 255, 128), 2)
+                color = self._overlay_box_color(det.label)
+                thickness = 3 if str(det.label or "").strip() in ng_labels else 2
+                cv2.polylines(frame, [pts], True, color, thickness)
                 label_parts = [det.label]
                 if show_conf:
                     label_parts.append(f"{det.conf:.2f}")
                 if show_tid and det.track_id is not None:
                     label_parts.append(f"#{det.track_id}")
-                label = " ".join(label_parts)
+                label = " ".join(part for part in label_parts if part)
                 tx, ty = int(det.polygon[0][0]), int(det.polygon[0][1]) - 5
-                cv2.putText(frame, label, (tx, max(15, ty)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 1)
+                labels.append((label, (tx, max(15, ty)), color))
+            frame = draw_bgr_texts(frame, labels, pixel_size=16)
             frame = self._draw_tip_and_holes(frame, overlay)
+            frame = draw_hand_landmarks(frame, getattr(overlay, "hand_landmarks", None))
 
-        if self._roi_engine is not None:
-            frame = self._draw_roi_overlay(frame)
-
-        return frame
+        return self._draw_roi_overlay(frame)
 
     def _draw_roi_overlay(self, frame: np.ndarray) -> np.ndarray:
-        """模板定位启用时，主画面只绘制搜索 ROI 矩形。"""
-        if self._roi_engine is None or not bool(
-            getattr(self.config, "roi_template_enabled", False)
-        ):
-            return frame
-        search_mapping = getattr(self.config, "roi_template_search_rect", None)
-        if not search_mapping:
-            return frame
+        """画出当前有效的识别 ROI 与搜索 ROI，不画模板 ROI。"""
         height, width = frame.shape[:2]
-        try:
-            search_rect = NormalizedRect.from_mapping(search_mapping)
-        except ValueError:
-            return frame
-        x, y, rect_width, rect_height = search_rect.to_pixel_rect((width, height))
-        p1 = (int(round(x)), int(round(y)))
-        p2 = (int(round(x + rect_width)), int(round(y + rect_height)))
-        cv2.rectangle(frame, p1, p2, (71, 181, 255), 2)
+        frame_size = (width, height)
+        for mapping, color in (
+            (getattr(self.config, "roi_template_search_rect", None), (71, 181, 255)),
+            (getattr(self.config, "roi_inspection_rect", None), (87, 217, 126)),
+        ):
+            rect = usable_normalized_rect(mapping)
+            if rect is None:
+                continue
+            x, y, rect_width, rect_height = rect.to_pixel_rect(frame_size)
+            p1 = (int(round(x)), int(round(y)))
+            p2 = (int(round(x + rect_width)), int(round(y + rect_height)))
+            cv2.rectangle(frame, p1, p2, color, 2)
         return frame
 
     @staticmethod
@@ -559,6 +664,7 @@ class MainWindow(QMainWindow):
             ))
         tip, _ = extract_tip_point(obb_dets, tool_class, calibrator, overlay.source_frame_id)
 
+        labels: list[tuple[str, tuple[int, int], tuple[int, int, int]]] = []
         for hole in holes:
             if not hole.enabled:
                 continue
@@ -567,8 +673,7 @@ class MainWindow(QMainWindow):
             cv2.circle(frame, (cx, cy), max(1, inner_r), (0, 255, 0), 2)
             outer_r = self._mm_to_pixel_radius(hole.outer_radius_mm, calibrator)
             cv2.circle(frame, (cx, cy), max(1, outer_r), (0, 255, 255), 1)
-            cv2.putText(frame, hole.name, (cx - 10, cy - max(1, outer_r) - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            labels.append((hole.name, (cx - 10, cy - max(1, outer_r) - 5), (255, 255, 255)))
 
         if tip:
             tx, ty = int(tip.px), int(tip.py)
@@ -581,15 +686,13 @@ class MainWindow(QMainWindow):
                     for hole in holes:
                         if hole.step_index == st.current_step_index and hole.enabled:
                             dist = distance_mm((tip.mm_x, tip.mm_y), hole.center_mm)
-                            cv2.putText(frame, f"{dist:.1f}mm",
-                                        (tx + 10, ty - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                            labels.append((f"{dist:.1f}mm", (tx + 10, ty - 10), (0, 255, 255)))
                             cv2.line(frame, (tx, ty),
                                      (int(hole.center_px[0]), int(hole.center_px[1])),
                                      (0, 255, 255), 1)
                             break
 
-        return frame
+        return draw_bgr_texts(frame, labels, pixel_size=14)
 
     def _mm_to_pixel_radius(self, radius_mm: float, calibrator) -> int:
         if not calibrator.is_valid:
@@ -599,24 +702,71 @@ class MainWindow(QMainWindow):
         return int(((edge_px[0] - origin_px[0]) ** 2 + (edge_px[1] - origin_px[1]) ** 2) ** 0.5)
 
     def _show_frame(self, frame: np.ndarray) -> None:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # 先缩到控件尺寸再做色彩转换与 Qt 构图：后面每一步的数据量都按显示分辨率计算，
+        # 而不是按相机分辨率，这在高像素相机上是渲染耗时的主要来源。
+        scaled = self._scale_frame_to_label(frame)
+        rgb = cv2.cvtColor(scaled, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimg)
-        scaled = pixmap.scaled(
-            self._video_label.size(), Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self._video_label.setPixmap(scaled)
+        self._video_label.setPixmap(QPixmap.fromImage(qimg))
+
+    def _scale_frame_to_label(self, frame: np.ndarray) -> np.ndarray:
+        """按 KeepAspectRatio 把整帧缩放到显示控件尺寸。"""
+        height, width = frame.shape[:2]
+        label_size = self._video_label.size()
+        target_width = label_size.width()
+        target_height = label_size.height()
+        if width <= 0 or height <= 0 or target_width <= 0 or target_height <= 0:
+            return frame
+        ratio = min(target_width / width, target_height / height)
+        new_width = max(1, int(round(width * ratio)))
+        new_height = max(1, int(round(height * ratio)))
+        if new_width == width and new_height == height:
+            return frame
+        interpolation = cv2.INTER_AREA if ratio < 1.0 else cv2.INTER_LINEAR
+        return cv2.resize(frame, (new_width, new_height), interpolation=interpolation)
 
     # ------------------------------------------------------------------
     # 步骤状态 → 卡片状态映射
     # ------------------------------------------------------------------
-    def _update_step_display(self, state) -> None:
+    def _lstm_progress_index(self, state, live_action: str) -> int:
+        """当前轮里正在识别的那一步。上一步还没结算完时，不把黄标签切到下一步。"""
+        if (
+            not self._uses_lstm_sequence()
+            or state is None
+            or state.round_result != RoundResult.IN_PROGRESS
+        ):
+            self._lstm_progress_step = -1
+            self._lstm_progress_round = None
+            return -1
+        if state.round_id != self._lstm_progress_round:
+            self._lstm_progress_round = state.round_id
+            self._lstm_progress_step = -1
+        live_name = str(live_action or "").strip()
+        current = state.current_step_index
+        if live_name and 0 <= current < len(state.steps):
+            step = state.steps[current]
+            if (
+                step.configured
+                and step.class_name == live_name
+                and step.status not in (StepStatus.PASS, StepStatus.NG)
+            ):
+                self._lstm_progress_step = current
+                return current
+        held = self._lstm_progress_step
+        if 0 <= held < len(state.steps):
+            held_step = state.steps[held]
+            if held_step.status not in (StepStatus.PASS, StepStatus.NG):
+                return held
+        self._lstm_progress_step = -1
+        return -1
+
+    def _update_step_display(self, state, live_action: str = "") -> None:
         """根据步骤引擎状态更新识别进度项与 KPI。"""
         if not self._step_cards:
             return
 
+        progress_idx = self._lstm_progress_index(state, live_action)
         terminal_ng_step_idx = -1
         if state is not None and state.round_result == RoundResult.ACTION_NG:
             terminal_ng_step_idx = state.action_ng_step
@@ -634,13 +784,19 @@ class MainWindow(QMainWindow):
             if state is not None and 0 <= engine_idx < len(state.steps):
                 step_state = state.steps[engine_idx].status
 
+            in_progress = engine_idx == progress_idx and step_state not in (
+                StepStatus.PASS,
+                StepStatus.NG,
+            )
             # 状态映射
             if step_state == StepStatus.PASS:
                 card.set_step_state("pass")
-            elif engine_idx == ng_step_idx:
+            elif step_state == StepStatus.NG:
                 card.set_step_state("ng")
+            elif in_progress:
+                card.set_step_state("progress")
             elif has_unresolved_ng and engine_idx > ng_step_idx:
-                # NG 之后的步骤锁定
+                # 整轮已经结束后，未判定的后续步骤锁定。进行中的红步不锁后面的类别。
                 card.set_step_state("locked")
             elif engine_idx == current_idx:
                 card.set_step_state("active")
@@ -650,17 +806,21 @@ class MainWindow(QMainWindow):
             else:
                 card.set_step_state("waiting")
 
-            # 显示当前帧数量进度，不跨帧累计。
+            # 只按步骤顺序出现：未轮到的类别即使被认出也不显示。
             if state is not None and 0 <= engine_idx < len(state.steps):
                 ss = state.steps[engine_idx]
                 card.set_quantity_progress(ss.current_count, ss.required_count)
                 should_show = (
-                    ss.current_count > 0
-                    or step_state == StepStatus.PASS
+                    step_state == StepStatus.PASS
+                    or step_state == StepStatus.NG
+                    or in_progress
                     or engine_idx == ng_step_idx
+                    or (engine_idx == current_idx and ss.current_count > 0)
                 )
                 card.setVisible(should_show)
                 recognized_count += int(should_show)
+            else:
+                card.setVisible(False)
 
         self._sync_recognition_empty_state(recognized_count)
 
@@ -684,7 +844,11 @@ class MainWindow(QMainWindow):
                 self._set_result_label("PASS", "#4CAF50")
                 self._update_kpi()
             elif state.round_result == RoundResult.ACTION_NG:
-                self._set_notice("检测到顺序异常，请按配置顺序重新执行当前步骤。")
+                notice = state.action_ng_reason or "检测到顺序异常，请按配置顺序重新执行当前步骤。"
+                if self._uses_lstm_sequence() or "数量不符" in notice or "未检出" in notice:
+                    self._set_notice(notice)
+                else:
+                    self._set_notice("检测到顺序异常，请按配置顺序重新执行当前步骤。")
                 ng_key = (state.round_id, state.action_ng_step)
                 if ng_key != self._last_counted_ng_key:
                     self._last_counted_ng_key = ng_key
@@ -697,6 +861,8 @@ class MainWindow(QMainWindow):
                     return
                 self._set_result_label("NG", "#F44336")
                 self._status_label.setText("NG 已记录")
+                if getattr(self, "_action_evidence_warning", ""):
+                    self._set_notice(f"{notice}；{self._action_evidence_warning}")
                 self._update_kpi()
 
         self._sync_step_focus_scroll(state)
@@ -722,33 +888,60 @@ class MainWindow(QMainWindow):
         if any(marker in text for marker in roi_error_markers):
             self._set_notice("")
 
+    def _cooldown_interval_ms(self) -> int:
+        return int(max(0.0, float(getattr(self.config, "round_cooldown_seconds", 0.0))) * 1000)
+
+    def _resync_round_cooldown_timer(self) -> None:
+        if not self._round_pass_timer.isActive():
+            return
+        self._round_pass_timer.start(self._cooldown_interval_ms())
+
     def _start_next_round_after_pass(self) -> None:
         if not self.step_engine:
             return
-        interval_ms = int(max(0.0, float(getattr(self.config, "round_cooldown_seconds", 0.0))) * 1000)
-        self._round_pass_timer.start(interval_ms)
+        self._round_pass_timer.start(self._cooldown_interval_ms())
 
     def _start_next_round_after_ng(self) -> None:
         if not self.step_engine:
             return
-        interval_ms = int(max(0.0, float(getattr(self.config, "round_cooldown_seconds", 0.0))) * 1000)
-        self._round_pass_timer.start(interval_ms)
+        self._round_pass_timer.start(self._cooldown_interval_ms())
         return
+
+    def _refresh_ng_alarm_for_new_round(self) -> None:
+        """新一轮允许再响一次 NG；同一轮仍靠 result_key 只报一次。"""
+        self._last_counted_ng_key = None
+        self._action_evidence_warning = ""
+        for key in [
+            item
+            for item in self._played_result_sound_keys
+            if item[:1] == ("action",) and item[-1:] == ("fail",)
+        ]:
+            self._played_result_sound_keys.pop(key, None)
 
     def _start_new_round_now(self) -> None:
         if not self.step_engine:
             return
         require_rearm = bool(self._last_counted_ng_key is not None)
-        self.step_engine.start_round(require_first_step_rearm=require_rearm)
+        self._begin_step_round(require_first_step_rearm=require_rearm, continue_from_previous=True)
         self._round_start_time = time.time()
         self._last_counted_pass_round = -1
-        self._last_counted_ng_key = None
+        self._refresh_ng_alarm_for_new_round()
         self._sticky_ng_step_idx = -1
         self._last_step_focus_key = None
         self._set_notice("")
         state = self.step_engine.get_state()
         self._update_step_display(state)
         self._sync_step_focus_scroll(state, reason="ng-next-round", force=True)
+
+    def _begin_step_round(self, *, continue_from_previous: bool = False, **kwargs) -> None:
+        """每轮记录真实源帧门槛，保留连续时序隐藏状态。
+
+        延续上一轮时引擎优先用上一轮结束边界，预览帧只作没有边界时的回退。
+        """
+        kwargs["action_min_source_frame"] = self.worker.get_latest_preview_frame_id() + 1
+        if continue_from_previous:
+            kwargs["continue_from_previous"] = True
+        self.step_engine.start_round(**kwargs)
 
     @staticmethod
     def _remember_result_key(cache: dict[tuple, None], key: tuple) -> bool:
@@ -798,9 +991,24 @@ class MainWindow(QMainWindow):
             frame, frame_id = self._get_feedback_frame()
             data = self._last_overlay_data or {}
             source_frame_id = int(data.get("source_frame_id") or frame_id or 0)
+            boundary = int(getattr(state, "action_boundary_frame", 0) or 0)
+            decision = int(getattr(state, "action_decision_frame", 0) or 0)
+            if boundary:
+                evidence = self.worker.get_action_boundary_evidence(boundary)
+                if evidence is None:
+                    self._action_evidence_warning = f"动作边界第 {boundary} 帧证据不可用"
+                    self._set_notice(f"NG 已记录，{self._action_evidence_warning}")
+                    self._runtime_logger.error("action_evidence=unavailable boundary=%s decision=%s", boundary, decision)
+                    return
+                frame, boundary_detections, metadata = evidence
+                source_frame_id = int(metadata.get("source_frame_id", boundary))
+                data = dict(metadata, detections=boundary_detections)
             step_idx = int(getattr(state, "action_ng_step", -1))
             names = getattr(self.config, "category_names", []) or []
             step_name = names[step_idx] if 0 <= step_idx < len(names) else ""
+            ng_step = None
+            if state is not None and 0 <= step_idx < len(getattr(state, "steps", []) or []):
+                ng_step = state.steps[step_idx]
             context = FailEvidenceContext(
                 round_id=int(getattr(state, "round_id", 0)),
                 action_ng_step=step_idx,
@@ -809,6 +1017,18 @@ class MainWindow(QMainWindow):
                 detections=list(data.get("detections", []) or []),
                 model_path=str(data.get("model_path", "")),
                 timestamp=float(data.get("timestamp") or time.time()),
+                actual_count=None if ng_step is None else int(ng_step.current_count),
+                required_count=None if ng_step is None else int(ng_step.required_count),
+                fail_retry_count=None if ng_step is None else int(ng_step.fail_retry_count),
+                ng_reason=str(getattr(state, "action_ng_reason", "") or ""),
+                boundary_frame=boundary,
+                decision_frame=decision or int(data.get("source_frame_id") or 0),
+                seen_parts=list(getattr(state, "action_seen_parts", []) or []),
+                missing_parts=list(getattr(state, "action_missing_parts", []) or []),
+                model_sha256=str(getattr(state, "action_weights_sha256", "") or ""),
+                action_start_time=float(getattr(state, "action_start_time", 0.0)) if boundary else None,
+                action_end_time=float(getattr(state, "action_end_time", 0.0)) if boundary else None,
+                action_decision_time=float(getattr(state, "action_decision_time", 0.0)) if boundary else None,
             )
             self._fail_evidence_saver.save_fail_event(frame, context)
         except Exception:
@@ -826,7 +1046,14 @@ class MainWindow(QMainWindow):
             if category is None:
                 card.setVisible(False)
                 continue
-            card.setVisible(True)
+            should_show = (
+                category.observed_count > 0
+                or category.passed
+                or bool(snapshot.result and name in snapshot.result.failed_categories)
+            )
+            card.setVisible(should_show)
+            if not should_show:
+                continue
             card.set_quantity_progress(category.observed_count, category.required_count)
             recognized_count += int(category.observed_count > 0 or category.passed)
             if category.passed:
@@ -918,22 +1145,40 @@ class MainWindow(QMainWindow):
 
     def _update_kpi(self) -> None:
         batch = self._stats_manager.batch
-        self._kpi_row.set_value("output", str(batch.total))
+        self._kpi_row.set_value("output", f"{batch.total}")
         self._kpi_row.set_value("yield", f"{batch.yield_rate:.1f}%")
         self._kpi_row.set_value("ok", str(batch.ok))
         self._kpi_row.set_value("ng", str(batch.ng))
 
     def _on_round_pass_settled(self) -> None:
         """完成一轮间隔结束后再启动新一轮。"""
+        if self._pending_step_engine_rebuild:
+            self._pending_step_engine_rebuild = False
+            self._rebuild_step_engine()
+            self._refresh_steps()
         self._clear_result_label()
         self._status_label.setText("检测中")
-        self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+        self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
         self._start_new_round_now()
 
     def _set_result_label(self, text: str, color: str) -> None:
         """显示顶部 PASS/NG 结果，避免无结果时保留空白占位。"""
+        # 实心徽章：PASS 绿底黑字 / NG 红底白字，远距离可读；签名保持不变。
+        key = text.strip().upper()
+        if key == "PASS":
+            background, foreground = STEP_PASS_BORDER, "#04160E"
+        elif key == "NG":
+            background, foreground = STEP_NG_BORDER, "#FFFFFF"
+        else:
+            background, foreground = "", color
         self._result_label.setText(text)
-        self._result_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+        if background:
+            self._result_label.setStyleSheet(
+                f"background-color: {background}; color: {foreground}; border: none; "
+                "border-radius: 6px; padding: 4px 14px; font-size: 14px; font-weight: 800;"
+            )
+        else:
+            self._result_label.setStyleSheet(f"color: {color}; font-weight: bold;")
         self._result_label.setVisible(True)
 
     def _clear_result_label(self) -> None:
@@ -954,18 +1199,15 @@ class MainWindow(QMainWindow):
         can_detect = cam_on and self.processor is not None
         self._btn_detect.setVisible(True)
         self._btn_detect.setEnabled(infer_on or can_detect)
+        self._update_timing_display()
         if not can_detect and not infer_on:
             if cam_on and self.processor is None:
                 self._status_label.setText("处理器未加载")
-                self._status_label.setStyleSheet(text_style(TEXT_SECONDARY, size=14, weight=500))
+                self._status_label.setStyleSheet(_status_badge_style(TEXT_SECONDARY))
 
     # ------------------------------------------------------------------
     # 信号槽
     # ------------------------------------------------------------------
-    @Slot(QImage)
-    def _on_frame_ready(self, qimg: QImage) -> None:
-        pass
-
     @Slot(str)
     def _on_error(self, msg: str) -> None:
         self._runtime_logger.error("runtime_error=%s", msg)
@@ -973,8 +1215,65 @@ class MainWindow(QMainWindow):
         self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
         self._set_notice(msg)
 
+    def _overlay_image_size(self, data: dict) -> tuple:
+        raw_image_size = tuple((data or {}).get("image_size") or ())
+        if len(raw_image_size) == 2 and all(float(value) > 0 for value in raw_image_size):
+            return (int(raw_image_size[0]), int(raw_image_size[1]))
+        display_frame, _ = self.worker.get_display_frame()
+        if display_frame is not None:
+            frame_height, frame_width = display_frame.shape[:2]
+            return (int(frame_width), int(frame_height))
+        return ()
+
+    def _judgement_detections(self, detections: list, image_size: tuple) -> list:
+        """有效识别 ROI 只把中心在框内的目标交给判定；空框整图。"""
+        rect = usable_normalized_rect(getattr(self.config, "roi_inspection_rect", None))
+        if rect is None or not image_size:
+            return list(detections)
+        return [
+            detection
+            for detection in detections
+            if detection_center_in_rect(detection, rect, image_size)
+        ]
+
+    def _log_step_sequence_frame(
+        self,
+        data: dict,
+        raw_detections: list,
+        judged: list,
+        state,
+        frozen: bool,
+    ) -> None:
+        """顺序模式逐帧记录判定输入与结果，用于区分「没检到」「被 ROI 滤掉」「数量不符」。"""
+        raw_counts = Counter(str(det.label) for det in raw_detections if getattr(det, "label", ""))
+        judged_counts = Counter(str(det.label) for det in judged if getattr(det, "label", ""))
+        if state is not None and 0 <= state.current_step_index < len(state.steps):
+            step = state.steps[state.current_step_index]
+            expected = (
+                f"idx={step.index} class={step.class_name} required={step.required_count} "
+                f"current={step.current_count} status={step.status.value}"
+            )
+        else:
+            expected = "none"
+        roi = getattr(self.config, "roi_inspection_rect", None)
+        self._runtime_logger.info(
+            "step_seq_update frame_id=%s frozen=%s roi=%s raw=%s judged=%s "
+            "expected=[%s] round=%s round_id=%s reason=%s",
+            data.get("source_frame_id", 0),
+            frozen,
+            roi,
+            dict(raw_counts),
+            dict(judged_counts),
+            expected,
+            getattr(state, "round_result", None).value if state is not None else None,
+            getattr(state, "round_id", 0),
+            getattr(state, "action_ng_reason", "") or "",
+        )
+
     @Slot(dict)
     def _on_overlay_updated(self, data: dict) -> None:
+        if data.get("runtime_generation", self.worker.runtime_generation) != self.worker.runtime_generation:
+            return
         self._last_overlay_data = dict(data or {})
         detections = data.get("detections", [])
         obb_dets = []
@@ -990,18 +1289,10 @@ class MainWindow(QMainWindow):
             ))
 
         state = None
+        image_size = self._overlay_image_size(data)
+        judged = self._judgement_detections(obb_dets, image_size)
         if self._roi_engine is not None:
-            raw_image_size = tuple(data.get("image_size") or ())
-            image_size = raw_image_size if len(raw_image_size) == 2 else ()
-            image_size_source = "overlay"
-            if not image_size or any(float(value) <= 0 for value in image_size):
-                display_frame, _ = self.worker.get_display_frame()
-                if display_frame is not None:
-                    frame_height, frame_width = display_frame.shape[:2]
-                    image_size = (int(frame_width), int(frame_height))
-                    image_size_source = "display_frame"
-                else:
-                    image_size_source = "unavailable"
+            image_size_source = "overlay" if data.get("image_size") else "derived"
 
             sample_centers = []
             for d in detections[:3]:
@@ -1029,7 +1320,7 @@ class MainWindow(QMainWindow):
                 }
                 previous_round_id = self._roi_engine.snapshot.round_id
                 roi_results = self._roi_engine.update(
-                    obb_dets,
+                    judged,
                     image_size=image_size,
                     source_frame_id=data.get("source_frame_id", 0),
                     timestamp=data.get("timestamp") or None,
@@ -1049,12 +1340,57 @@ class MainWindow(QMainWindow):
                 data,
             )
             self._sync_roi_cards()
+        elif self.step_engine and self._uses_lstm_sequence():
+            report = data.get("lstm_action") or {}
+            frozen = self._round_pass_timer.isActive()
+            if report.get("fault") or getattr(self, "_action_runtime_fault", ""):
+                fault = str(report.get("fault") or self._action_runtime_fault)
+                self._action_runtime_fault = fault
+                self.worker.stop_inference()
+                self._round_pass_timer.stop()
+                self._set_notice(f"模型故障，已停止检测，禁止放行：{fault}")
+                self._status_label.setText("模型故障，检测已停止")
+                self._status_label.setStyleSheet(_status_badge_style(TEXT_DANGER))
+                self._lstm_status_label.setText(f"时序动作：故障，{fault}")
+                self._clear_result_label()
+                self._sync_button_states()
+                state = self.step_engine.get_state()
+            else:
+                state = self.step_engine.get_state()
+                events = list(report.get("events") or [])
+                if self.state.inference_on:
+                    for event in events:
+                        state = self.step_engine.apply_action_event(event)
+                else:
+                    for event in events:
+                        trace(
+                            "event_decision",
+                            result="reject",
+                            reason="inference_off",
+                            note="检测未开启",
+                            name=event.get("name") or "-",
+                            start_frame=event.get("start_frame"),
+                            end_frame=event.get("end_frame"),
+                            session=event.get("session_id"),
+                            event=event.get("event_id"),
+                        )
+                self._show_action_progress(report)
+            self._log_step_sequence_frame(data, obb_dets, judged, state, frozen)
+            if not getattr(self, "_action_runtime_fault", ""):
+                self._update_step_display(state, live_action=str(report.get("action") or ""))
         elif self.step_engine:
-            try:
-                state = self.step_engine.update(obb_dets, frame_id=data.get("source_frame_id", 0))
-            except TypeError:
-                state = self.step_engine.update(obb_dets)
+            frozen = self._round_pass_timer.isActive()
+            if frozen:
+                state = self.step_engine.get_state()
+            else:
+                try:
+                    state = self.step_engine.update(judged, frame_id=data.get("source_frame_id", 0))
+                except TypeError:
+                    state = self.step_engine.update(judged)
+            self._log_step_sequence_frame(data, obb_dets, judged, state, frozen)
             self._update_step_display(state)
+        if not self._uses_lstm_sequence():
+            self._update_lstm_action(data, obb_dets, image_size)
 
         overlay = DetectionOverlayState(
             source_frame_id=data.get("source_frame_id", 0),
@@ -1066,10 +1402,11 @@ class MainWindow(QMainWindow):
             error=data.get("error", ""),
             round_id=data.get("round_id", 0),
             latency_ms=data.get("latency_ms", 0.0),
+            hand_landmarks=self._normalize_hand_landmarks(data.get("hand_landmarks")),
         )
+        # 渲染不在事件路径上进行：积压时判定仍逐帧推进，而画面由定时器统一取最新状态渲染。
         self._latest_runtime_overlay = overlay
         self._record_coordinate_log(overlay, state)
-        self._update_display()
 
     def _handle_roi_results(
         self,
@@ -1328,6 +1665,29 @@ class MainWindow(QMainWindow):
     @Slot(dict)
     def _on_stats_updated(self, stats: dict) -> None:
         self._last_pipeline_stats = dict(stats)
+        self._update_timing_display()
+
+    def _update_timing_display(self) -> None:
+        """把四段耗时和瓶颈段直接摆在画面下方，现场不用翻日志就能定位卡在哪。"""
+        stats = self._last_pipeline_stats
+        if not stats or not self.state.inference_on:
+            self._timing_label.setVisible(False)
+            return
+        segments = [
+            ("采集", float(stats.get("capture_ms", 0.0) or 0.0)),
+            ("定位", float(stats.get("template_ms", 0.0) or 0.0)),
+            ("推理", float(stats.get("yolo_ms", 0.0) or 0.0)),
+            ("渲染", float(stats.get("render_ms", 0.0) or 0.0)),
+        ]
+        measured = [(name, value) for name, value in segments if value > 0.0]
+        if not measured:
+            self._timing_label.setVisible(False)
+            return
+        slowest = max(measured, key=lambda item: item[1])[0]
+        parts = "   ".join(f"{name} {value:.1f}ms" for name, value in measured)
+        fps = float(stats.get("infer_fps", 0.0) or 0.0)
+        self._timing_label.setText(f"{parts}   瓶颈 {slowest}   推理 {fps:.1f} fps")
+        self._timing_label.setVisible(True)
 
     @Slot(dict)
     def _on_camera_params(self, params: dict) -> None:
@@ -1361,14 +1721,15 @@ class MainWindow(QMainWindow):
             self._runtime_logger.info("camera_action=close")
             self._close_camera_session()
             self._status_label.setText("READY")
-            self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+            self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
         else:
             self._runtime_logger.info("camera_action=open")
             if self.worker.open_camera():
                 self._runtime_logger.info("camera_open=ok")
                 self._display_timer.start(33)
+                self._set_scanline_active(True)
                 self._status_label.setText("预览中")
-                self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+                self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
             else:
                 self._runtime_logger.error("camera_open=failed")
                 self._status_label.setText("相机打开失败")
@@ -1380,7 +1741,9 @@ class MainWindow(QMainWindow):
         if self.state.inference_on:
             self._runtime_logger.info("detection_action=stop")
             self.worker.stop_inference()
+            self.worker.reset_action_session()
             self._round_pass_timer.stop()
+            self._pending_step_engine_rebuild = False
             self._stop_template_diagnostics()
             self._status_label.setText("已停止")
             self._status_label.setStyleSheet(text_style(TEXT_SECONDARY, size=14, weight=500))
@@ -1426,20 +1789,29 @@ class MainWindow(QMainWindow):
                 self._set_notice(message)
                 self._sync_button_states()
                 return
+            if self._uses_lstm_sequence():
+                self._reload_configured_action_model()
+            if self._uses_lstm_sequence() and (getattr(self, "_action_block_reason", "") or getattr(self, "_action_runtime_fault", "")):
+                message = self._action_block_reason or f"模型故障，请重新保存配置以加载模型：{self._action_runtime_fault}"
+                self._status_label.setText(message)
+                self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+                self._set_notice(message)
+                self._sync_button_states()
+                return
             if getattr(self.config, "roi_inspection_enabled", False):
                 self._init_roi_engine()
                 if self._roi_engine is None:
                     self._status_label.setText("ROI 检测配置无法初始化")
-                    self._set_notice("请检查定位模板、识别 ROI、待检类别和数量配置")
+                    self._set_notice("请检查待检类别和数量配置")
                     self._sync_button_states()
                     return
                 self._sync_roi_cards()
             elif self.step_engine:
-                self.step_engine.start_round()
+                self._begin_step_round()
                 self._round_start_time = time.time()
                 self._round_id_reset()
                 self._last_counted_pass_round = -1
-                self._last_counted_ng_key = None
+                self._refresh_ng_alarm_for_new_round()
                 self._update_step_display(self.step_engine.get_state())
             self._start_template_diagnostics()
             self.worker.start_inference()
@@ -1449,8 +1821,9 @@ class MainWindow(QMainWindow):
                 type(self.processor).__name__,
             )
             self._status_label.setText("检测中")
-            self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+            self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
             self._clear_result_label()
+        self._sync_hand_overlay_enabled()
         self._sync_button_states()
 
     # ------------------------------------------------------------------
@@ -1461,10 +1834,11 @@ class MainWindow(QMainWindow):
         recorder = get_template_diagnostics()
         if recorder.active:
             return
+        from yolo_runtime.template_gated_processor import TemplateGatedProcessor
+
         enabled = bool(
             getattr(self.config, "template_diagnostics_enabled", False)
-            and getattr(self.config, "roi_inspection_enabled", False)
-            and getattr(self.config, "roi_template_enabled", False)
+            and isinstance(self.processor, TemplateGatedProcessor)
         )
         recorder.configure(
             enabled=enabled,
@@ -1559,17 +1933,23 @@ class MainWindow(QMainWindow):
         self._start_template_diagnostics()
 
     def _template_runtime_validation_error(self) -> str:
-        """模板启用时确认当前处理器和磁盘模板都真实可用。"""
-        if not bool(getattr(self.config, "roi_inspection_enabled", False)):
-            return ""
-        if not bool(getattr(self.config, "roi_template_enabled", False)):
-            return ""
-
-        from template_matching.template_store import load_shape_model
+        """仅在模板层会实际启用时检查门控处理器、模型和搜索余量。"""
+        from template_matching.template_store import load_shape_model, resolve_template_path
         from yolo_runtime.template_gated_processor import TemplateGatedProcessor
 
+        if not bool(getattr(self.config, "roi_template_enabled", False)):
+            return ""
+        if usable_normalized_rect(getattr(self.config, "roi_template_search_rect", None)) is None:
+            return ""
+        try:
+            template_path = resolve_template_path(self.config, self._app_base_dir)
+        except ValueError:
+            return ""
+        if not template_path.is_file():
+            return ""
+
         if not isinstance(self.processor, TemplateGatedProcessor):
-            return "模板定位处理器未加载，请完成三种 ROI 后点击验证并保存"
+            return "模板定位处理器未加载，请先验证并保存"
         if self.worker.frame_processor is not self.processor:
             return "相机线程未使用模板定位处理器，请完成三种 ROI 后点击验证并保存"
         try:
@@ -1579,8 +1959,6 @@ class MainWindow(QMainWindow):
 
         # 搜索框余量必须够，否则运行期会因旋转候选被丢弃而随机不触发。
         search = getattr(self.config, "roi_template_search_rect", None)
-        if not search:
-            return "搜索 ROI 未配置，请先创建并保存搜索 ROI"
         frame = self.worker.get_latest_preview_frame()
         if frame is not None:
             height, width = frame.shape[:2]
@@ -1613,10 +1991,10 @@ class MainWindow(QMainWindow):
                 self.config,
                 stats_manager=self._stats_manager,
                 roi_frame_provider=self.worker.get_latest_preview_frame,
+                config_committer=self._commit_candidate_config,
             )
             self._config_page.back_clicked.connect(self._on_config_back)
             self._config_page.stats_changed.connect(self._on_stats_changed)
-            self._config_page.config_saved.connect(self._on_config_saved)
             self._config_page.camera_refresh_requested.connect(
                 self._on_camera_refresh_requested
             )
@@ -1655,10 +2033,11 @@ class MainWindow(QMainWindow):
         self._apply_feedback_config()
         self._apply_step_engine_config()
         self._apply_roi_engine_config()
+        self._invalidate_render_cache()
         self._sync_button_states()
         self._update_kpi()
         self._status_label.setText("READY" if not self.state.camera_on else "预览中")
-        self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+        self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
 
     def _on_stats_changed(self) -> None:
         """配置页归零后同步主界面 KPI。"""
@@ -1672,7 +2051,20 @@ class MainWindow(QMainWindow):
         self._apply_feedback_config()
         model_ok = self._apply_runtime_model_config()
         self._apply_step_engine_config()
+        self._reload_configured_action_model()
+        if (
+            model_ok
+            and self._uses_lstm_sequence()
+            and self._resolved_bundle_dir(self.config) is not None
+            and not self._action_session_matches_config()
+        ):
+            self._status_label.setText(self._action_block_reason or "动作模型未加载")
+            self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+            return False
+        self._resync_round_cooldown_timer()
         self._init_roi_engine()
+        self._invalidate_render_cache()
+        self._sync_hand_overlay_enabled()
         self._sync_button_states()
         self._update_kpi()
         if not model_ok:
@@ -1680,12 +2072,92 @@ class MainWindow(QMainWindow):
             self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
             return False
         elif camera_switch_result is None and not self.state.inference_on:
-            self._status_label.setText("配置已应用")
-            self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+            self._status_label.setText(self._config_applied_text())
+            self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
         self._restart_template_diagnostics_if_running()
         self._sync_template_diagnostics_status()
         self._clear_stale_roi_notice()
         return True
+
+    def _commit_candidate_config(self, candidate) -> None:
+        """候选实例全部就绪后提交；失败时旧配置、模型和会话均保留。"""
+        from lstm_action.bundle import uses_lstm_sequence
+
+        candidate.validate()
+        new_processor = self._create_processor_from_config(candidate)
+        raw_names = new_processor.get_class_names() if hasattr(new_processor, "get_class_names") else []
+        class_names = list(raw_names.values()) if isinstance(raw_names, dict) else list(raw_names)
+        candidate.require_valid_inspection_config(class_names, require_roi_rects=False)
+        session = None
+        if uses_lstm_sequence(candidate):
+            session, reason = self._load_action_session(candidate, new_processor)
+            if session is None:
+                raise ValueError(reason or "动作模型未能加载，保留原运行配置")
+        new_step_engine = StepSequenceEngine(
+            step_class_names=candidate.category_names,
+            step_counts=candidate.get_runtime_category_counts(),
+            enter_stable_frames=candidate.action_pass_stable_frames,
+            out_of_order_frames=candidate.action_ng_stable_frames,
+            leave_stable_frames=getattr(candidate, "action_leave_stable_frames", 4),
+            order_constraint_enabled=candidate.action_order_constraint_enabled,
+            fail_retry_enabled=getattr(candidate, "action_fail_retry_enabled", False),
+            fail_retry_frames=candidate.action_ng_stable_frames,
+            detection_updates=not uses_lstm_sequence(candidate),
+        )
+        path = Path(candidate.get_config_path())
+        old_bytes = path.read_bytes() if path.is_file() else None
+        was_running = bool(self.state.inference_on)
+        self.worker.stop_inference()
+        saved = False
+        try:
+            candidate.save(path)
+            saved = True
+            self.worker.replace_runtime(candidate, new_processor, session)
+        except Exception:
+            if saved:
+                restore_file(path, old_bytes)
+            if was_running and self.state.camera_on:
+                self.worker.start_inference()
+            raise
+
+        self.config = candidate
+        self.processor = new_processor
+        self.step_engine = new_step_engine
+        self._round_pass_timer.stop()
+        self._pending_step_engine_rebuild = False
+        self._last_overlay_data = {}
+        self._last_model_reload_error = ""
+        self._action_block_reason = ""
+        self._action_runtime_fault = ""
+        self._runtime_model_signature = self._model_runtime_signature(candidate)
+        self._step_engine_signature = self._step_engine_config_signature(candidate)
+        self.lstm_action.state.loaded = session is not None
+        self.lstm_action.state.reason = "已加载" if session is not None else "未启用"
+        self._show_lstm_state(self.lstm_action.state)
+        if self._config_page is not None:
+            self._config_page.config = candidate
+        self._apply_feedback_config()
+        self._init_roi_engine()
+        self._refresh_steps()
+        self._invalidate_render_cache()
+        self._clear_result_label()
+        self._set_notice("")
+        self._refresh_ng_alarm_for_new_round()
+        self._sticky_ng_step_idx = -1
+        if was_running and self.state.camera_on:
+            self._begin_step_round()
+            self._round_start_time = time.time()
+            self.worker.start_inference()
+        camera_switch_result = self._apply_camera_selection()
+        self._sync_hand_overlay_enabled()
+        self._sync_button_states()
+        self._update_kpi()
+        if camera_switch_result is not False:
+            self._status_label.setText("检测中" if self.state.inference_on else self._config_applied_text())
+        else:
+            self._set_notice("配置和模型已保存，相机切换失败，请检查所选相机后重新打开")
+        self._restart_template_diagnostics_if_running()
+        self._sync_template_diagnostics_status()
 
     def _apply_camera_selection(self) -> Optional[bool]:
         """Apply a saved SN change only when a camera session is currently open."""
@@ -1705,7 +2177,7 @@ class MainWindow(QMainWindow):
         if self.worker.open_camera():
             self._display_timer.start(33)
             self._status_label.setText("预览中")
-            self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+            self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
             return True
 
         self._status_label.setText(f"相机切换失败（SN: {target_sn}）")
@@ -1716,12 +2188,15 @@ class MainWindow(QMainWindow):
         """Stop detection and camera threads before releasing the SDK session."""
         if self.state.inference_on:
             self.worker.stop_inference()
+        self.worker.reset_action_session()
         self._display_timer.stop()
+        self._set_scanline_active(False)
         self._round_pass_timer.stop()
         self._stop_template_diagnostics()
         if self._coordinate_logger.active:
             self._coordinate_logger.stop_session()
         self.worker.close_camera()
+        self._sync_hand_overlay_enabled()
         if clear_visuals:
             self._clear_camera_session_visuals()
 
@@ -1729,11 +2204,12 @@ class MainWindow(QMainWindow):
         """Remove all camera-specific frames, overlays, results, and trackers."""
         self._video_label.clear()
         self._latest_runtime_overlay = DetectionOverlayState()
+        self._invalidate_render_cache()
         self._last_overlay_data = {}
         self._last_pipeline_stats = {}
         self._last_camera_params = {}
         self._last_counted_pass_round = -1
-        self._last_counted_ng_key = None
+        self._refresh_ng_alarm_for_new_round()
         self._round_start_time = 0.0
         self._sticky_ng_step_idx = -1
         self._last_step_focus_key = None
@@ -1743,6 +2219,118 @@ class MainWindow(QMainWindow):
         self._init_roi_engine()
         self._refresh_steps()
 
+    def _build_viewfinder_overlays(self, frame: QFrame) -> None:
+        """取景器 HUD：四角 L 标 + 垂直扫描线（无辉光/模糊，只用描边）。"""
+        self._viewfinder_corners = []
+        for v_edge, h_edge in (("top", "left"), ("top", "right"), ("bottom", "left"), ("bottom", "right")):
+            mark = QFrame(frame)
+            mark.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            v_side = "border-top" if v_edge == "top" else "border-bottom"
+            h_side = "border-left" if h_edge == "left" else "border-right"
+            mark.setStyleSheet(
+                f"QFrame {{ background: transparent; border: none; "
+                f"{v_side}: 2px solid {TEXT_ACCENT}; {h_side}: 2px solid {TEXT_ACCENT}; }}"
+            )
+            mark.setFixedSize(22, 22)
+            mark.raise_()
+            self._viewfinder_corners.append((mark, v_edge, h_edge))
+
+        self._scanline = QFrame(frame)
+        self._scanline.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._scanline.setStyleSheet(f"QFrame {{ background-color: {TEXT_ACCENT}; border: none; }}")
+        self._scanline.setFixedHeight(2)
+        self._scanline.setVisible(False)
+        self._scanline.raise_()
+
+        self._scan_offset = 0
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(60)
+        self._scan_timer.timeout.connect(self._advance_scanline)
+
+        frame.installEventFilter(self)
+        self._position_hud_overlays()
+
+    def _position_hud_overlays(self) -> None:
+        frame = getattr(self, "_video_frame", None)
+        scanline = getattr(self, "_scanline", None)
+        corners = getattr(self, "_viewfinder_corners", None)
+        if frame is None or scanline is None or not corners:
+            return
+        inset = 12
+        width = frame.width()
+        height = frame.height()
+        for mark, v_edge, h_edge in corners:
+            x = inset if h_edge == "left" else max(0, width - inset - mark.width())
+            y = inset if v_edge == "top" else max(0, height - inset - mark.height())
+            mark.move(x, y)
+        scanline.setFixedWidth(max(0, width - inset * 2))
+        scanline.move(inset, inset + self._scan_offset)
+        scanline.raise_()
+        for mark, _v_edge, _h_edge in corners:
+            mark.raise_()
+
+    def _advance_scanline(self) -> None:
+        frame = getattr(self, "_video_frame", None)
+        scanline = getattr(self, "_scanline", None)
+        if frame is None or scanline is None or not scanline.isVisible():
+            return
+        span = max(1, frame.height() - 24 - scanline.height())
+        self._scan_offset = (self._scan_offset + 8) % span
+        scanline.move(scanline.x(), 12 + self._scan_offset)
+
+    def _set_scanline_active(self, active: bool) -> None:
+        scanline = getattr(self, "_scanline", None)
+        timer = getattr(self, "_scan_timer", None)
+        if scanline is None or timer is None:
+            return
+        if active:
+            self._scan_offset = 0
+            self._position_hud_overlays()
+            scanline.setVisible(True)
+            timer.start()
+        else:
+            timer.stop()
+            scanline.setVisible(False)
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "_video_frame", None) and event.type() == QEvent.Type.Resize:
+            self._position_hud_overlays()
+        return super().eventFilter(obj, event)
+
+    def _sync_hand_overlay_enabled(self) -> None:
+        """顺序模式且正在检测时才开 Hands；ROI / 停止检测立即关掉。"""
+        enabled = bool(self.state.inference_on) and not bool(
+            getattr(self.config, "roi_inspection_enabled", False)
+        )
+        self.worker.set_hand_overlay_enabled(enabled)
+
+    @staticmethod
+    def _normalize_hand_landmarks(raw) -> list:
+        if not raw:
+            return []
+        hands = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            points = item.get("points") or []
+            if len(points) != 21:
+                continue
+            cleaned = []
+            try:
+                for point in points:
+                    cleaned.append((float(point[0]), float(point[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+            if len(cleaned) != 21:
+                continue
+            hands.append(
+                {
+                    "handedness": str(item.get("handedness") or ""),
+                    "points": cleaned,
+                }
+            )
+        return hands
+
     def _apply_feedback_config(self) -> None:
         """同步保存后可立即生效的反馈配置。"""
         self._sound_feedback.enabled = (
@@ -1751,8 +2339,7 @@ class MainWindow(QMainWindow):
         )
         self._fail_evidence_saver.enabled = bool(getattr(self.config, "fail_evidence_enabled", True))
 
-    @staticmethod
-    def _step_engine_config_signature(config) -> tuple:
+    def _step_engine_config_signature(self, config) -> tuple:
         """Configuration fields that require resetting the normal step engine."""
         names = tuple(str(name).strip() for name in (getattr(config, "category_names", []) or []))
         counts = tuple(config.get_runtime_category_counts())
@@ -1763,6 +2350,8 @@ class MainWindow(QMainWindow):
             int(getattr(config, "action_ng_stable_frames", 1)),
             int(getattr(config, "action_leave_stable_frames", 4)),
             bool(getattr(config, "action_order_constraint_enabled", True)),
+            bool(getattr(config, "action_fail_retry_enabled", False)),
+            self._action_bundle_signature(config),
         )
 
     @staticmethod
@@ -1802,8 +2391,13 @@ class MainWindow(QMainWindow):
         new_signature = self._step_engine_config_signature(self.config)
         if new_signature == self._step_engine_signature:
             return False
+        if self._round_pass_timer.isActive():
+            self._pending_step_engine_rebuild = True
+            return False
         self._rebuild_step_engine()
         self._refresh_steps()
+        if self.state.inference_on and self.step_engine:
+            self._begin_step_round()
         return True
 
     def _apply_roi_engine_config(self) -> bool:
@@ -1820,12 +2414,9 @@ class MainWindow(QMainWindow):
             str(getattr(config, "yolo_model_path", "")),
             float(getattr(config, "yolo_conf_threshold", 0.0)),
             float(getattr(config, "yolo_iou_threshold", 0.0)),
-            str(getattr(config, "ultralytics_device", "")),
             bool(getattr(config, "ultralytics_half", False)),
             str(getattr(config, "ultralytics_tracker", "")),
-            int(getattr(config, "ultralytics_max_det", 0)),
             bool(getattr(config, "ultralytics_track_persist", True)),
-            bool(getattr(config, "roi_inspection_enabled", False)),
             bool(getattr(config, "roi_template_enabled", False)),
             str(getattr(config, "roi_template_path", "") or "").strip(),
             float(getattr(config, "roi_template_match_threshold", 0.6)),
@@ -1833,15 +2424,37 @@ class MainWindow(QMainWindow):
             float(getattr(config, "roi_template_angle_step", 1.0)),
             tuple(sorted((getattr(config, "roi_template_search_rect", None) or {}).items())),
             template_file_signature(config, self._app_base_dir),
+            self._action_bundle_signature(config),
         )
 
-    def _create_processor_from_config(self):
+    def _action_bundle_signature(self, config) -> tuple:
+        path = Path(str(getattr(config, "lstm_bundle_path", "") or "").strip())
+        if not path.is_absolute():
+            path = self._app_base_dir / path
+        files = []
+        for name in ("best_lstm.pt", "contract.json", "runtime_manifest.json"):
+            target = path / name
+            try:
+                digest = hashlib.sha256()
+                with target.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                files.append((name, digest.hexdigest()))
+            except OSError:
+                files.append((name, None))
+        return (
+            bool(getattr(config, "action_order_constraint_enabled", False)),
+            bool(getattr(config, "roi_inspection_enabled", False)),
+            str(path.resolve()), tuple(files),
+        )
+
+    def _create_processor_from_config(self, config=None):
         """创建新处理器。测试可注入 factory，生产路径复用 main.create_yolo_processor。"""
         if self._processor_factory is not None:
-            return self._processor_factory(self.config, app_base_dir=self._app_base_dir)
+            return self._processor_factory(config or self.config, app_base_dir=self._app_base_dir)
         from main import create_yolo_processor
 
-        return create_yolo_processor(self.config, app_base_dir=self._app_base_dir)
+        return create_yolo_processor(config or self.config, app_base_dir=self._app_base_dir)
 
     def _apply_runtime_model_config(self) -> bool:
         """模型相关配置变化时重载处理器，失败时保留旧处理器。"""
@@ -1855,10 +2468,14 @@ class MainWindow(QMainWindow):
             self.worker.stop_inference()
 
         self._status_label.setText("模型加载中...")
-        self._status_label.setStyleSheet(text_style(TEXT_SECONDARY, size=14, weight=700))
+        self._status_label.setStyleSheet(_status_badge_style(TEXT_SECONDARY))
 
         try:
-            new_processor = self._create_processor_from_config()
+            new_processor = (
+                self._create_processor_from_config()
+                if self.processor is None or new_signature[:-1] != self._runtime_model_signature[:-1]
+                else self.processor
+            )
         except Exception as exc:
             self._runtime_logger.exception(
                 "processor_reload=failed configured_model=%s",
@@ -1890,12 +2507,13 @@ class MainWindow(QMainWindow):
             self._status_label.setText("检测中")
         else:
             self._status_label.setText("模型已加载")
-        self._status_label.setStyleSheet(text_style(TEXT_ACCENT, size=14, weight=700))
+        self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
         return True
 
     def _rebuild_step_engine(self) -> None:
         """根据最新配置重建步骤引擎，保证 UI 卡片和判定顺序一致。"""
         self._step_engine_signature = self._step_engine_config_signature(self.config)
+        self._configure_lstm_action()
         if self.step_engine is None:
             return
         self.step_engine = StepSequenceEngine(
@@ -1905,9 +2523,169 @@ class MainWindow(QMainWindow):
             out_of_order_frames=self.config.action_ng_stable_frames,
             leave_stable_frames=getattr(self.config, "action_leave_stable_frames", 4),
             order_constraint_enabled=self.config.action_order_constraint_enabled,
+            fail_retry_enabled=getattr(self.config, "action_fail_retry_enabled", False),
+            fail_retry_frames=getattr(self.config, "action_ng_stable_frames", 10),
+            detection_updates=not self._uses_lstm_sequence(),
         )
         self._sticky_ng_step_idx = -1
         self._last_step_focus_key = None
+
+    def _uses_lstm_sequence(self) -> bool:
+        from lstm_action.bundle import uses_lstm_sequence
+
+        return uses_lstm_sequence(self.config)
+
+    def _resolved_bundle_dir(self, config) -> Path | None:
+        raw = str(getattr(config, "lstm_bundle_path", "") or "").strip()
+        if not raw:
+            return None
+        path = Path(raw)
+        if not path.is_absolute():
+            path = self._app_base_dir / path
+        try:
+            return path.resolve()
+        except OSError:
+            return path
+
+    def _loaded_action_folder_name(self) -> str:
+        session = self.worker.get_action_session() if hasattr(self, "worker") else None
+        directory = getattr(getattr(session, "bundle", None), "directory", None)
+        if not directory:
+            return ""
+        return Path(directory).name
+
+    def _config_applied_text(self) -> str:
+        folder = self._loaded_action_folder_name()
+        if self._uses_lstm_sequence() and folder:
+            return f"配置已应用，动作模型已重新加载：{folder}"
+        return "配置已应用"
+
+    def _action_session_matches_config(self) -> bool:
+        session = self.worker.get_action_session() if hasattr(self, "worker") else None
+        expected = self._resolved_bundle_dir(self.config)
+        if expected is None:
+            return session is None
+        directory = getattr(getattr(session, "bundle", None), "directory", None)
+        if directory is None:
+            return session is not None
+        try:
+            return Path(directory).resolve() == expected
+        except OSError:
+            return Path(directory) == expected
+
+    def _reload_configured_action_model(self) -> None:
+        """保存后的动作模型如果还不是当前会话，立刻换成这份。"""
+        if not self._uses_lstm_sequence():
+            return
+        if not self._action_session_matches_config():
+            self._configure_lstm_action()
+        if hasattr(self, "lstm_action"):
+            self._show_lstm_state(self.lstm_action.state)
+
+    def _configure_lstm_action(self) -> None:
+        if not hasattr(self, "lstm_action"):
+            return
+        self._action_block_reason = ""
+        self._action_runtime_fault = ""
+        session = None
+        if self._uses_lstm_sequence():
+            session, reason = self._load_action_session()
+            self._action_block_reason = reason
+            state = self.lstm_action.state
+            state.loaded = session is not None
+            state.reason = "已加载" if session is not None else (reason or "未加载")
+            self._show_lstm_state(state)
+        else:
+            state = self.lstm_action.configure(
+                enabled=False,
+                contract_path=str(getattr(self.config, "lstm_contract_path", "") or ""),
+                category_names=list(getattr(self.config, "category_names", []) or []),
+                yolo_model_path=str(getattr(self.config, "yolo_model_path", "") or ""),
+            )
+            self._show_lstm_state(state)
+        if hasattr(self, "worker"):
+            self.worker.set_action_session(session)
+
+    def _load_action_session(self, config=None, processor=None):
+        from lstm_action.bundle import load_runtime_bundle
+        from lstm_action.stream import TimelineSession
+
+        config = config or self.config
+        processor = processor or self.processor
+        path = str(getattr(config, "lstm_bundle_path", "") or "").strip()
+        if not path:
+            return None, "顺序模式需要动作模型包，不能按 YOLO 放行"
+        try:
+            bundle_path = Path(path)
+            if not bundle_path.is_absolute():
+                bundle_path = self._app_base_dir / bundle_path
+            actual_processor = getattr(processor, "_inner", processor)
+            actual_yolo_path = getattr(actual_processor, "_model_path", None) or getattr(actual_processor, "model_path", None)
+            yolo_path = Path(actual_yolo_path or str(config.yolo_model_path))
+            if not yolo_path.is_absolute():
+                yolo_path = self._app_base_dir / yolo_path
+            class_names = processor.get_class_names() if processor is not None and hasattr(processor, "get_class_names") else []
+            class_names = list(class_names.values()) if isinstance(class_names, dict) else list(class_names)
+            bundle = load_runtime_bundle(
+                bundle_path,
+                category_names=list(config.category_names or []),
+                yolo_path=str(yolo_path),
+                yolo_conf=float(config.yolo_conf_threshold),
+                yolo_class_names=class_names or None,
+                step_counts=list(config.get_runtime_category_counts()),
+            )
+        except ValueError as exc:
+            return None, str(exc)
+        return TimelineSession(
+            bundle,
+            confirm_seconds=float(getattr(config, "action_switch_confirm_seconds", 0.5)),
+        ), ""
+
+    def _show_lstm_state(self, state) -> None:
+        if not hasattr(self, "_lstm_status_label"):
+            return
+        if not state.loaded:
+            self._lstm_status_label.setText(f"时序动作：{state.reason}")
+            return
+        if self._uses_lstm_sequence():
+            folder = self._loaded_action_folder_name()
+            if folder:
+                self._lstm_status_label.setText(f"时序动作：已加载 {folder}")
+            else:
+                self._lstm_status_label.setText("时序动作：连续模型已加载")
+            return
+        passed = "、".join(state.passed_categories) if state.passed_categories else "无"
+        self._lstm_status_label.setText(f"时序动作：{state.reason}，已 Pass {passed}")
+
+    def _show_action_progress(self, report: dict) -> None:
+        if not hasattr(self, "_lstm_status_label"):
+            return
+        phase = str(report.get("phase") or "")
+        action = str(report.get("action") or "")
+        seen = "、".join(report.get("seen_parts") or []) or "无"
+        missing = "、".join(report.get("missing_parts") or []) or "无"
+        if phase:
+            self._lstm_status_label.setText(f"时序动作：{phase} {action}，已见 {seen}，缺少 {missing}".strip())
+
+    def _update_lstm_action(self, data: dict, detections, image_size) -> None:
+        if not bool(getattr(self.config, "lstm_action_enabled", False)):
+            return
+        if not image_size:
+            return
+        width, height = int(image_size[0]), int(image_size[1])
+        rows = [{"label": d.label, "conf": d.conf, "box": d.box} for d in detections]
+        hands = []
+        for item in data.get("hand_landmarks") or []:
+            if isinstance(item, dict):
+                hands.append(item.get("points") or [])
+        state = self.lstm_action.update(
+            rows,
+            hands,
+            width,
+            height,
+            float(self.config.yolo_conf_threshold),
+        )
+        self._show_lstm_state(state)
 
     @Slot()
     def _on_close_clicked(self) -> None:

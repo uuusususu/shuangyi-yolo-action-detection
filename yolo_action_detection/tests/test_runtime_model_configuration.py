@@ -124,6 +124,7 @@ def test_config_page_save_persists_manual_categories_without_model_autofill(qapp
     page._step_inputs[0].setText("人工步骤A")
     page._step_inputs[1].setText("人工步骤B")
 
+    page._action_order_cb.setChecked(False)
     page._on_save()
 
     saved = json.loads(Path(config.get_config_path()).read_text(encoding="utf-8"))
@@ -143,6 +144,7 @@ def test_config_page_loads_and_saves_independent_result_sound_switches(qapp, tmp
     assert page._fail_sound_cb.isChecked() is False
     page._pass_sound_cb.setChecked(False)
     page._fail_sound_cb.setChecked(True)
+    page._action_order_cb.setChecked(False)
     page._on_save()
 
     saved = json.loads(Path(config.get_config_path()).read_text(encoding="utf-8"))
@@ -191,6 +193,50 @@ def test_normal_mode_result_sound_plays_once_per_round(qapp, tmp_path):
     window._update_step_display(state)
 
     assert sound.pass_calls == 1
+    window._round_pass_timer.stop()
+
+
+def test_ng_alarm_plays_once_per_round_and_refreshes_next_round(qapp, tmp_path):
+    config = _config(tmp_path)
+    config.roi_inspection_enabled = False
+    config.category_names = ["A", "B", "", "", "", ""]
+    config.category_counts = [1, 1, 1, 1, 1, 1]
+    config.fail_sound_enabled = True
+    config.round_cooldown_seconds = 60.0
+    sound = SoundSpy()
+    window = _window(
+        config,
+        lambda runtime_config, **_: DummyProcessor(runtime_config.yolo_model_path),
+        DummyProcessor("old"),
+        sound,
+    )
+    window.step_engine = StepSequenceEngine(
+        step_class_names=config.category_names,
+        step_counts=config.get_runtime_category_counts(),
+        enter_stable_frames=1,
+        fail_retry_enabled=True,
+        fail_retry_frames=1,
+    )
+    window._refresh_steps()
+    window.step_engine.start_round(require_first_step_rearm=False)
+    window.step_engine._mark_quantity_ng(window.step_engine._steps[1])
+    ng_state = window.step_engine.get_state()
+
+    window._update_step_display(ng_state)
+    window._update_step_display(ng_state)
+    assert sound.fail_calls == 1
+    assert window._overlay_box_color("B") == (0, 0, 255)
+
+    window._round_pass_timer.stop()
+    window._start_new_round_now()
+    assert window._overlay_box_color("B") == (0, 255, 128)
+    assert sound.fail_calls == 1
+
+    window.step_engine._mark_quantity_ng(window.step_engine._steps[1])
+    next_state = window.step_engine.get_state()
+    window._update_step_display(next_state)
+    window._update_step_display(next_state)
+    assert sound.fail_calls == 2
     window._round_pass_timer.stop()
 
 
@@ -243,6 +289,23 @@ def test_template_config_change_reloads_processor_and_updates_worker(qapp, tmp_p
     assert window.processor.name == "template-enabled"
 
 
+def test_recognition_style_switch_does_not_reload_processor(qapp, tmp_path):
+    config = _config(tmp_path)
+    old_processor = DummyProcessor("old")
+    created = []
+
+    def factory(*_args, **_kwargs):
+        created.append(True)
+        return DummyProcessor("reloaded")
+
+    window = _window(config, factory, old_processor)
+    config.roi_inspection_enabled = True
+    window._on_config_saved()
+
+    assert created == []
+    assert window.processor is old_processor
+
+
 def test_template_path_is_relative_to_actual_config_file(tmp_path):
     from main import resolve_template_path
 
@@ -261,7 +324,7 @@ def test_template_path_is_relative_to_actual_config_file(tmp_path):
     )
 
 
-def test_create_processor_fails_closed_when_enabled_template_is_missing(tmp_path, monkeypatch):
+def test_create_processor_skips_gate_when_enabled_template_is_missing(tmp_path, monkeypatch):
     import main as main_module
 
     class FakeOnnxProcessor(DummyProcessor):
@@ -272,14 +335,17 @@ def test_create_processor_fails_closed_when_enabled_template_is_missing(tmp_path
             return None
 
     config = _config(tmp_path)
-    config.roi_inspection_enabled = True
+    config.roi_inspection_enabled = False
     config.roi_template_enabled = True
     config.roi_template_path = "locator_template.png"
     config.roi_template_search_rect = {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}
     monkeypatch.setattr(main_module, "OnnxObbProcessor", FakeOnnxProcessor)
 
-    with pytest.raises(FileNotFoundError, match="定位模板"):
-        main_module.create_yolo_processor(config, app_base_dir=tmp_path)
+    processor = main_module.create_yolo_processor(config, app_base_dir=tmp_path)
+
+    from yolo_runtime.template_gated_processor import TemplateGatedProcessor
+    assert not isinstance(processor, TemplateGatedProcessor)
+    assert processor.get_class_names() == {0: "散热片"}
 
 
 def test_create_processor_wraps_yolo_when_template_is_valid(tmp_path, monkeypatch):
@@ -294,7 +360,7 @@ def test_create_processor_wraps_yolo_when_template_is_valid(tmp_path, monkeypatc
             return None
 
     config = _config(tmp_path)
-    config.roi_inspection_enabled = True
+    config.roi_inspection_enabled = False
     config.roi_template_enabled = True
     config.roi_template_path = "locator_template.png"
     config.roi_template_search_rect = {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}
@@ -311,6 +377,27 @@ def test_create_processor_wraps_yolo_when_template_is_valid(tmp_path, monkeypatc
 
     assert isinstance(processor, TemplateGatedProcessor)
     assert processor.get_class_names() == {0: "散热片"}
+
+
+def test_create_processor_rejects_corrupt_template_file(tmp_path, monkeypatch):
+    import main as main_module
+
+    class FakeOnnxProcessor(DummyProcessor):
+        def __init__(self, **_kwargs):
+            super().__init__("onnx", {0: "散热片"})
+
+        def load(self):
+            return None
+
+    config = _config(tmp_path)
+    config.roi_template_enabled = True
+    config.roi_template_path = "locator_template.png"
+    config.roi_template_search_rect = {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}
+    (tmp_path / "locator_template.png").write_bytes(b"not-a-template")
+    monkeypatch.setattr(main_module, "OnnxObbProcessor", FakeOnnxProcessor)
+
+    with pytest.raises(RuntimeError, match="定位模板"):
+        main_module.create_yolo_processor(config, app_base_dir=tmp_path)
 
 
 def test_saving_template_roi_does_not_reload_unrelated_runtime_processor(
@@ -460,6 +547,7 @@ def test_config_page_saves_manual_classes_then_reloads_the_selected_model(
     page._model_path_input.setText("new-model.onnx")
     page._step_inputs[0].setText("散热片")
 
+    page._action_order_cb.setChecked(False)
     page._on_save()
 
     assert warnings == []
@@ -553,6 +641,58 @@ def test_startup_step_engine_uses_configured_counts():
     ]
 
 
+def test_saving_cooldown_updates_active_hold_timer(qapp, tmp_path):
+    config = _config(tmp_path)
+    config.round_cooldown_seconds = 2.0
+    window = _window(
+        config,
+        lambda runtime_config, **_: DummyProcessor(runtime_config.yolo_model_path),
+        DummyProcessor("old"),
+    )
+    window.step_engine.start_round()
+    window._start_next_round_after_pass()
+    assert window._round_pass_timer.interval() == 2000
+
+    config.round_cooldown_seconds = 8.0
+    window._on_config_saved()
+
+    assert window._round_pass_timer.isActive()
+    assert window._round_pass_timer.interval() == 8000
+    window._round_pass_timer.stop()
+
+
+def test_hold_timer_skips_step_engine_update(qapp, tmp_path):
+    config = _config(tmp_path)
+    config.category_names = ["散热片", "", "", "", "", ""]
+    config.category_counts = [1, 1, 1, 1, 1, 1]
+    window = _window(
+        config,
+        lambda runtime_config, **_: DummyProcessor(runtime_config.yolo_model_path),
+        DummyProcessor("old"),
+    )
+    window.step_engine.start_round()
+    first = window.step_engine.update([_detection("散热片")])
+    window._update_step_display(first)
+    window._start_next_round_after_pass()
+    original_round = window.step_engine.get_state().round_id
+
+    window._on_overlay_updated({
+        "detections": [{
+            "class_id": 0,
+            "label": "散热片",
+            "conf": 0.9,
+            "track_id": 1,
+            "polygon": [(10, 10), (30, 10), (30, 30), (10, 30)],
+            "box": (10, 10, 30, 30),
+            "center": (20, 20),
+        }],
+        "source_frame_id": 2,
+    })
+
+    assert window.step_engine.get_state().round_id == original_round
+    window._round_pass_timer.stop()
+
+
 def test_round_cooldown_delays_next_round_start(qapp, tmp_path):
     config = _config(tmp_path)
     config.round_cooldown_seconds = 10.0
@@ -594,3 +734,58 @@ def test_runtime_recognition_list_holds_pass_and_quantity_during_cooldown(qapp, 
     assert item.quantity_text() == "4 / 4"
     assert window.step_engine.get_state().round_id == pass_state.round_id
     window._round_pass_timer.stop()
+
+
+def test_rebuild_step_engine_passes_fail_retry_settings(qapp, tmp_path):
+    config = _config(tmp_path)
+    config.roi_inspection_enabled = False
+    config.action_fail_retry_enabled = True
+    config.action_ng_stable_frames = 7
+    window = _window(
+        config,
+        lambda runtime_config, **_: DummyProcessor(runtime_config.yolo_model_path),
+        DummyProcessor("old"),
+    )
+    window._rebuild_step_engine()
+    assert window.step_engine._fail_retry_enabled is True
+    assert window.step_engine._fail_retry_frames == 7
+    signature = window._step_engine_config_signature(config)
+    assert True in signature
+    assert 7 in signature
+
+
+def test_config_page_round_trips_fail_retry(qapp, tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    page = ConfigPage(config)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: None)
+
+    assert page._fail_retry_cb.isChecked() is False
+    assert not hasattr(page, "_fail_retry_frames_input")
+
+    assert page._action_ng_frames_input.maximum() == 99999
+    page._action_ng_frames_input.setValue(200)
+    page._fail_retry_cb.setChecked(True)
+    page._action_order_cb.setChecked(False)
+    page._on_save()
+
+    saved = json.loads(Path(config.get_config_path()).read_text(encoding="utf-8"))
+    assert saved["action_fail_retry_enabled"] is True
+    assert saved["action_ng_stable_frames"] == 200
+
+
+def test_failed_action_mode_save_restores_the_previous_categories(qapp, tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config.action_order_constraint_enabled = True
+    config.roi_inspection_enabled = False
+    config.category_names = ["原来的步骤", "", "", "", "", ""]
+    page = ConfigPage(config)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: None)
+    page._action_order_cb.setChecked(True)
+    page._step_inputs[0].setText("包装")
+    page._lstm_bundle_input.setText("")
+
+    page._on_save()
+
+    assert config.category_names[0] == "原来的步骤"
+    assert not Path(config.get_config_path()).is_file() or "包装" not in Path(config.get_config_path()).read_text(encoding="utf-8")
+

@@ -15,12 +15,12 @@ from PySide6.QtWidgets import (
 )
 
 from ui.runtime_ui_tokens import (
-    CHIP_BG,
     FONT_BODY,
     FONT_METRIC,
+    FONT_MICRO,
     FONT_SECTION,
     FONT_SMALL,
-    FONT_TITLE,
+    MONO_FAMILY,
     PAGE_BG,
     PANEL_BG,
     PANEL_BG_ALT,
@@ -28,6 +28,9 @@ from ui.runtime_ui_tokens import (
     STEP_ACTIVE_BG,
     STEP_ACTIVE_BORDER,
     STEP_ACTIVE_TEXT,
+    STEP_PROGRESS_BG,
+    STEP_PROGRESS_BORDER,
+    STEP_PROGRESS_TEXT,
     STEP_LOCKED_BG,
     STEP_LOCKED_BORDER,
     STEP_LOCKED_TEXT,
@@ -49,76 +52,6 @@ from ui.runtime_ui_tokens import (
     frame_style,
     text_style,
 )
-
-
-class PanelSection(QFrame):
-    """Container panel with optional title."""
-
-    def __init__(self, title: str, *, background: str = PANEL_BG_ALT, parent=None):
-        super().__init__(parent)
-        self.setStyleSheet(frame_style(background, border=STROKE_MAIN, radius=12))
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(14, 14, 14, 14)
-        self._layout.setSpacing(10)
-        self.title_label = QLabel(title, self)
-        self.title_label.setStyleSheet(text_style(TEXT_ACCENT, size=FONT_SECTION, weight=700))
-        self._layout.addWidget(self.title_label)
-
-    @property
-    def content_layout(self) -> QVBoxLayout:
-        return self._layout
-
-
-class MetricCard(QFrame):
-    """Title + value card."""
-
-    def __init__(self, title: str, value: str = "0", parent=None):
-        super().__init__(parent)
-        self.setStyleSheet(frame_style(CHIP_BG, border=STROKE_SOFT, radius=8))
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setFixedHeight(40)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 3, 6, 3)
-        layout.setSpacing(0)
-        self.title_label = QLabel(title, self)
-        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.title_label.setStyleSheet(text_style(TEXT_SECONDARY, size=10, weight=700))
-        self.value_label = QLabel(value, self)
-        self.value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.value_label.setStyleSheet(text_style(TEXT_PRIMARY, size=14, weight=800))
-        layout.addWidget(self.title_label)
-        layout.addWidget(self.value_label)
-
-    def replace_value_widget(self, widget: QLabel) -> None:
-        layout = self.layout()
-        if layout is None:
-            return
-        layout.removeWidget(self.value_label)
-        self.value_label.deleteLater()
-        self.value_label = widget
-        widget.setParent(self)
-        layout.addWidget(widget)
-
-
-class DefectChip(QFrame):
-    """Name + percentage chip."""
-
-    def __init__(self, name: str, value: str = "0.00%", parent=None):
-        super().__init__(parent)
-        self.setStyleSheet(frame_style(CHIP_BG, border=STROKE_SOFT, radius=8))
-        self.setFixedHeight(44)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(8)
-        self.name_label = QLabel(name, self)
-        self.name_label.setStyleSheet(text_style(TEXT_SECONDARY, size=FONT_SMALL, weight=700))
-        self.value_label = QLabel(value, self)
-        self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.value_label.setStyleSheet(text_style(TEXT_SECONDARY, size=FONT_SMALL, weight=700))
-        layout.addWidget(self.name_label, 1)
-        layout.addWidget(self.value_label)
 
 
 class StatusBadge(QLabel):
@@ -230,7 +163,7 @@ class ConfigNavButton(QPushButton):
 class FormGroup(QFrame):
     """带标题的配置表单分组。"""
 
-    def __init__(self, title: str, parent=None):
+    def __init__(self, title: str, parent=None, number: str = ""):
         super().__init__(parent)
         self.setStyleSheet(frame_style(PANEL_BG, border=STROKE_MAIN, radius=8))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -239,7 +172,26 @@ class FormGroup(QFrame):
         outer.setSpacing(14)
         self.title_label = QLabel(title, self)
         self.title_label.setStyleSheet(text_style(TEXT_ACCENT, size=FONT_SECTION, weight=700))
-        outer.addWidget(self.title_label)
+        self.number_label: QLabel | None = None
+        if number:
+            head = QHBoxLayout()
+            head.setContentsMargins(0, 0, 0, 0)
+            head.setSpacing(10)
+            self.number_label = QLabel(number, self)
+            self.number_label.setStyleSheet(
+                text_style(
+                    TEXT_ACCENT,
+                    size=FONT_MICRO,
+                    weight=800,
+                    extra=f"font-family: '{MONO_FAMILY}';",
+                )
+            )
+            head.addWidget(self.number_label, 0, Qt.AlignmentFlag.AlignVCenter)
+            head.addWidget(self.title_label, 0, Qt.AlignmentFlag.AlignVCenter)
+            head.addStretch(1)
+            outer.addLayout(head)
+        else:
+            outer.addWidget(self.title_label)
         self._content = QWidget(self)
         self._content.setObjectName("formGroupContent")
         self._content.setStyleSheet("QWidget#formGroupContent { background: transparent; border: none; }")
@@ -339,6 +291,7 @@ class FooterActionBar(QFrame):
 _STEP_STATE_STYLE = {
     "waiting": (STEP_WAITING_BG, STEP_WAITING_BORDER, STEP_WAITING_TEXT, "等待", "等待上一步通过"),
     "active": (STEP_ACTIVE_BG, STEP_ACTIVE_BORDER, STEP_ACTIVE_TEXT, "检测中", "请执行当前步骤"),
+    "progress": (STEP_PROGRESS_BG, STEP_PROGRESS_BORDER, STEP_PROGRESS_TEXT, "进行中", "动作进行中"),
     "pass": (STEP_PASS_BG, STEP_PASS_BORDER, STEP_PASS_TEXT, "PASS", "已完成"),
     "ng": (STEP_NG_BG, STEP_NG_BORDER, STEP_NG_TEXT, "NG", "请重新执行当前步骤"),
     "locked": (STEP_LOCKED_BG, STEP_LOCKED_BORDER, STEP_LOCKED_TEXT, "锁定", "等待纠正前置步骤"),
@@ -391,7 +344,7 @@ class RecognitionListItem(QFrame):
             f"QFrame#recognitionListItem {{ background-color: {bg}; border: 1px solid {border}; border-radius: 8px; }}"
         )
         self._index_label.setStyleSheet(
-            f"background-color: {border}; color: {PAGE_BG}; border: none; border-radius: 7px; "
+            f"background-color: {border}; color: {PAGE_BG}; border: none; border-radius: 19px; "
             "font-size: 13px; font-weight: 800;"
         )
         self._name_label.setStyleSheet(text_style(TEXT_PRIMARY if state != "locked" else color, size=FONT_BODY, weight=700))
@@ -414,90 +367,6 @@ class RecognitionListItem(QFrame):
 
     def state_name(self) -> str:
         return self._state
-
-
-class StepCard(QFrame):
-    """大尺寸步骤检测卡片。
-
-    显示步骤序号(01/02/...)、名称、状态徽章和辅助提示。
-    通过 ``set_step_state`` 更新状态，状态色由统一 token 驱动。
-    """
-
-    def __init__(self, index: int, name: str, parent=None):
-        super().__init__(parent)
-        self._index = index
-        self.setMinimumHeight(104)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        outer = QHBoxLayout(self)
-        outer.setContentsMargins(14, 12, 14, 12)
-        outer.setSpacing(14)
-
-        # 序号圆角块
-        self._index_label = QLabel(f"{index:02d}", self)
-        self._index_label.setFixedSize(56, 56)
-        self._index_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        outer.addWidget(self._index_label, 0)
-
-        # 名称 + 提示
-        text_box = QVBoxLayout()
-        text_box.setContentsMargins(0, 0, 0, 0)
-        text_box.setSpacing(4)
-        self._name_label = QLabel(name, self)
-        self._name_label.setStyleSheet(text_style(TEXT_PRIMARY, size=FONT_SECTION, weight=700))
-        self._hint_label = QLabel("等待上一步通过", self)
-        self._hint_label.setStyleSheet(text_style(STEP_WAITING_TEXT, size=FONT_SMALL, weight=500))
-        text_box.addWidget(self._name_label)
-        text_box.addWidget(self._hint_label)
-        outer.addLayout(text_box, 1)
-
-        # 状态徽章
-        self._status_label = QLabel("等待", self)
-        self._status_label.setFixedSize(96, 40)
-        self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        outer.addWidget(self._status_label, 0)
-
-        self.set_step_state("waiting")
-
-    def set_step_state(self, state: str, *, hint: str | None = None) -> None:
-        """更新步骤卡片状态。state 取值: waiting/active/pass/ng/locked。"""
-        bg, border, color, status_text, default_hint = _STEP_STATE_STYLE.get(
-            state, _STEP_STATE_STYLE["waiting"]
-        )
-        min_height = {
-            "active": 116,
-            "ng": 116,
-            "waiting": 98,
-            "pass": 84,
-            "locked": 84,
-        }.get(state, 98)
-        border_width = 3 if state in {"active", "ng"} else 2
-        index_size = 56 if state in {"active", "ng"} else 48
-        status_height = 40 if state in {"active", "ng"} else 34
-        name_weight = 800 if state in {"active", "ng"} else 700
-        name_color = TEXT_PRIMARY if state not in {"pass", "locked"} else color
-        self.setMinimumHeight(min_height)
-        self._index_label.setFixedSize(index_size, index_size)
-        self._status_label.setFixedSize(96, status_height)
-        self.setStyleSheet(
-            f"QFrame {{ background-color: {bg}; border: {border_width}px solid {border}; border-radius: 12px; }}"
-        )
-        self._index_label.setStyleSheet(
-            f"background-color: {border}; color: #0B1636; border-radius: 10px; "
-            f"font-size: {22 if state in {'active', 'ng'} else 18}px; font-weight: 800;"
-        )
-        self._name_label.setStyleSheet(text_style(name_color, size=FONT_SECTION, weight=name_weight))
-        self._hint_label.setStyleSheet(text_style(color, size=FONT_SMALL, weight=700 if state == "ng" else 500))
-        self._hint_label.setText(hint if hint is not None else default_hint)
-        self._status_label.setStyleSheet(
-            f"background-color: {border}; color: #0B1636; border-radius: 8px; "
-            f"font-size: 15px; font-weight: 800;"
-        )
-        self._status_label.setText(status_text)
-
-    def set_quantity_progress(self, current: int, required: int) -> None:
-        """显示当前帧数量进度，如 3/4。"""
-        if required > 1:
-            self._hint_label.setText(f"{current}/{required}")
 
 
 class KpiRow(QFrame):

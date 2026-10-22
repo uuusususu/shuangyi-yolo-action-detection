@@ -5,7 +5,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
-from roi_inspection.geometry import NormalizedRect
+from roi_inspection.geometry import (
+    FULL_FRAME_RECT,
+    NormalizedRect,
+    usable_normalized_rect,
+)
 
 
 class RoundPhase(str, Enum):
@@ -59,7 +63,12 @@ class RoiInspectionConfig:
         return bool(self.template_enabled)
 
     @classmethod
-    def from_config(cls, config) -> "RoiInspectionConfig":
+    def from_config(
+        cls,
+        config,
+        *,
+        template_gate_active: Optional[bool] = None,
+    ) -> "RoiInspectionConfig":
         required_counts: Dict[str, int] = {}
         names = list(getattr(config, "category_names", []) or [])
         counts = list(getattr(config, "category_counts", []) or [])
@@ -68,10 +77,24 @@ class RoiInspectionConfig:
             if not name:
                 continue
             required_counts[name] = int(counts[index] if index < len(counts) else 1)
+        inspection_roi = usable_normalized_rect(
+            getattr(config, "roi_inspection_rect", None),
+            warn_label="识别 ROI",
+        )
+        if inspection_roi is None:
+            inspection_roi = FULL_FRAME_RECT
+        if template_gate_active is None:
+            template_gate_active = bool(getattr(config, "roi_template_enabled", False)) and (
+                usable_normalized_rect(
+                    getattr(config, "roi_template_search_rect", None),
+                    warn_label="搜索 ROI",
+                )
+                is not None
+            )
         return cls(
-            inspection_roi=NormalizedRect.from_mapping(config.roi_inspection_rect),
+            inspection_roi=inspection_roi,
             required_counts=required_counts,
-            template_enabled=bool(getattr(config, "roi_template_enabled", False)),
+            template_enabled=bool(template_gate_active),
             pass_stable_frames=getattr(config, "action_pass_stable_frames", 1),
             fail_stable_frames=getattr(config, "action_ng_stable_frames", 10),
             round_interval_seconds=getattr(config, "round_cooldown_seconds", 0.0),

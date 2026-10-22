@@ -46,10 +46,15 @@ class DetectionOverlayState:
     error: str = ""
     round_id: int = 0
     latency_ms: float = 0.0
+    # 分段耗时：latency_ms 的口径随处理器而变，定位慢还是推理慢要靠这两项区分。
+    template_ms: float = 0.0
+    yolo_ms: float = 0.0
     template_matched: bool = False
     template_score: float = 0.0
     template_center: Optional[Tuple[float, float]] = None
     template_angle: Optional[float] = None
+    # 顺序模式手部骨架，只给显示用；ROI / 步骤引擎不要读这个字段。
+    hand_landmarks: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -60,6 +65,11 @@ class PipelineStats:
     infer_fps: float = 0.0
     dropped_for_infer: int = 0
     infer_latency_ms: float = 0.0
+    # 从取到一帧到画面更新的四段耗时，用来定位"框追不上目标"到底卡在哪一段。
+    capture_ms: float = 0.0
+    template_ms: float = 0.0
+    yolo_ms: float = 0.0
+    render_ms: float = 0.0
     task_type: str = "ultralytics_obb"
     model_path: str = ""
 
@@ -70,6 +80,10 @@ class PipelineStats:
             "infer_fps": float(self.infer_fps),
             "dropped_for_infer": int(self.dropped_for_infer),
             "infer_latency_ms": float(self.infer_latency_ms),
+            "capture_ms": float(self.capture_ms),
+            "template_ms": float(self.template_ms),
+            "yolo_ms": float(self.yolo_ms),
+            "render_ms": float(self.render_ms),
             "task_type": str(self.task_type),
             "model_path": str(self.model_path),
         }

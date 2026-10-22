@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
 
 from ui.runtime_ui_tokens import (
     CONFIG_NAV_WIDTH,
+    FONT_MICRO,
+    MONO_FAMILY,
     PAGE_BG,
     PANEL_BG_DARK,
     STROKE_MAIN,
@@ -42,13 +44,8 @@ from template_matching.template_store import (
     read_optional_bytes,
     replace_file_atomically,
     restore_file,
-    shape_model_settings,
 )
 from template_matching.shape_model import ShapeModel, ShapeModelSettings
-
-
-class _HeadroomError(ValueError):
-    """搜索框平移余量不足，消息已是给操作员看的完整文案。"""
 
 
 class ConfigPage(QWidget):
@@ -64,11 +61,13 @@ class ConfigPage(QWidget):
         config,
         stats_manager=None,
         roi_frame_provider=None,
+        config_committer=None,
     ) -> None:
         super().__init__()
         self.config = config
         self._stats_manager = stats_manager
         self._roi_frame_provider = roi_frame_provider
+        self._config_committer = config_committer
         self._camera_devices = []
         self._camera_enumeration_error = ""
         self._saved_feedback_timer = QTimer(self)
@@ -76,6 +75,7 @@ class ConfigPage(QWidget):
         self._saved_feedback_timer.timeout.connect(self._hide_saved_feedback)
         self._build_ui()
         self._load_values()
+        self._sync_model_dependent_fields()
         self.refresh_stats_display()
 
     def _build_ui(self) -> None:
@@ -96,21 +96,44 @@ class ConfigPage(QWidget):
         self._sidebar_back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._sidebar_back_btn.clicked.connect(self.back_clicked.emit)
         side_layout.addWidget(self._sidebar_back_btn)
-        brand = QLabel("系统配置")
+        brand_row = QWidget(sidebar)
+        brand_row.setStyleSheet("background: transparent;")
+        brand_layout = QHBoxLayout(brand_row)
+        brand_layout.setContentsMargins(4, 0, 0, 0)
+        brand_layout.setSpacing(8)
+        brand_dot = QLabel(brand_row)
+        brand_dot.setFixedSize(8, 8)
+        brand_dot.setStyleSheet(f"background-color: {TEXT_ACCENT}; border: none; border-radius: 4px;")
+        brand = QLabel("系统配置", brand_row)
         brand.setStyleSheet(text_style(TEXT_PRIMARY, size=20, weight=800))
-        side_layout.addWidget(brand)
+        brand_layout.addWidget(brand_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        brand_layout.addWidget(brand, 0, Qt.AlignmentFlag.AlignVCenter)
+        brand_layout.addStretch(1)
+        side_layout.addWidget(brand_row)
         subtitle = QLabel("视觉行为引导系统")
         subtitle.setStyleSheet(text_style(TEXT_MUTED, size=12, weight=500))
+        subtitle.setContentsMargins(4, 0, 0, 0)
         side_layout.addWidget(subtitle)
         side_layout.addSpacing(18)
 
         section_titles = ["模型与步骤", "动作判定", "工业相机", "显示与反馈", "ROI 配置", "生产统计"]
         self._nav_buttons = []
+        self._nav_index_labels = []
         for index, title in enumerate(section_titles):
-            button = ConfigNavButton(title)
+            row = QWidget(sidebar)
+            row.setStyleSheet("background: transparent;")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(9)
+            index_label = QLabel(f"{index + 1:02d}", row)
+            index_label.setStyleSheet(self._nav_index_style(False))
+            button = ConfigNavButton(title, row)
             button.clicked.connect(lambda _checked=False, i=index: self._show_section(i))
-            side_layout.addWidget(button)
+            row_layout.addWidget(index_label, 0, Qt.AlignmentFlag.AlignVCenter)
+            row_layout.addWidget(button, 1)
+            side_layout.addWidget(row)
             self._nav_buttons.append(button)
+            self._nav_index_labels.append(index_label)
         side_layout.addStretch(1)
         version = QLabel(f"CONFIG SCHEMA · v{CURRENT_CONFIG_SCHEMA_VERSION}")
         version.setStyleSheet(text_style(TEXT_MUTED, size=11, weight=500))
@@ -156,6 +179,7 @@ class ConfigPage(QWidget):
         self._build_feedback_section(feedback_layout)
         self._build_region_section(region_layout)
         self._build_stats_section(stats_layout)
+        self._model_path_input.textChanged.connect(self._sync_model_dependent_fields)
 
         self._footer = FooterActionBar(content)
         self._save_btn = self._footer.save_button
@@ -234,7 +258,7 @@ class ConfigPage(QWidget):
         group.content_layout.addWidget(container)
 
     def _build_model_section(self, layout: QVBoxLayout) -> None:
-        model_group = FormGroup("YOLO OBB 模型")
+        model_group = FormGroup("YOLO OBB 模型", number="01 / MODEL")
         self._model_path_input = QLineEdit()
         self._select_model_btn = QPushButton("浏览")
         self._select_model_btn.setMinimumWidth(84)
@@ -247,23 +271,19 @@ class ConfigPage(QWidget):
         path_layout.addWidget(self._select_model_btn)
         self._conf_input = QDoubleSpinBox(); self._conf_input.setRange(0.0, 1.0); self._conf_input.setSingleStep(0.05)
         self._iou_input = QDoubleSpinBox(); self._iou_input.setRange(0.0, 1.0); self._iou_input.setSingleStep(0.05)
-        self._device_input = QLineEdit(); self._device_input.setPlaceholderText("留空自动选择")
         self._tracker_input = QComboBox(); self._tracker_input.addItems(["bytetrack.yaml", "botsort.yaml"])
-        self._max_det_input = QSpinBox(); self._max_det_input.setRange(1, 1000)
         self._add_form_grid(model_group, [
             (FormField("模型文件路径", path_row, "支持 .pt 与 .onnx，保存后将重新加载模型。"), True),
             (FormField("置信度阈值", self._conf_input), False),
             (FormField("IoU 阈值", self._iou_input), False),
-            (FormField("推理设备", self._device_input), False),
             (FormField("跟踪器", self._tracker_input), False),
-            (FormField("最大检测数量", self._max_det_input), False),
         ])
         persist_row = SwitchRow("持续跟踪", "跨帧保持目标 Track ID。")
         self._track_persist_cb = persist_row.checkbox
         model_group.content_layout.addWidget(persist_row)
         self._insert_group(layout, model_group)
 
-        steps_group = FormGroup("类别步骤与数量")
+        steps_group = FormGroup("类别步骤与数量", number="02 / STEPS")
         steps_container = self._transparent_container(steps_group)
         steps_grid = QGridLayout(steps_container)
         steps_grid.setContentsMargins(0, 0, 0, 0)
@@ -289,22 +309,58 @@ class ConfigPage(QWidget):
         self._insert_group(layout, steps_group)
 
     def _build_action_section(self, layout: QVBoxLayout) -> None:
-        group = FormGroup("动作通过与异常判定")
-        self._action_pass_frames_input = QSpinBox(); self._action_pass_frames_input.setRange(1, 30)
-        self._action_ng_frames_input = QSpinBox(); self._action_ng_frames_input.setRange(1, 30)
+        group = FormGroup("动作通过与异常判定", number="03 / JUDGE")
+        self._action_pass_frames_input = QSpinBox(); self._action_pass_frames_input.setRange(1, 99999)
+        self._action_ng_frames_input = QSpinBox(); self._action_ng_frames_input.setRange(1, 99999)
         self._cooldown_input = QDoubleSpinBox(); self._cooldown_input.setRange(0.0, 60.0); self._cooldown_input.setSingleStep(0.5)
+        self._switch_confirm_input = QDoubleSpinBox()
+        self._switch_confirm_input.setRange(0.1, 5.0)
+        self._switch_confirm_input.setSingleStep(0.1)
+        self._switch_confirm_input.setDecimals(1)
         self._add_form_grid(group, [
             (FormField("通过稳定帧数", self._action_pass_frames_input), False),
             (FormField("NG 稳定帧数", self._action_ng_frames_input), False),
             (FormField("完成一轮间隔（秒）", self._cooldown_input, "PASS 或 NG 后保持结果颜色，到间隔结束再开始新一轮。"), False),
+            (FormField("动作切换确认（秒）", self._switch_confirm_input, "切到下一个动作后，新动作连续保持这么久，上一个动作就完成。"), False),
         ])
         order_row = SwitchRow("步骤顺序约束", "防止跳步或越序操作。")
         self._action_order_cb = order_row.checkbox
         group.content_layout.addWidget(order_row)
+        lstm_row = SwitchRow("时序动作", "顺序约束开启且未启用 ROI 时，由连续 LSTM 判定完整动作。这个开关不再单独放行。")
+        self._lstm_action_cb = lstm_row.checkbox
+        self._lstm_action_cb.setEnabled(False)
+        group.content_layout.addWidget(lstm_row)
+        self._lstm_contract_input = QLineEdit()
+        self._lstm_contract_input.setPlaceholderText("旧契约路径，仅兼容保留")
+        self._lstm_bundle_input = QLineEdit()
+        self._lstm_bundle_input.setPlaceholderText("选择训练出来的模型文件夹")
+        self._select_action_bundle_btn = QPushButton("浏览")
+        self._select_action_bundle_btn.setMinimumWidth(84)
+        self._select_action_bundle_btn.clicked.connect(self._on_select_action_bundle)
+        bundle_row = self._transparent_container()
+        bundle_layout = QHBoxLayout(bundle_row)
+        bundle_layout.setContentsMargins(0, 0, 0, 0)
+        bundle_layout.setSpacing(8)
+        bundle_layout.addWidget(self._lstm_bundle_input, 1)
+        bundle_layout.addWidget(self._select_action_bundle_btn)
+        self._add_form_grid(group, [
+            (FormField("时序契约", self._lstm_contract_input), False),
+            (FormField(
+                "动作模型包",
+                bundle_row,
+                "点浏览选择训练文件夹。有手部、没手部都可以，程序按文件夹里的契约决定。",
+            ), True),
+        ])
+        retry_row = SwitchRow(
+            "类别/数量失败重试",
+            "打开后复用上面的「NG 稳定帧数」：第 1 步到位后，当前步未检出或数量不符时连续累计，满则报 NG。",
+        )
+        self._fail_retry_cb = retry_row.checkbox
+        group.content_layout.addWidget(retry_row)
         self._insert_group(layout, group)
 
     def _build_camera_section(self, layout: QVBoxLayout) -> None:
-        group = FormGroup("工业相机参数")
+        group = FormGroup("工业相机参数", number="04 / CAMERA")
         device_row = self._transparent_container(group)
         device_layout = QHBoxLayout(device_row)
         device_layout.setContentsMargins(0, 0, 0, 0)
@@ -328,14 +384,8 @@ class ConfigPage(QWidget):
             )
         )
         group.content_layout.addWidget(self._camera_device_status)
-        self._cam_mode_input = QComboBox(); self._cam_mode_input.addItems(["preserve", "load_group", "load_file", "manual"])
-        self._cam_group_input = QSpinBox(); self._cam_group_input.setRange(0, 16)
-        self._cam_file_input = QLineEdit(); self._cam_file_input.setPlaceholderText("load_file 模式使用")
         self._cam_exp_input = QSpinBox(); self._cam_exp_input.setRange(100, 1000000)
         self._add_form_grid(group, [
-            (FormField("参数模式", self._cam_mode_input, "preserve 不覆盖；load_group / load_file 加载已有参数；manual 手动设置。"), False),
-            (FormField("参数组编号", self._cam_group_input), False),
-            (FormField("参数文件路径", self._cam_file_input), True),
             (FormField("手动曝光（us）", self._cam_exp_input), False),
         ])
         self._insert_group(layout, group)
@@ -415,8 +465,19 @@ class ConfigPage(QWidget):
             None,
         )
 
+    def _sync_model_dependent_fields(self) -> None:
+        """按模型类型置灰无效参数。
+
+        .onnx 走的是本项目自己的 ONNX Runtime 推理与后处理，Ultralytics 的
+        跟踪器、持续跟踪都不参与，也不会产出 Track ID；留着可编辑只会让现场以为调了有用。
+        """
+        is_onnx = str(self._model_path_input.text()).strip().lower().endswith(".onnx")
+        for widget in (self._tracker_input, self._track_persist_cb,
+                       self._show_tid_cb):
+            widget.setEnabled(not is_onnx)
+
     def _build_feedback_section(self, layout: QVBoxLayout) -> None:
-        overlay_group = FormGroup("画面叠加")
+        overlay_group = FormGroup("画面叠加", number="05 / OVERLAY")
         conf_row = SwitchRow("显示置信度", "在检测框标签中显示模型分数。")
         self._show_conf_cb = conf_row.checkbox
         tid_row = SwitchRow("显示 Track ID", "显示持续跟踪目标编号。")
@@ -425,7 +486,7 @@ class ConfigPage(QWidget):
         overlay_group.content_layout.addWidget(tid_row)
         self._insert_group(layout, overlay_group)
 
-        feedback_group = FormGroup("操作反馈")
+        feedback_group = FormGroup("操作反馈", number="06 / FEEDBACK")
         pass_sound_row = SwitchRow("PASS 提示音", "每个通过轮次最多播放一次提示音。")
         self._pass_sound_cb = pass_sound_row.checkbox
         fail_sound_row = SwitchRow("FAIL 提示音", "每个异常轮次最多播放一次提示音。")
@@ -438,11 +499,11 @@ class ConfigPage(QWidget):
         self._insert_group(layout, feedback_group)
 
     def _build_region_section(self, layout: QVBoxLayout) -> None:
-        group = FormGroup("ROI 定位检测")
+        group = FormGroup("ROI 定位检测", number="08 / ROI")
         self._region_title_label = group.title_label
         enabled_row = SwitchRow(
             "启用 ROI 定位检测",
-            "在识别 ROI 内统计全部平级待检类别的精确数量并判定 PASS/FAIL。",
+            "只切换认法：打开后不按顺序、按配置数量同时计数。关闭则按步骤顺序计数。已保存的 ROI 两种认法都会加载。",
         )
         self._roi_enabled_cb = enabled_row.checkbox
         self._roi_enabled_cb.stateChanged.connect(self._on_mode_changed)
@@ -479,9 +540,8 @@ class ConfigPage(QWidget):
                 "0 表示按模板尺寸自动推算（推荐）。金字塔搜索下放宽角度范围几乎不增加耗时。",
             ), False),
         ])
-        self._insert_group(layout, group)
 
-        diag_group = FormGroup("模板匹配诊断（现场测试用）")
+        diag_group = FormGroup("模板匹配诊断（现场测试用）", number="09 / DIAG")
         diag_row = SwitchRow(
             "记录模板匹配诊断日志",
             "每帧记录逐角度得分曲线、定位抖动、耗时和失败原因，写入 logs/template_sessions。",
@@ -508,9 +568,8 @@ class ConfigPage(QWidget):
         self._diag_status_label.setWordWrap(True)
         self._diag_status_label.setStyleSheet(text_style(TEXT_MUTED, size=12, weight=600))
         diag_group.content_layout.addWidget(self._diag_status_label)
-        self._insert_group(layout, diag_group)
 
-        editor_group = FormGroup("静态画面与 ROI")
+        editor_group = FormGroup("静态画面与 ROI", number="07 / ROI EDITOR")
         toolbar = self._transparent_container(editor_group)
         toolbar_layout = QHBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
@@ -520,7 +579,7 @@ class ConfigPage(QWidget):
         self._roi_kind_input.addItem("识别 ROI", RoiKind.INSPECTION.value)
         self._roi_kind_input.addItem("模板 ROI", RoiKind.LOCATOR.value)
         self._roi_kind_input.addItem("搜索 ROI", RoiKind.SEARCH.value)
-        self._create_roi_btn = QPushButton("创建/替换 ROI")
+        self._create_roi_btn = QPushButton("创建 ROI")
         self._delete_roi_btn = QPushButton("删除 ROI")
         self._refresh_roi_frame_btn.clicked.connect(self._refresh_roi_frame)
         self._roi_kind_input.currentIndexChanged.connect(self._on_roi_kind_changed)
@@ -550,12 +609,15 @@ class ConfigPage(QWidget):
         roi_save_layout.addStretch(1)
         editor_group.content_layout.addWidget(roi_save_actions)
         self._on_roi_kind_changed(self._roi_kind_input.currentIndex())
+        # 面板顺序对齐设计稿：编辑器 → 定位 → 诊断
         self._insert_group(layout, editor_group)
+        self._insert_group(layout, group)
+        self._insert_group(layout, diag_group)
         self._update_roi_controls()
         self._sync_template_inputs_enabled()
 
     def _build_stats_section(self, layout: QVBoxLayout) -> None:
-        self._stats_group = FormGroup("生产统计")
+        self._stats_group = FormGroup("生产统计", number="10 / STATS")
         stats_row = self._transparent_container(self._stats_group)
         stats_grid = QGridLayout(stats_row)
         stats_grid.setContentsMargins(0, 0, 0, 0)
@@ -572,11 +634,9 @@ class ConfigPage(QWidget):
         stats_grid.addWidget(self._stats_ng_label, 1, 2)
         stats_grid.addWidget(self._stats_yield_label, 1, 3)
         self._stats_group.content_layout.addWidget(stats_row)
-        self._target_input = QSpinBox(); self._target_input.setRange(0, 99999)
-        self._stats_group.content_layout.addWidget(FormField("今日目标产能", self._target_input))
         self._insert_group(layout, self._stats_group)
 
-        actions = FormGroup("批次操作")
+        actions = FormGroup("批次操作", number="11 / BATCH")
         hint = QLabel("归零前先保存当前生产记录，再开始新批次。无计数时只刷新批次开始时间。")
         hint.setWordWrap(True)
         hint.setStyleSheet(text_style(TEXT_MUTED, size=13, weight=500))
@@ -588,12 +648,25 @@ class ConfigPage(QWidget):
         actions.content_layout.addWidget(self._reset_btn, 0, Qt.AlignmentFlag.AlignLeft)
         self._insert_group(layout, actions)
 
+    @staticmethod
+    def _nav_index_style(active: bool) -> str:
+        return text_style(
+            TEXT_ACCENT if active else TEXT_MUTED,
+            size=FONT_MICRO,
+            weight=700,
+            extra=f"font-family: '{MONO_FAMILY}'; letter-spacing: 0.08em;",
+        )
+
     def _show_section(self, index: int) -> None:
         if not 0 <= index < self._section_stack.count():
             return
         self._section_stack.setCurrentIndex(index)
-        for button_index, button in enumerate(self._nav_buttons):
-            button.setChecked(button_index == index)
+        for button_index, (button, index_label) in enumerate(
+            zip(self._nav_buttons, self._nav_index_labels)
+        ):
+            active = button_index == index
+            button.setChecked(active)
+            index_label.setStyleSheet(self._nav_index_style(active))
         self._section_title_label.setText(self._nav_buttons[index].text())
 
     def _label(self, text: str) -> QLabel:
@@ -640,89 +713,39 @@ class ConfigPage(QWidget):
             return
         self._save_plain_roi(kind, rect)
 
-    # ------------------------------------------------------------------
-    # 搜索框余量校验
-    # ------------------------------------------------------------------
-    def _current_search_rect(self) -> Optional[NormalizedRect]:
-        """优先取编辑器里当前的搜索框草稿，没有则退回配置里已存的值。"""
-        draft = self._roi_editor.roi_rect(RoiKind.SEARCH)
-        if draft is not None:
-            return draft
-        saved = getattr(self.config, "roi_template_search_rect", None)
-        if not saved:
-            return None
-        try:
-            return NormalizedRect.from_mapping(saved)
-        except ValueError:
-            return None
-
-    def _required_travel_px(self, model: ShapeModel) -> int:
-        """搜索框相对模板必须留出的最小平移余量。"""
-        short_side = min(model.template_size)
-        ratio = float(getattr(self.config, "roi_template_min_travel_ratio", 0.30))
-        floor = int(getattr(self.config, "roi_template_min_travel_px", 40))
-        return max(floor, int(round(short_side * ratio)))
-
-    def _search_headroom_error(
-        self,
-        model: ShapeModel,
-        search: Optional[NormalizedRect],
-    ) -> str:
-        """搜索框余量不足时返回给操作员看的失败原因；足够则返回空串。
-
-        余量 = 搜索框尺寸 - 最大旋转包围盒。它必须大于工位停位波动，
-        否则模板永远对不准，现场表现为"随机不触发"。
-        """
-        if not self._roi_editor.has_frame:
-            return "没有可用画面，无法校验搜索框尺寸"
-        if search is None:
-            return "请先创建并框选搜索 ROI，再保存模板"
+    def _template_self_check_rect(self, model: ShapeModel, template_rect: NormalizedRect) -> dict:
+        """回查窗口从模板 ROI 向四周扩到算法最小窗，不够则用整图。不用搜索 ROI。"""
         frame_h, frame_w = self._roi_editor.frame_shape[:2]
-        _x, _y, roi_w, roi_h = search.to_pixel_rect((frame_w, frame_h))
-        travel = model.center_travel((int(roi_w), int(roi_h)))
-        need = self._required_travel_px(model)
-        required = model.min_search_size(need)
-        bbox = model.rotated_bbox(0)
-        if travel[0] >= need and travel[1] >= need:
-            return ""
-        return (
-            f"搜索框太小，保存失败。\n\n"
-            f"模板尺寸 {model.template_size[0]}×{model.template_size[1]}，"
-            f"±{abs(model.settings.angle_start):.0f}° 旋转后包围盒 {bbox[0]}×{bbox[1]}。\n"
-            f"当前搜索框 {int(roi_w)}×{int(roi_h)}，只剩 {travel[0]}×{travel[1]} 像素平移余量。\n\n"
-            f"需要至少 {required[0]}×{required[1]}（两个方向各留 {need} 像素余量）。\n"
-            f"余量不足会导致旋转候选被丢弃、工件稍有偏移就对不准，"
-            f"现场表现为随机不触发。请把搜索框画大一些。"
-        )
+        x, y, width, height = template_rect.to_pixel_rect((frame_w, frame_h))
+        need_w, need_h = model.min_search_size(2)
+        extra_w = max(0, int(need_w - width))
+        extra_h = max(0, int(need_h - height))
+        x0 = max(0, int(round(x - extra_w / 2)))
+        y0 = max(0, int(round(y - extra_h / 2)))
+        x1 = min(frame_w, int(round(x + width + extra_w / 2)))
+        y1 = min(frame_h, int(round(y + height + extra_h / 2)))
+        if (x1 - x0) < need_w or (y1 - y0) < need_h:
+            return {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}
+        return {
+            "x": x0 / frame_w,
+            "y": y0 / frame_h,
+            "width": (x1 - x0) / frame_w,
+            "height": (y1 - y0) / frame_h,
+        }
 
-    def _headroom_hint(self, model: ShapeModel, search: Optional[NormalizedRect]) -> str:
-        if search is None or not self._roi_editor.has_frame:
-            return ""
-        frame_h, frame_w = self._roi_editor.frame_shape[:2]
-        _x, _y, roi_w, roi_h = search.to_pixel_rect((frame_w, frame_h))
-        travel = model.center_travel((int(roi_w), int(roi_h)))
-        return f"搜索框平移余量 {travel[0]}×{travel[1]}px"
-
-    def _save_plain_roi(self, kind: RoiKind, rect: NormalizedRect) -> None:
-        field_name, label = {
+    def _roi_field(self, kind: RoiKind) -> tuple[str, str]:
+        return {
             RoiKind.SEARCH: ("roi_template_search_rect", "搜索 ROI"),
             RoiKind.INSPECTION: ("roi_inspection_rect", "识别 ROI"),
+            RoiKind.LOCATOR: ("roi_template_rect", "模板 ROI"),
         }[kind]
+
+    def _persist_roi_field(self, field_name: str, label: str, value) -> bool:
         try:
             config_path = self._roi_config_path()
         except ValueError as exc:
             QMessageBox.warning(self, "ROI 保存失败", str(exc))
-            return
-
-        # 保存搜索框时若已有模型，同样校验余量：防止先存模板、后把框改小。
-        if kind is RoiKind.SEARCH:
-            model = self._existing_shape_model(config_path)
-            if model is not None:
-                error = self._search_headroom_error(model, rect)
-                if error:
-                    QMessageBox.warning(self, "搜索 ROI 保存失败", error)
-                    self._roi_frame_status.setText("搜索框太小，未保存")
-                    return
+            return False
 
         previous_config = config_path.read_bytes() if config_path.is_file() else None
         previous_schema = self.config.config_schema_version
@@ -730,7 +753,7 @@ class ConfigPage(QWidget):
         temp_config = config_path.with_name(f".{config_path.name}.tmp")
         try:
             self.config.config_schema_version = CURRENT_CONFIG_SCHEMA_VERSION
-            setattr(self.config, field_name, rect.to_mapping())
+            setattr(self.config, field_name, value)
             self.config.save(temp_config)
             replace_file_atomically(temp_config, config_path)
         except Exception as exc:
@@ -739,20 +762,15 @@ class ConfigPage(QWidget):
             self.config.config_schema_version = previous_schema
             setattr(self.config, field_name, previous_rect)
             QMessageBox.warning(self, "ROI 保存失败", f"{label} 保存失败：{exc}")
-            return
+            return False
+        return True
 
+    def _save_plain_roi(self, kind: RoiKind, rect: NormalizedRect) -> None:
+        field_name, label = self._roi_field(kind)
+        if not self._persist_roi_field(field_name, label, rect.to_mapping()):
+            return
         self._roi_frame_status.setText(f"{label} 已单独保存")
         self._show_saved_feedback()
-
-    def _existing_shape_model(self, config_path) -> Optional[ShapeModel]:
-        """已保存的形状模型；不存在或读不出来返回 None。"""
-        model_path = config_path.parent / DEFAULT_MODEL_NAME
-        if not model_path.is_file():
-            return None
-        try:
-            return ShapeModel.load(model_path, shape_model_settings(self.config))
-        except Exception:
-            return None
 
     def _save_template_roi(self, rect: NormalizedRect) -> None:
         """只用模板 ROI 创建并自检模板，不依赖搜索或识别 ROI。"""
@@ -802,17 +820,11 @@ class ConfigPage(QWidget):
                 created_frame_size=(int(frame_w), int(frame_h)),
             )
 
-            # 搜索框余量校验：不足直接拒绝保存（现场就是栽在这一条上）。
-            search = self._current_search_rect()
-            headroom_error = self._search_headroom_error(candidate_model, search)
-            if headroom_error:
-                raise _HeadroomError(headroom_error)
-
-            # 回查：用真实的搜索框去搜，得分才和现场同尺度。
-            match_result = candidate_model.find(static_frame, search.to_mapping())
+            verify_rect = self._template_self_check_rect(candidate_model, rect)
+            match_result = candidate_model.find(static_frame, verify_rect)
             if not match_result.matched:
                 raise ValueError(
-                    f"模板在搜索框内回查得分 {match_result.score:.3f}，"
+                    f"模板在模板 ROI 内回查得分 {match_result.score:.3f}，"
                     f"未达到阈值 {settings.min_score:.3f}。\n"
                     f"失败原因：{match_result.failure or '未知'}\n"
                     f"请检查框选区域是否包含清晰轮廓，或降低匹配分数阈值。"
@@ -838,9 +850,9 @@ class ConfigPage(QWidget):
                 box=match_result.box,
                 contours=(),
             )
-            self._roi_frame_status.setText(self._template_saved_summary(
-                candidate_model, match_result, search
-            ))
+            self._roi_frame_status.setText(
+                self._template_saved_summary(candidate_model, match_result)
+            )
             self._show_saved_feedback()
             self._update_roi_controls()
         except Exception as exc:
@@ -854,12 +866,8 @@ class ConfigPage(QWidget):
             restore_file(config_path, previous_config)
             for name, value in previous_values.items():
                 setattr(self.config, name, value)
-            if isinstance(exc, _HeadroomError):
-                title, message = "搜索框太小", str(exc)
-                status = "搜索框太小，模板未保存"
-            else:
-                title, message = "模板保存失败", f"定位模板保存失败：{exc}"
-                status = message
+            title, message = "模板保存失败", f"定位模板保存失败：{exc}"
+            status = message
             self._roi_editor.set_template_feedback(
                 success=False,
                 score=match_result.score if match_result is not None else None,
@@ -883,19 +891,15 @@ class ConfigPage(QWidget):
             polarity=str(getattr(self.config, "roi_template_polarity", "use") or "use"),
         )
 
-    def _template_saved_summary(self, model, match_result, search) -> str:
-        """保存成功后把回查得分、余量和建议阈值一并显示出来。"""
+    def _template_saved_summary(self, model, match_result) -> str:
+        """保存成功后把回查得分和建议阈值显示出来。"""
         suggested = max(0.30, round(match_result.score - 0.25, 2))
-        parts = [
+        return (
             f"模板已保存：{model.template_size[0]}×{model.template_size[1]}，"
-            f"{model.level_count} 层金字塔，角度步进 {model.base_angle_step:.2f}°",
-            f"在搜索框内回查得分 {match_result.score:.3f}"
-            f"（当前阈值 {model.settings.min_score:.2f}，建议不高于 {suggested:.2f}）",
-        ]
-        hint = self._headroom_hint(model, search)
-        if hint:
-            parts.append(hint)
-        return " ｜ ".join(parts)
+            f"{model.level_count} 层金字塔，角度步进 {model.base_angle_step:.2f}°"
+            f" ｜ 在模板 ROI 内回查得分 {match_result.score:.3f}"
+            f"（当前阈值 {model.settings.min_score:.2f}，建议不高于 {suggested:.2f}）"
+        )
 
     def _roi_config_path(self) -> Path:
         config_path_text = str(self.config.get_config_path() or "").strip()
@@ -920,11 +924,9 @@ class ConfigPage(QWidget):
         self._model_path_input.setText(c.yolo_model_path)
         self._conf_input.setValue(c.yolo_conf_threshold)
         self._iou_input.setValue(c.yolo_iou_threshold)
-        self._device_input.setText(c.ultralytics_device)
         idx = self._tracker_input.findText(c.ultralytics_tracker)
         if idx >= 0:
             self._tracker_input.setCurrentIndex(idx)
-        self._max_det_input.setValue(c.ultralytics_max_det)
         self._track_persist_cb.setChecked(c.ultralytics_track_persist)
         for i, name in enumerate(c.category_names):
             if i < 6:
@@ -935,19 +937,18 @@ class ConfigPage(QWidget):
             val = counts[i] if i < len(counts) else 1
             self._step_count_inputs[i].setValue(_display_positive_int(val))
         # 相机参数
-        idx = self._cam_mode_input.findText(getattr(c, "camera_parameter_mode", "preserve"))
-        if idx >= 0:
-            self._cam_mode_input.setCurrentIndex(idx)
-        self._cam_group_input.setValue(getattr(c, "camera_parameter_group", 0))
-        self._cam_file_input.setText(getattr(c, "camera_parameter_file", ""))
         self._cam_exp_input.setValue(getattr(c, "camera_manual_exposure_us", 30000))
         self.set_camera_devices(self._camera_devices, self._camera_enumeration_error)
         # 动作判定
         self._action_pass_frames_input.setValue(getattr(c, "action_pass_stable_frames", 2))
         self._action_ng_frames_input.setValue(getattr(c, "action_ng_stable_frames", 10))
         self._action_order_cb.setChecked(getattr(c, "action_order_constraint_enabled", True))
+        self._lstm_action_cb.setChecked(bool(getattr(c, "lstm_action_enabled", False)))
+        self._lstm_contract_input.setText(str(getattr(c, "lstm_contract_path", "") or ""))
+        self._lstm_bundle_input.setText(str(getattr(c, "lstm_bundle_path", "") or ""))
+        self._fail_retry_cb.setChecked(getattr(c, "action_fail_retry_enabled", False))
         self._cooldown_input.setValue(c.round_cooldown_seconds)
-        self._target_input.setValue(c.today_target_capacity)
+        self._switch_confirm_input.setValue(float(getattr(c, "action_switch_confirm_seconds", 0.5)))
         self._show_conf_cb.setChecked(c.show_confidence_overlay)
         self._show_tid_cb.setChecked(c.show_track_id_overlay)
         self._pass_sound_cb.setChecked(getattr(c, "pass_sound_enabled", False))
@@ -976,7 +977,15 @@ class ConfigPage(QWidget):
                     self._roi_editor.set_rect(kind, NormalizedRect.from_mapping(value))
                 except ValueError:
                     pass
+        self._sync_action_quantity_inputs()
+        self._action_order_cb.toggled.connect(self._sync_action_quantity_inputs)
+        self._roi_enabled_cb.toggled.connect(self._sync_action_quantity_inputs)
         self._on_mode_changed()
+
+    def _sync_action_quantity_inputs(self) -> None:
+        action_mode = self._action_order_cb.isChecked() and not self._roi_enabled_cb.isChecked()
+        for box in self._step_count_inputs:
+            box.setEnabled(not action_mode)
 
     def _refresh_roi_frame(self) -> None:
         frame = self._roi_frame_provider() if callable(self._roi_frame_provider) else None
@@ -1011,7 +1020,16 @@ class ConfigPage(QWidget):
         self._create_default_roi(self._selected_roi_kind())
 
     def _delete_selected_roi(self) -> None:
-        self._roi_editor.delete_rect(self._selected_roi_kind())
+        kind = self._selected_roi_kind()
+        field_name, label = self._roi_field(kind)
+        self._roi_editor.delete_rect(kind)
+        if getattr(self.config, field_name, None) is None:
+            self._roi_frame_status.setText(f"{label} 已删除")
+            self._update_roi_controls()
+            return
+        if self._persist_roi_field(field_name, label, None):
+            self._roi_frame_status.setText(f"{label} 已删除并保存")
+            self._show_saved_feedback()
         self._update_roi_controls()
 
     def _update_roi_controls(self) -> None:
@@ -1026,11 +1044,28 @@ class ConfigPage(QWidget):
             self._save_roi_btn.setEnabled(has_frame and selected_rect is not None)
 
     def _on_select_model(self) -> None:
+        current = str(self._model_path_input.text()).strip()
+        start = str(Path(current).parent) if current else ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择 YOLO OBB 模型", "", "YOLO 模型 (*.pt *.onnx)"
+            self, "选择 YOLO OBB 模型", start, "YOLO 模型 (*.pt *.onnx)"
         )
         if path:
             self._model_path_input.setText(path)
+
+    def _on_select_action_bundle(self) -> None:
+        from lstm_action.bundle import bundle_directory_for_model_file
+
+        current = str(self._lstm_bundle_input.text()).strip()
+        start = current if current else ""
+        path = QFileDialog.getExistingDirectory(self, "选择动作模型文件夹", start)
+        if not path:
+            return
+        try:
+            directory = bundle_directory_for_model_file(path)
+        except ValueError as exc:
+            QMessageBox.warning(self, "动作模型", str(exc))
+            return
+        self._lstm_bundle_input.setText(str(directory))
 
     def refresh_stats_display(self) -> None:
         """刷新生产统计区域显示。"""
@@ -1078,37 +1113,69 @@ class ConfigPage(QWidget):
             )
 
     def _on_save(self) -> None:
-        c = self.config
+        c = deepcopy(self.config)
+        try:
+            self._write_form_into_config(c)
+            camera_validation_error = self._camera_validation_error()
+            if camera_validation_error:
+                raise ValueError(camera_validation_error)
+            if self._config_committer is None and (
+                not c.roi_inspection_enabled
+                and c.action_order_constraint_enabled
+            ):
+                from lstm_action.bundle import load_runtime_bundle
+
+                if not str(c.lstm_bundle_path or "").strip():
+                    raise ValueError("顺序模式需要动作模型包，不能按 YOLO 放行")
+                load_runtime_bundle(
+                    c.lstm_bundle_path,
+                    category_names=list(c.category_names or []),
+                    yolo_path=str(c.yolo_model_path or ""),
+                    yolo_conf=float(c.yolo_conf_threshold),
+                    step_counts=list(c.category_counts or []),
+                )
+            c.validate()
+            c.require_valid_inspection_config(
+                None,
+                require_roi_rects=False,
+            )
+            config_path = c.get_config_path()
+            if not config_path:
+                raise ValueError("配置路径不存在，无法保存。")
+            if self._config_committer is not None:
+                self._config_committer(c)
+                self.config = c
+            else:
+                c.save(config_path)
+                self.config.__dict__.update(c.__dict__)
+            self.config_saved.emit()
+            self._saved_label.setVisible(True)
+            self._saved_feedback_timer.start(2200)
+        except Exception as exc:
+            QMessageBox.warning(self, "配置错误", str(exc))
+
+    def _write_form_into_config(self, c) -> None:
         c.yolo_model_path = self._model_path_input.text()
         c.yolo_conf_threshold = self._conf_input.value()
         c.yolo_iou_threshold = self._iou_input.value()
-        c.ultralytics_device = self._device_input.text()
         c.ultralytics_tracker = self._tracker_input.currentText()
-        c.ultralytics_max_det = self._max_det_input.value()
         c.ultralytics_track_persist = self._track_persist_cb.isChecked()
         c.category_names = [inp.text() for inp in self._step_inputs]
         c.category_counts = [inp.value() for inp in self._step_count_inputs]
-        # 相机参数
         selected_camera = self._selected_camera_device()
-        selected_index = self._camera_device_input.currentIndex()
-        camera_validation_error = ""
         if selected_camera is not None:
             c.mvsdk_camera_sn = str(selected_camera.sn).strip()
             c.mvsdk_friendly_name = selected_camera.friendly_name
-        elif selected_index > 0:
-            camera_validation_error = "所选迈德相机缺少 SN，无法保存为稳定设备"
-        elif self._camera_devices and not getattr(c, "mvsdk_camera_sn", ""):
-            camera_validation_error = "请选择一台迈德相机后再保存"
-        c.camera_parameter_mode = self._cam_mode_input.currentText()
-        c.camera_parameter_group = self._cam_group_input.value()
-        c.camera_parameter_file = self._cam_file_input.text()
         c.camera_manual_exposure_us = self._cam_exp_input.value()
-        # 动作判定
         c.action_pass_stable_frames = self._action_pass_frames_input.value()
         c.action_ng_stable_frames = self._action_ng_frames_input.value()
         c.action_order_constraint_enabled = self._action_order_cb.isChecked()
+        c.lstm_action_enabled = self._lstm_action_cb.isChecked()
+        c.lstm_contract_path = self._lstm_contract_input.text().strip()
+        c.lstm_bundle_path = self._lstm_bundle_input.text().strip()
+        c.action_fail_retry_enabled = self._fail_retry_cb.isChecked()
         c.round_cooldown_seconds = self._cooldown_input.value()
-        c.today_target_capacity = self._target_input.value()
+        c.action_switch_confirm_seconds = self._switch_confirm_input.value()
         c.show_confidence_overlay = self._show_conf_cb.isChecked()
         c.show_track_id_overlay = self._show_tid_cb.isChecked()
         c.pass_sound_enabled = self._pass_sound_cb.isChecked()
@@ -1123,24 +1190,15 @@ class ConfigPage(QWidget):
         c.template_diagnostics_enabled = self._template_diag_cb.isChecked()
         c.template_diagnostics_shadow_enabled = self._template_shadow_cb.isChecked()
         c.template_diagnostics_sample_frames = self._template_sample_input.value()
-        # 三种 ROI 只由“保存当前 ROI”单独提交，普通配置保存不得覆盖草稿。
-        try:
-            if camera_validation_error:
-                raise ValueError(camera_validation_error)
-            c.validate()
-            c.require_valid_inspection_config(
-                None,
-                require_roi_rects=False,
-            )
-            config_path = c.get_config_path()
-            if not config_path:
-                raise ValueError("配置路径不存在，无法保存。")
-            c.save(config_path)
-            self.config_saved.emit()
-            self._saved_label.setVisible(True)
-            self._saved_feedback_timer.start(2200)
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "配置错误", str(exc))
+
+    def _camera_validation_error(self) -> str:
+        selected_camera = self._selected_camera_device()
+        selected_index = self._camera_device_input.currentIndex()
+        if selected_camera is None and selected_index > 0:
+            return "所选迈德相机缺少 SN，无法保存为稳定设备"
+        if selected_camera is None and self._camera_devices and not getattr(self.config, "mvsdk_camera_sn", ""):
+            return "请选择一台迈德相机后再保存"
+        return ""
 
     def _hide_saved_feedback(self) -> None:
         self._saved_label.setVisible(False)

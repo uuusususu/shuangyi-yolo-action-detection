@@ -22,10 +22,10 @@ def create_processor(config: ConfigManager) -> YoloObbProcessor:
         model_path=config.yolo_model_path,
         conf_threshold=config.yolo_conf_threshold,
         iou_threshold=config.yolo_iou_threshold,
-        device=config.ultralytics_device,
+        device="",
         half=config.ultralytics_half,
         tracker=config.ultralytics_tracker,
-        max_det=config.ultralytics_max_det,
+        max_det=300,
         track_persist=config.ultralytics_track_persist,
     )
     processor.load()
@@ -48,6 +48,10 @@ def summarize_worker(worker: CameraWorker, *, started_at: float, ended_at: float
         "infer_fps": stats.get("infer_fps", 0.0),
         "dropped_for_infer": stats.get("dropped_for_infer", 0),
         "infer_latency_ms": stats.get("infer_latency_ms", 0.0),
+        "capture_ms": stats.get("capture_ms", 0.0),
+        "template_ms": stats.get("template_ms", 0.0),
+        "yolo_ms": stats.get("yolo_ms", 0.0),
+        "render_ms": stats.get("render_ms", 0.0),
         "latest_preview_frame_id": latest_preview_id,
         "latest_inferred_frame_id": latest_overlay.source_frame_id,
         "latest_display_frame_id": latest_display_id if latest_display_frame is not None else 0,

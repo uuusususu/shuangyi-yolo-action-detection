@@ -417,6 +417,7 @@ def test_camera_config_lists_devices_and_saves_selected_sn(
     page._camera_refresh_btn.click()
     assert refresh_requests == [True]
 
+    page._action_order_cb.setChecked(False)
     page._on_save()
 
     saved = json.loads(Path(config.get_config_path()).read_text(encoding="utf-8"))
@@ -481,6 +482,7 @@ def test_camera_config_rejects_device_without_sn(qapp, tmp_path, monkeypatch):
     assert item is not None and item.isEnabled() is False
 
     page._camera_device_input.setCurrentIndex(1)
+    page._action_order_cb.setChecked(False)
     page._on_save()
 
     assert warnings and "缺少 SN" in warnings[-1][1]

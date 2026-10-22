@@ -24,6 +24,19 @@ class FailEvidenceContext:
     model_path: str = ""
     timestamp: float = 0.0
     source_roi: dict[str, int] | None = None
+    actual_count: int | None = None
+    required_count: int | None = None
+    fail_retry_count: int | None = None
+    ng_reason: str = ""
+    boundary_frame: int = 0
+    decision_frame: int = 0
+    seen_parts: list[str] = field(default_factory=list)
+    missing_parts: list[str] = field(default_factory=list)
+    model_sha256: str = ""
+    # 连续动作使用采集单调时钟；timestamp 始终为存档日期所用的 Unix 墙钟。
+    action_start_time: float | None = None
+    action_end_time: float | None = None
+    action_decision_time: float | None = None
 
 
 class FailEvidenceSaver:
@@ -90,6 +103,34 @@ class FailEvidenceSaver:
         }
         if context.source_roi is not None:
             metadata["source_roi"] = _json_safe_dict(context.source_roi)
+        if context.actual_count is not None:
+            metadata["actual_count"] = int(context.actual_count)
+        if context.required_count is not None:
+            metadata["required_count"] = int(context.required_count)
+        if context.fail_retry_count is not None:
+            metadata["fail_retry_count"] = int(context.fail_retry_count)
+        if context.ng_reason:
+            metadata["ng_reason"] = str(context.ng_reason)
+        if context.boundary_frame:
+            metadata["boundary_frame"] = int(context.boundary_frame)
+        if context.decision_frame:
+            metadata["decision_frame"] = int(context.decision_frame)
+        if context.seen_parts:
+            metadata["seen_parts"] = list(context.seen_parts)
+        if context.missing_parts:
+            metadata["missing_parts"] = list(context.missing_parts)
+        if context.model_sha256:
+            metadata["model_sha256"] = str(context.model_sha256)
+        action_times = {
+            "action_start_time": context.action_start_time,
+            "action_end_time": context.action_end_time,
+            "action_decision_time": context.action_decision_time,
+        }
+        if any(value is not None for value in action_times.values()):
+            metadata["action_time_clock"] = "monotonic"
+            for key, value in action_times.items():
+                if value is not None:
+                    metadata[key] = float(value)
         return metadata
 
 

@@ -23,6 +23,7 @@ class LocatorStub:
     def __init__(self, result: ShapeMatchResult, model: ShapeModel) -> None:
         self.result = result
         self.calls = []
+        self.angle_curve_requests = []
         self._model = model
 
     @property
@@ -45,8 +46,9 @@ class LocatorStub:
     def base_angle_step(self):
         return self._model.base_angle_step
 
-    def find(self, frame, search_rect):
+    def find(self, frame, search_rect, *, collect_angle_curve=True):
         self.calls.append((frame, search_rect))
+        self.angle_curve_requests.append(bool(collect_angle_curve))
         return self.result
 
 
@@ -130,6 +132,43 @@ def test_gate_runs_yolo_and_attaches_pose():
     assert processor.get_class_names() == {0: "散热片"}
     assert processor.template_model is locator
     assert processor.search_rect is search_rect
+
+
+class _RecorderStub:
+    def __init__(self, active: bool) -> None:
+        self.active = active
+        self.records = []
+
+    def record(self, payload, sample_image=None):
+        self.records.append(payload)
+
+
+def test_angle_curve_is_requested_only_when_diagnostics_active(monkeypatch):
+    """角度曲线是纯诊断输出，诊断没开就不该为它付采样代价。"""
+    model = _real_model()
+    locator = LocatorStub(
+        ShapeMatchResult(matched=True, score=0.9, center=(30.0, 20.0), angle=0.0),
+        model)
+    inner = ProcessorSpy()
+    processor = TemplateGatedProcessor(
+        inner, locator, {"x": 0.1, "y": 0.2, "width": 0.5, "height": 0.6})
+    frame = np.zeros((40, 60, 3), dtype=np.uint8)
+
+    idle = _RecorderStub(active=False)
+    monkeypatch.setattr(
+        "yolo_runtime.template_gated_processor.get_recorder", lambda: idle)
+    processor.process_frame(frame, source_frame_id=1)
+
+    assert locator.angle_curve_requests == [False]
+    assert idle.records == []
+
+    live = _RecorderStub(active=True)
+    monkeypatch.setattr(
+        "yolo_runtime.template_gated_processor.get_recorder", lambda: live)
+    processor.process_frame(frame, source_frame_id=2)
+
+    assert locator.angle_curve_requests == [False, True]
+    assert len(live.records) == 1
 
 
 def test_real_shape_gate_runs_yolo_on_full_frame():

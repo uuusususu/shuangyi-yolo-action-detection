@@ -1,15 +1,116 @@
 """YOLO OBB 动作检测系统入口。"""
+import multiprocessing
 import sys
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication
+APP_WINDOW_TITLE = "双翼科技视觉行为引导系统"
+ERROR_ALREADY_EXISTS = 183
+_instance_mutex = None
+
+
+def gui_instance_lock_required(argv: list[str] | None = None) -> bool:
+    """启动自检不占界面锁，避免诊断把正在用的程序当成重复打开。"""
+    args = list(sys.argv if argv is None else argv)
+    return "--portable-smoke-test" not in args
+
+
+def this_process_owns_instance(handle, last_error: int) -> bool:
+    """互斥量创建失败时仍允许启动；只有确认已有实例才拒绝。"""
+    if not handle:
+        return True
+    return int(last_error) != ERROR_ALREADY_EXISTS
+
+
+def _create_windows_mutex(name: str):
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel32.CreateMutexW(None, False, name)
+    return handle, ctypes.get_last_error()
+
+
+def _close_windows_handle(handle) -> None:
+    if not handle or sys.platform != "win32":
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle(handle)
+
+
+def acquire_single_instance() -> bool:
+    """同一台机器只留一个检测程序。本进程已经持有锁时再次调用仍然算成功。"""
+    global _instance_mutex
+    if sys.platform != "win32":
+        return True
+    if _instance_mutex:
+        return True
+    handle, last_error = _create_windows_mutex("Local\\WingTech.YOLOActionDetection")
+    if not this_process_owns_instance(handle, last_error):
+        _close_windows_handle(handle)
+        return False
+    _instance_mutex = handle
+    return True
+
+
+def activate_titled_window(title: str) -> bool:
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    user32.FindWindowW.restype = ctypes.c_void_p
+    hwnd = user32.FindWindowW(None, title)
+    if not hwnd:
+        return False
+    user32.ShowWindow(hwnd, 9)
+    user32.SetForegroundWindow(hwnd)
+    return True
+
+
+def _tell_user_already_running() -> None:
+    """重复打开时用系统对话框结束，不再加载 Qt 和模型。"""
+    activate_titled_window(APP_WINDOW_TITLE)
+    if sys.platform != "win32":
+        print("程序正在启动或已在运行。请使用已经打开的窗口。", file=sys.stderr)
+        return
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.MessageBoxW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+    user32.MessageBoxW.restype = ctypes.c_int
+    user32.MessageBoxW(
+        None,
+        "程序正在启动或已在运行。请使用已经打开的窗口。",
+        APP_WINDOW_TITLE,
+        0x00000040,
+    )
+
+
+def _stop_if_another_instance() -> None:
+    if gui_instance_lock_required() and not acquire_single_instance():
+        _tell_user_already_running()
+        raise SystemExit(0)
+
+
+if __name__ == "__main__":
+    # 必须赶在导入 YOLO、LSTM 之前。否则连点时第二个进程会先把模型加载起来。
+    multiprocessing.freeze_support()
+    _stop_if_another_instance()
+
+from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 from PySide6.QtCore import Qt
 
 from config import ConfigManager
 from app_state import AppState
 from camera.camera_worker import CameraWorker
+from detection_logging.action_trace import configure_action_trace
 from detection_logging.audio_feedback import resolve_sound_file
 from runtime_diagnostics import (
     close_runtime_logger,
@@ -21,6 +122,7 @@ from runtime_diagnostics import (
     log_startup_context,
 )
 from yolo_runtime.onnx_obb_processor import OnnxObbProcessor
+from roi_inspection.geometry import usable_normalized_rect
 from template_matching.template_store import resolve_template_path
 from step_sequence.step_sequence_engine import StepSequenceEngine
 from ui.main_window import MainWindow
@@ -85,6 +187,33 @@ def initialize_portable_config(base_dir: Path, resource_dir: Path) -> Path:
     return config_path
 
 
+def show_startup_notice() -> QWidget:
+    """模型加载完成前先出现一个窗口，避免用户以为没点开而再点一次。"""
+    notice = QWidget()
+    notice.setWindowTitle(APP_WINDOW_TITLE)
+    notice.setWindowFlags(
+        Qt.WindowType.Window
+        | Qt.WindowType.WindowTitleHint
+        | Qt.WindowType.CustomizeWindowHint
+    )
+    notice.setFixedSize(460, 160)
+    layout = QVBoxLayout(notice)
+    label = QLabel("正在启动，请稍候。")
+    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    layout.addWidget(label)
+    notice.show()
+    return notice
+
+
+def save_live_config(window, config_path: Path | str) -> None:
+    """退出时保存窗口当前这份配置。
+
+    配置页保存会换成新实例，并已经写入磁盘。退出时如果再写启动时的旧实例，
+    刚选中的动作模型文件夹会被盖回旧路径。
+    """
+    window.config.save(config_path)
+
+
 def resolve_model_path(config: ConfigManager, app_base_dir: Path | str) -> Path:
     model_path = Path(str(config.yolo_model_path))
     if model_path.is_absolute():
@@ -99,10 +228,10 @@ def _create_pt_processor(config: ConfigManager, model_path_text: str):
         model_path=model_path_text,
         conf_threshold=config.yolo_conf_threshold,
         iou_threshold=config.yolo_iou_threshold,
-        device=config.ultralytics_device,
+        device="",
         half=config.ultralytics_half,
         tracker=config.ultralytics_tracker,
-        max_det=config.ultralytics_max_det,
+        max_det=300,
         track_persist=config.ultralytics_track_persist,
     )
 
@@ -117,7 +246,9 @@ def create_yolo_processor(config: ConfigManager, app_base_dir: Path | str | None
             model_path=model_path_text,
             conf_threshold=config.yolo_conf_threshold,
             iou_threshold=config.yolo_iou_threshold,
-            max_det=config.ultralytics_max_det,
+            max_det=300,
+            intra_op_threads=0,
+            graph_optimization="all",
         )
         processor.load()
     else:
@@ -126,18 +257,35 @@ def create_yolo_processor(config: ConfigManager, app_base_dir: Path | str | None
     return _wrap_with_template_gate(processor, config, base_dir)
 
 
+def template_gate_can_assemble(config: ConfigManager, app_base_dir: Path | str) -> bool:
+    """模板开关开、搜索 ROI 有效、模板文件存在时才具备挂门控的条件。"""
+    if not getattr(config, "roi_template_enabled", False):
+        return False
+    if usable_normalized_rect(
+        getattr(config, "roi_template_search_rect", None),
+        warn_label="搜索 ROI",
+    ) is None:
+        return False
+    try:
+        template_path = resolve_template_path(config, app_base_dir)
+    except ValueError:
+        return False
+    return template_path.is_file()
+
+
 def _wrap_with_template_gate(processor, config: ConfigManager, base_dir: Path):
-    """模板启用时必须返回门控处理器，初始化失败直接阻断。"""
-    if not getattr(config, "roi_inspection_enabled", False):
-        return processor
+    """齐全时挂门控；缺一层跳过；文件损坏才阻断。"""
     if not getattr(config, "roi_template_enabled", False):
         return processor
-    template_path = resolve_template_path(config, base_dir)
-    if not template_path.is_file():
-        raise FileNotFoundError(f"定位模板文件不存在: {template_path}")
     search_rect = getattr(config, "roi_template_search_rect", None)
-    if search_rect is None:
-        raise ValueError("搜索 ROI 未配置")
+    if usable_normalized_rect(search_rect, warn_label="搜索 ROI") is None:
+        return processor
+    try:
+        template_path = resolve_template_path(config, base_dir)
+    except ValueError:
+        return processor
+    if not template_path.is_file():
+        return processor
 
     logger = get_runtime_logger()
     try:
@@ -195,6 +343,8 @@ def create_step_engine(config: ConfigManager) -> StepSequenceEngine:
         out_of_order_frames=config.action_ng_stable_frames,
         leave_stable_frames=config.action_leave_stable_frames,
         order_constraint_enabled=config.action_order_constraint_enabled,
+        fail_retry_enabled=getattr(config, "action_fail_retry_enabled", False),
+        fail_retry_frames=getattr(config, "action_ng_stable_frames", 10),
     )
 
 
@@ -248,6 +398,7 @@ def run_portable_smoke_check(
     model_path = resolve_model_path(config, app_base_dir)
     emit(f"[portable-smoke] config={config_path}")
     emit(f"[portable-smoke] model={model_path}")
+    emit(f"[portable-smoke] frozen={bool(getattr(sys, 'frozen', False))} sys_path={sys.path}")
     if not model_path.exists():
         emit("[portable-smoke] model missing")
         return finish(2)
@@ -266,7 +417,7 @@ def run_portable_smoke_check(
             f"diagnostics={get_runtime_log_path() or 'unavailable'}"
         )
         return finish(6)
-    if config.roi_inspection_enabled and config.roi_template_enabled:
+    if template_gate_can_assemble(config, app_base_dir):
         from template_matching.shape_model import ShapeModel
         from yolo_runtime.template_gated_processor import TemplateGatedProcessor
 
@@ -300,6 +451,54 @@ def run_portable_smoke_check(
     if config_errors:
         emit(f"[portable-smoke] inspection config invalid: {'; '.join(config_errors)}")
         return finish(1)
+
+    from lstm_action.bundle import load_runtime_bundle, uses_lstm_sequence
+
+    if uses_lstm_sequence(config):
+        try:
+            import numpy as np
+            from lstm_action.stream import TimelineSession
+            from lstm_workbench.model_registry import create_hands_tracker
+
+            bundle_path = Path(str(config.lstm_bundle_path or ""))
+            if not bundle_path.is_absolute():
+                bundle_path = Path(app_base_dir) / bundle_path
+            values = [name for _index, name in sorted(class_names.items())] if isinstance(class_names, dict) else list(class_names)
+            bundle = load_runtime_bundle(
+                bundle_path,
+                category_names=list(config.category_names),
+                yolo_path=str(model_path),
+                yolo_conf=float(config.yolo_conf_threshold),
+                yolo_class_names=values,
+                step_counts=list(config.category_counts),
+            )
+            tracker = create_hands_tracker()
+            try:
+                if not tracker.available:
+                    raise RuntimeError(tracker.error or "手部模型不可用")
+                tracker.process(np.zeros((64, 64, 3), dtype=np.uint8))
+                if not tracker.available or tracker.error:
+                    raise RuntimeError(tracker.error or "手部前向失败")
+            finally:
+                tracker.close()
+            session = TimelineSession(
+                bundle,
+                confirm_seconds=float(getattr(config, "action_switch_confirm_seconds", 0.5)),
+            )
+            result = session.observe_frame(
+                source_frame=0, timestamp=0.0, detections=[], hands=[], frame_w=64, frame_h=64,
+            )
+            if result.get("fault"):
+                raise RuntimeError(result["fault"])
+            emit(
+                f"[portable-smoke] lstm=ok bundle={bundle_path} "
+                f"weights_sha256={bundle.weights_sha256} hands_sha256={bundle.contract['hands_sha256']} "
+                f"time_base_fps={bundle.time_base_fps} phase={result.get('phase')} "
+                f"hands_forward=ok torch_forward=ok frozen={bool(getattr(sys, 'frozen', False))}"
+            )
+        except Exception as exc:
+            emit(f"[portable-smoke] lstm failed: {type(exc).__name__}: {exc}")
+            return finish(7)
 
     pass_sound = _resolve_portable_sound("pass", Path(app_base_dir), resource_root)
     fail_sound = _resolve_portable_sound("fail", Path(app_base_dir), resource_root)
@@ -343,11 +542,15 @@ def run_portable_smoke_check(
 
 def main():
     """应用主函数。"""
+    multiprocessing.freeze_support()
+    _stop_if_another_instance()
+
     paths = resolve_app_paths()
     base_dir = paths.base_dir
     config_path = paths.config_path
 
     runtime_log_path = configure_runtime_logger(base_dir)
+    action_trace_path = configure_action_trace(base_dir)
     install_unhandled_exception_hook()
     if getattr(sys, "frozen", False):
         config_path = initialize_portable_config(paths.base_dir, paths.resource_dir)
@@ -359,6 +562,7 @@ def main():
         frozen=bool(getattr(sys, "frozen", False)),
     )
     logger = get_runtime_logger()
+    logger.info("action_trace=%s", action_trace_path)
 
     if "--portable-smoke-test" in sys.argv:
         smoke_code = run_portable_smoke_check(
@@ -378,6 +582,9 @@ def main():
     app.setApplicationName("YOLO OBB 动作检测系统")
     app.setOrganizationName("WingTech")
     apply_application_theme(app)
+    app.setQuitOnLastWindowClosed(False)
+    startup_notice = show_startup_notice()
+    app.processEvents()
 
     # 加载配置
     config = ConfigManager()
@@ -422,6 +629,9 @@ def main():
         runtime_log_path=runtime_log_path,
     )
     window.show()
+    startup_notice.close()
+    startup_notice.deleteLater()
+    app.setQuitOnLastWindowClosed(True)
     app.processEvents()
 
     if processor:
@@ -434,7 +644,7 @@ def main():
 
     exit_code = app.exec()
     try:
-        config.save(config_path)
+        save_live_config(window, config_path)
         logger.info("config_save=ok path=%s", config_path)
     except Exception:
         logger.exception("config_save=failed path=%s", config_path)
