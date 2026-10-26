@@ -124,7 +124,7 @@ from runtime_diagnostics import (
 from yolo_runtime.onnx_obb_processor import OnnxObbProcessor
 from roi_inspection.geometry import usable_normalized_rect
 from template_matching.template_store import resolve_template_path
-from step_sequence.step_sequence_engine import StepSequenceEngine
+from step_sequence.step_sequence_engine import StepSequenceEngine, build_step_engine
 from ui.main_window import MainWindow
 from ui.theme import THEME_ID, apply_application_theme, require_theme_module
 
@@ -335,17 +335,11 @@ def load_yolo_processor_with_diagnostics(
 
 
 def create_step_engine(config: ConfigManager) -> StepSequenceEngine:
-    """按当前配置创建步骤引擎。"""
-    return StepSequenceEngine(
-        step_class_names=config.category_names,
-        step_counts=config.get_runtime_category_counts(),
-        enter_stable_frames=config.action_pass_stable_frames,
-        out_of_order_frames=config.action_ng_stable_frames,
-        leave_stable_frames=config.action_leave_stable_frames,
-        order_constraint_enabled=config.action_order_constraint_enabled,
-        fail_retry_enabled=getattr(config, "action_fail_retry_enabled", False),
-        fail_retry_frames=getattr(config, "action_ng_stable_frames", 10),
-    )
+    """按当前配置创建步骤引擎。
+
+    启动、保存配置和重建引擎都走这里，避免几处构造参数各自漂移。
+    """
+    return build_step_engine(config)
 
 
 def _resolve_portable_sound(kind: str, app_base_dir: Path, resource_dir: Path) -> Path:

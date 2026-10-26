@@ -49,6 +49,8 @@ class MvSdkCamera:
         self._frame_buffer_size = 0
 
         self._lock = threading.Lock()
+        # read 全程持有，close 等它结束再释放句柄和帧缓冲，避免采集线程读已释放的内存。
+        self._io_lock = threading.Lock()
 
     @staticmethod
     def enumerate_devices() -> list[MvSdkDevice]:
@@ -239,6 +241,10 @@ class MvSdkCamera:
             return False
 
     def close(self) -> None:
+        with self._io_lock:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
         mvsdk = self._mvsdk
         with self._lock:
             h = int(self._h_camera)
@@ -266,6 +272,10 @@ class MvSdkCamera:
                 pass
 
     def read(self, *, timeout_ms: int = 200) -> Optional[np.ndarray]:
+        with self._io_lock:
+            return self._read_locked(timeout_ms)
+
+    def _read_locked(self, timeout_ms: int) -> Optional[np.ndarray]:
         mvsdk = self._mvsdk
         if mvsdk is None:
             return None

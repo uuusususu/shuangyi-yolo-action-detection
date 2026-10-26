@@ -27,6 +27,8 @@ class CameraWorker(QObject):
     pipeline_stats_updated = Signal(dict)
     camera_params_updated = Signal(dict)
     _ACTION_EVIDENCE_LIMIT = 16
+    _OVERLAY_BACKLOG_LIMIT = 4
+    _OVERLAY_WAIT_LIMIT_S = 1.0
 
     def __init__(self, config, state) -> None:
         super().__init__()
@@ -71,6 +73,11 @@ class CameraWorker(QObject):
 
         self._next_frame_id = 0
         self._last_inferred_frame_id = 0
+        # 采集到新帧时唤醒推理线程，替代固定间隔轮询。
+        self._frame_ready = threading.Event()
+        # 已发出、界面还没处理完的推理结果数量。
+        self._overlay_backlog = 0
+        self._overlay_backlog_cond = threading.Condition()
 
         self._capture_count = 0
         self._capture_fps_start = time.time()
@@ -105,9 +112,11 @@ class CameraWorker(QObject):
                 raise RuntimeError("请先停止推理，再切换模型配置")
             with self._action_lock:
                 self.config = config
+                previous = self.frame_processor
                 self.frame_processor = processor
                 self._action_session = action_session
                 self.runtime_generation += 1
+            self._close_processor(previous, keep=processor)
             with self._hand_lock:
                 self._release_hand_tracker_locked()
                 self._hand_tracker_failed = False
@@ -115,11 +124,27 @@ class CameraWorker(QObject):
             self._clear_action_evidence()
 
     def set_frame_processor(self, processor) -> None:
-        self.frame_processor = processor
+        # 推理线程持 _runtime_lock 跑完整帧，这里等它结束再换，不会半帧换处理器。
+        with self._runtime_lock:
+            previous = self.frame_processor
+            self.frame_processor = processor
+        self._close_processor(previous, keep=processor)
         self._runtime_logger.info(
             "frame_processor=set type=%s",
             type(processor).__name__ if processor is not None else "None",
         )
+
+    def _close_processor(self, processor, *, keep) -> None:
+        """显式释放被替换下来的处理器；同一个对象继续使用时不动。"""
+        if processor is None or processor is keep:
+            return
+        close = getattr(processor, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception:
+            self._runtime_logger.warning("frame_processor=close_failed", exc_info=True)
 
     @staticmethod
     def enumerate_devices() -> list[MvSdkDevice]:
@@ -168,7 +193,7 @@ class CameraWorker(QObject):
                 params = self._mvsdk_camera.read_params()
                 self.camera_params_updated.emit(params)
             except Exception:
-                pass
+                self._runtime_logger.warning("camera_params=read_failed", exc_info=True)
 
             self.running = True
             self.state.set_camera_on(True)
@@ -205,30 +230,40 @@ class CameraWorker(QObject):
         self._session_generation += 1
         self.state.set_camera_on(False)
         self.state.set_inference_on(False)
-        self._wait_for_threads_to_stop()
+        self._frame_ready.set()
+        # 推理线程可能正在等界面确认积压；running 已为 False，叫醒它马上退出。
+        self._wake_overlay_waiters()
+        if not self._wait_for_threads_to_stop():
+            # 采集线程还没退出：MvSdkCamera.close 会等它当前这次 read 结束再释放句柄。
+            self._runtime_logger.warning("camera_close=threads_still_running")
         if self._mvsdk_camera:
             try:
                 self._mvsdk_camera.close()
             except Exception:
-                pass
+                self._runtime_logger.warning("camera_close=sdk_close_failed", exc_info=True)
             self._mvsdk_camera = None
         elif self.cap:
             try:
                 self.cap.release()
             except Exception:
-                pass
+                self._runtime_logger.warning("camera_close=release_failed", exc_info=True)
         self.cap = None
         self._release_hand_tracker()
         self._clear_session_buffers()
 
-    def _wait_for_threads_to_stop(self, timeout_s: float = 1.0) -> None:
+    def _wait_for_threads_to_stop(self, timeout_s: float = 1.0) -> bool:
+        """返回两个线程是否都已退出。"""
         current_thread = threading.current_thread()
+        all_stopped = True
         for attr_name in ("_capture_thread", "_inference_thread"):
             thread = getattr(self, attr_name)
             if thread is not None and thread is not current_thread and thread.is_alive():
                 thread.join(timeout=timeout_s)
             if thread is None or not thread.is_alive():
                 setattr(self, attr_name, None)
+            elif thread is not current_thread:
+                all_stopped = False
+        return all_stopped
 
     def set_hand_overlay_enabled(self, enabled: bool) -> None:
         """顺序模式检测中才开 Hands。关闭时释放会话，便于下次重新初始化。"""
@@ -251,6 +286,7 @@ class CameraWorker(QObject):
     def stop_inference(self) -> None:
         self._runtime_logger.info("inference_state=stop")
         self.state.set_inference_on(False)
+        self._wake_overlay_waiters()
 
     def _start_threads(self) -> None:
         self._session_generation += 1
@@ -312,6 +348,7 @@ class CameraWorker(QObject):
                     self._latest_infer_frame_id = frame_id
                     self._latest_infer_captured_at = time.monotonic()
                     self._latest_infer_captured_wall_time = time.time()
+                self._frame_ready.set()
                 self._pipeline_stats.capture_ms = (
                     time.perf_counter() - read_started
                 ) * 1000.0
@@ -337,12 +374,31 @@ class CameraWorker(QObject):
                 fid = self._latest_infer_frame_id
                 captured_at = getattr(self, "_latest_infer_captured_at", None)
                 captured_wall_time = getattr(self, "_latest_infer_captured_wall_time", None)
-            if frame is None:
-                time.sleep(0.01)
+            if frame is None or fid <= self._last_inferred_frame_id:
+                # 先清再复查，避免清掉采集线程刚发出的通知；超时兜底防止漏唤醒。
+                self._frame_ready.clear()
+                with self._infer_lock:
+                    has_new_frame = (
+                        self._latest_infer_frame is not None
+                        and self._latest_infer_frame_id > self._last_inferred_frame_id
+                    )
+                if not has_new_frame:
+                    self._frame_ready.wait(0.05)
                 continue
-            if fid <= self._last_inferred_frame_id:
-                time.sleep(0.005)
+            # 积压等待放在拿 _runtime_lock 之前：界面线程换处理器、停推理时也要拿这把锁，
+            # 若在锁内等界面确认，界面拿不到锁又无法确认，只能干等超时。
+            self._wait_for_overlay_capacity()
+            if not self.running or generation != self._session_generation:
+                break
+            if not self.state.inference_on:
                 continue
+            with self._infer_lock:
+                # 等待期间可能来了更新的帧，直接推最新的。
+                if self._latest_infer_frame is not None and self._latest_infer_frame_id > fid:
+                    frame = self._latest_infer_frame
+                    fid = self._latest_infer_frame_id
+                    captured_at = getattr(self, "_latest_infer_captured_at", None)
+                    captured_wall_time = getattr(self, "_latest_infer_captured_wall_time", None)
             dropped = max(0, fid - self._last_inferred_frame_id - 1)
             self._last_inferred_frame_id = fid
             self._runtime_lock.acquire()
@@ -418,7 +474,38 @@ class CameraWorker(QObject):
             payload["lstm_action"] = action_report
         payload["source_frame"] = frame
         payload["runtime_generation"] = self.runtime_generation
+        with self._overlay_backlog_cond:
+            self._overlay_backlog += 1
         self.overlay_state_updated.emit(payload)
+
+    def _wait_for_overlay_capacity(self) -> None:
+        """界面积压时让推理线程等一等，而不是把整帧图片无限堆进 Qt 事件队列。
+
+        判定仍逐帧推进；推理慢下来后多出的相机帧在"只取最新帧"这一步被丢弃。
+        等待有上限，界面卡死或没人确认时照常发出，避免推理线程永久阻塞。
+        """
+        deadline = time.monotonic() + self._OVERLAY_WAIT_LIMIT_S
+        with self._overlay_backlog_cond:
+            while (
+                self._overlay_backlog >= self._OVERLAY_BACKLOG_LIMIT
+                and self.running
+                and self.state.inference_on
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._pipeline_stats.overlay_backlog_timeouts += 1
+                    break
+                self._overlay_backlog_cond.wait(remaining)
+
+    def _wake_overlay_waiters(self) -> None:
+        with self._overlay_backlog_cond:
+            self._overlay_backlog_cond.notify_all()
+
+    def ack_overlay_event(self) -> None:
+        """界面处理完一条 overlay_state_updated 后调用，释放一个积压名额。"""
+        with self._overlay_backlog_cond:
+            self._overlay_backlog = max(0, self._overlay_backlog - 1)
+            self._overlay_backlog_cond.notify()
 
     def _record_inference_diagnostics(self, overlay: DetectionOverlayState) -> None:
         if overlay.error:
@@ -471,6 +558,10 @@ class CameraWorker(QObject):
             self._capture_fps_start = now
             self._infer_fps_start = now
             self._preview_fps_start = now
+        # 新会话不继承上一会话没确认的积压，否则会被旧事件卡住。
+        with self._overlay_backlog_cond:
+            self._overlay_backlog = 0
+            self._overlay_backlog_cond.notify_all()
 
     def get_latest_preview_frame(self) -> Optional[np.ndarray]:
         with self._preview_lock:
@@ -486,6 +577,14 @@ class CameraWorker(QObject):
             if self._latest_display_frame is not None:
                 return self._latest_display_frame.copy(), self._latest_display_frame_id
         return None, 0
+
+    def get_display_frame_size(self) -> tuple:
+        """只取同帧推理结果的 (宽, 高)，不拷贝整幅图像。没有帧时返回空元组。"""
+        with self._display_lock:
+            if self._latest_display_frame is None:
+                return ()
+            height, width = self._latest_display_frame.shape[:2]
+        return (int(width), int(height))
 
     def get_display_frame_id(self) -> int:
         """只取同帧推理结果的帧号，供界面在拷贝前判断内容是否变化。"""

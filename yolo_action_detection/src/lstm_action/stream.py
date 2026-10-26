@@ -101,6 +101,8 @@ class TimelineSession:
 
     def __init__(self, bundle: RuntimeBundle, confirm_seconds: float | None = None) -> None:
         self.bundle = bundle
+        # 归一化参数随模型包固定，首帧转成数组后复用，不在每帧重建。
+        self._feature_norm: tuple[np.ndarray, np.ndarray] | None = None
         fps = float(bundle.time_base_fps)
         self.min_frames = max(1, int(round(float(bundle.min_action_seconds) * fps)))
         # 未单独配置时沿用模型最短动作，避免旧回放提前结算。
@@ -256,8 +258,13 @@ class TimelineSession:
             self.bundle.yolo_conf_threshold,
             include_hands=bool(getattr(self.bundle, "hands_in_training", True)),
         )
-        values = (np.asarray(row, dtype=np.float32) - np.asarray(self.bundle.feature_mean, dtype=np.float32))
-        values = values / np.asarray(self.bundle.feature_std, dtype=np.float32)
+        if self._feature_norm is None:
+            self._feature_norm = (
+                np.asarray(self.bundle.feature_mean, dtype=np.float32),
+                np.asarray(self.bundle.feature_std, dtype=np.float32),
+            )
+        mean, std = self._feature_norm
+        values = (np.asarray(row, dtype=np.float32) - mean) / std
         batch = torch.tensor(values, dtype=torch.float32).view(1, 1, -1)
         with torch.no_grad():
             logits, self._hidden = self.model.step(batch, self._hidden)

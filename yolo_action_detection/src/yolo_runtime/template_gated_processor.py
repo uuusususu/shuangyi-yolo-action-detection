@@ -41,6 +41,11 @@ class TemplateGatedProcessor:
     def search_rect(self) -> object:
         return self._search_rect
 
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if callable(close):
+            close()
+
     def get_class_names(self) -> dict:
         if hasattr(self._inner, "get_class_names"):
             return self._inner.get_class_names()

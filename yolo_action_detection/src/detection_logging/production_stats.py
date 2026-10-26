@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 @dataclass
@@ -56,6 +56,19 @@ class ProductionStatsManager:
     ) -> None:
         self._records_dir = Path(records_dir)
         self._batch = ProductionBatch(started_at=time.time())
+        self._on_changed: Optional[Callable[[], None]] = None
+
+    def set_on_changed(self, callback: Optional[Callable[[], None]]) -> None:
+        """计数变化后通知界面写入配置。恢复历史批次时不触发。"""
+        self._on_changed = callback
+
+    def restore(self, batch: ProductionBatch) -> None:
+        """用已保存的批次替换内存计数，不写盘。"""
+        self._batch = batch
+
+    def _emit_changed(self) -> None:
+        if self._on_changed is not None:
+            self._on_changed()
 
     @property
     def batch(self) -> ProductionBatch:
@@ -68,10 +81,12 @@ class ProductionStatsManager:
     def record_pass(self) -> None:
         self._batch.total += 1
         self._batch.ok += 1
+        self._emit_changed()
 
     def record_ng(self) -> None:
         self._batch.total += 1
         self._batch.ng += 1
+        self._emit_changed()
 
     def reset_and_archive(self) -> ArchiveResult:
         """归零并保存记录。
@@ -101,7 +116,7 @@ class ProductionStatsManager:
             f"record_{started_dt.strftime('%Y%m%d_%H%M%S')}"
             f"_{ended_dt.strftime('%Y%m%d_%H%M%S')}.json"
         )
-        path = self._records_dir / filename
+        path = self._unused_record_path(filename)
         record = {
             "schema_version": "production_record.v1",
             "started_at": self._batch.started_at,
@@ -117,6 +132,16 @@ class ProductionStatsManager:
             json.dumps(record, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        return path
+
+    def _unused_record_path(self, filename: str) -> Path:
+        """文件名只精确到秒，同一秒内再次归档时加序号，避免覆盖旧记录。"""
+        path = self._records_dir / filename
+        stem, suffix = path.stem, path.suffix
+        index = 1
+        while path.exists():
+            path = self._records_dir / f"{stem}_{index}{suffix}"
+            index += 1
         return path
 
     def get_summary_text(self) -> str:

@@ -136,6 +136,12 @@ class ConfigManager:
     template_diagnostics_sample_frames: int = 120
     template_diagnostics_max_queue: int = 600
 
+    # 当前产能批次。关程序和重启都保留，只有清零才归档后归零。
+    production_started_at: float = 0.0
+    production_total: int = 0
+    production_ok: int = 0
+    production_ng: int = 0
+
     _config_path: Optional[str] = field(default=None, repr=False)
 
     def validate(self) -> None:
@@ -177,6 +183,10 @@ class ConfigManager:
         self.template_diagnostics_max_queue = max(
             50, min(20000, int(self.template_diagnostics_max_queue))
         )
+        self.production_started_at = max(0.0, float(self.production_started_at or 0))
+        self.production_ok = max(0, int(self.production_ok or 0))
+        self.production_ng = max(0, int(self.production_ng or 0))
+        self.production_total = self.production_ok + self.production_ng
         self._normalize_category_counts()
 
     def _normalize_category_counts(self) -> None:

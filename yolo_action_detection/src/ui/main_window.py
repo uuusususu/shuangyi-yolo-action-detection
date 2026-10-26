@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from collections import Counter
 from copy import deepcopy
+import logging
+import threading
 import time
 import hashlib
 from pathlib import Path
@@ -10,11 +12,11 @@ from typing import Callable, List, Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QEvent, QTimer, Slot
+from PySide6.QtCore import Qt, QEvent, QEventLoop, QTimer, Slot
 from PySide6.QtGui import QImage, QPixmap, QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QStackedWidget, QFrame, QScrollArea, QSizePolicy,
+    QLabel, QMessageBox, QPushButton, QStackedWidget, QFrame, QScrollArea, QSizePolicy,
 )
 
 from calibration.calibrator import extract_tip_point, distance_mm
@@ -38,9 +40,14 @@ from roi_inspection.geometry import (
 )
 from roi_inspection.models import InspectionOutcome, RoiInspectionConfig, RoundPhase
 from template_matching.match_diagnostics import get_recorder as get_template_diagnostics
+from ui.production_stats_store import ProductionStatsStore, batch_from_config
 from ui.roi_fail_alert_dialog import RoiFailAlertDialog
 from lstm_action.engine import LstmActionEngine
-from step_sequence.step_sequence_engine import StepSequenceEngine, RoundResult, StepStatus
+from step_sequence.step_sequence_engine import (
+    RoundResult,
+    StepStatus,
+    build_step_engine,
+)
 from ui.runtime_ui_tokens import (
     FONT_MICRO,
     FONT_TITLE,
@@ -108,6 +115,8 @@ class MainWindow(QMainWindow):
         self.step_engine = step_engine
         self.lstm_action = LstmActionEngine()
         self._processor_factory = processor_factory
+        self._model_loading = False
+        self._close_after_model_load = False
         self._app_base_dir = (
             Path(app_base_dir)
             if app_base_dir is not None
@@ -183,6 +192,13 @@ class MainWindow(QMainWindow):
         )
         self._stats_manager = ProductionStatsManager(
             records_dir=evidence_dir.parent / "production_records",
+        )
+        self._stats_manager.restore(batch_from_config(self.config))
+        self._stats_store = ProductionStatsStore(
+            self._stats_manager,
+            config_provider=lambda: self.config,
+            on_error=self._set_notice,
+            parent=self,
         )
         self._coordinate_logger = CoordinateSessionLogger(
             log_dir=getattr(config, "coordinate_logging_dir", "logs/coordinate_sessions"),
@@ -356,9 +372,18 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(12, 12, 12, 12)
         right_layout.setSpacing(12)
 
-        # 右上：KPI 单行
+        # 右上：KPI 单行，清零先归档再把配置里的计数写成 0
         self._kpi_row = KpiRow()
-        right_layout.addWidget(self._kpi_row)
+        self._btn_clear_stats = QPushButton("清零")
+        self._btn_clear_stats.setFixedSize(72, 72)
+        self._btn_clear_stats.setProperty("buttonRole", "danger")
+        self._btn_clear_stats.clicked.connect(self._on_clear_production_stats)
+        kpi_line = QHBoxLayout()
+        kpi_line.setContentsMargins(0, 0, 0, 0)
+        kpi_line.setSpacing(8)
+        kpi_line.addWidget(self._kpi_row, 1)
+        kpi_line.addWidget(self._btn_clear_stats)
+        right_layout.addLayout(kpi_line)
 
         # 右中：紧凑识别进度列表
         steps_head = QHBoxLayout()
@@ -650,11 +675,16 @@ class MainWindow(QMainWindow):
         if not cal_data or not holes_data:
             return frame
 
-        calibrator = CalibrationTransform.from_dict({"points": cal_data})
+        # 标定和孔位只随配置变化，按内容缓存，避免每次渲染都重建。
+        cache_key = (repr(cal_data), repr(holes_data))
+        cached = getattr(self, "_tip_hole_cache", None)
+        if cached is None or cached[0] != cache_key:
+            calibrator = CalibrationTransform.from_dict({"points": cal_data})
+            holes = [HoleDefinition.from_dict(h) for h in holes_data]
+            self._tip_hole_cache = (cache_key, calibrator, holes)
+        _, calibrator, holes = self._tip_hole_cache
         if not calibrator.is_valid:
             return frame
-
-        holes = [HoleDefinition.from_dict(h) for h in holes_data]
 
         obb_dets = []
         for d in overlay.detections:
@@ -707,7 +737,9 @@ class MainWindow(QMainWindow):
         scaled = self._scale_frame_to_label(frame)
         rgb = cv2.cvtColor(scaled, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        # QImage 直接引用 numpy 缓冲区，QPixmap.fromImage 在光栅平台上可能共享这块内存；
+        # rgb 回收后 pixmap 就指向已释放内存。先 copy 让 Qt 自己持有像素（显示尺寸，代价很小）。
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
         self._video_label.setPixmap(QPixmap.fromImage(qimg))
 
     def _scale_frame_to_label(self, frame: np.ndarray) -> np.ndarray:
@@ -964,7 +996,7 @@ class MainWindow(QMainWindow):
         try:
             self._sound_feedback.play_pass()
         except Exception:
-            pass
+            self._runtime_logger.warning("sound_feedback=pass_failed", exc_info=True)
 
     def _play_fail_feedback(self, result_key: Optional[tuple] = None) -> None:
         if result_key is not None and not self._remember_result_key(
@@ -977,7 +1009,7 @@ class MainWindow(QMainWindow):
         try:
             self._sound_feedback.play_fail()
         except Exception:
-            pass
+            self._runtime_logger.warning("sound_feedback=fail_failed", exc_info=True)
 
     def _handle_action_ng_feedback(self, state) -> None:
         self._play_fail_feedback(
@@ -1030,9 +1062,25 @@ class MainWindow(QMainWindow):
                 action_end_time=float(getattr(state, "action_end_time", 0.0)) if boundary else None,
                 action_decision_time=float(getattr(state, "action_decision_time", 0.0)) if boundary else None,
             )
-            self._fail_evidence_saver.save_fail_event(frame, context)
+            saved_path = self._fail_evidence_saver.save_fail_event(frame, context)
+            if (
+                saved_path is None
+                and frame is not None
+                and getattr(self._fail_evidence_saver, "enabled", True)
+            ):
+                self._runtime_logger.error(
+                    "action_ng_evidence=save_failed round_id=%s frame_id=%s",
+                    int(getattr(state, "round_id", 0) or 0),
+                    source_frame_id,
+                )
+                self._set_notice("NG 证据保存失败，请检查磁盘空间和输出目录权限")
         except Exception:
-            pass
+            # NG 追溯记录丢失必须留痕，不能静默吞掉。
+            self._runtime_logger.exception(
+                "action_ng_evidence=save_failed reason=exception round_id=%s",
+                int(getattr(state, "round_id", 0) or 0),
+            )
+            self._set_notice("NG 证据保存失败，请检查磁盘空间和输出目录权限")
 
     def _sync_roi_cards(self) -> None:
         """把 ROI 平级类别的实时数量和锁存状态同步到识别列表。"""
@@ -1219,11 +1267,18 @@ class MainWindow(QMainWindow):
         raw_image_size = tuple((data or {}).get("image_size") or ())
         if len(raw_image_size) == 2 and all(float(value) > 0 for value in raw_image_size):
             return (int(raw_image_size[0]), int(raw_image_size[1]))
+        return self._display_frame_size()
+
+    def _display_frame_size(self) -> tuple:
+        """显示帧尺寸。测试替身可能只实现 get_display_frame，此时退回读整帧。"""
+        size_of = getattr(self.worker, "get_display_frame_size", None)
+        if callable(size_of):
+            return tuple(size_of())
         display_frame, _ = self.worker.get_display_frame()
-        if display_frame is not None:
-            frame_height, frame_width = display_frame.shape[:2]
-            return (int(frame_width), int(frame_height))
-        return ()
+        if display_frame is None:
+            return ()
+        frame_height, frame_width = display_frame.shape[:2]
+        return (int(frame_width), int(frame_height))
 
     def _judgement_detections(self, detections: list, image_size: tuple) -> list:
         """有效识别 ROI 只把中心在框内的目标交给判定；空框整图。"""
@@ -1256,7 +1311,8 @@ class MainWindow(QMainWindow):
         else:
             expected = "none"
         roi = getattr(self.config, "roi_inspection_rect", None)
-        self._runtime_logger.info(
+        # 每帧一条，只在 DEBUG 下输出，避免运行日志被逐帧刷屏。
+        self._runtime_logger.debug(
             "step_seq_update frame_id=%s frozen=%s roi=%s raw=%s judged=%s "
             "expected=[%s] round=%s round_id=%s reason=%s",
             data.get("source_frame_id", 0),
@@ -1272,6 +1328,15 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _on_overlay_updated(self, data: dict) -> None:
+        try:
+            self._handle_overlay_update(data)
+        finally:
+            # 无论是否丢弃，都要释放推理线程的积压名额。
+            ack = getattr(self.worker, "ack_overlay_event", None)
+            if callable(ack):
+                ack()
+
+    def _handle_overlay_update(self, data: dict) -> None:
         if data.get("runtime_generation", self.worker.runtime_generation) != self.worker.runtime_generation:
             return
         self._last_overlay_data = dict(data or {})
@@ -1292,23 +1357,24 @@ class MainWindow(QMainWindow):
         image_size = self._overlay_image_size(data)
         judged = self._judgement_detections(obb_dets, image_size)
         if self._roi_engine is not None:
-            image_size_source = "overlay" if data.get("image_size") else "derived"
-
-            sample_centers = []
-            for d in detections[:3]:
-                c = d.get("center", d.get("center_px", (0, 0)))
-                if c:
-                    sample_centers.append((float(c[0]), float(c[1])))
-            self._runtime_logger.info(
-                "roi_overlay_received frame_id=%s det_count=%d image_size=%s image_size_source=%s "
-                "sample_centers=%s labels=%s",
-                data.get("source_frame_id", 0),
-                len(detections),
-                tuple(image_size) if image_size else None,
-                image_size_source,
-                sample_centers,
-                {d.get("label", ""): 1 for d in detections},
-            )
+            # 每帧一条，只在 DEBUG 下组装和输出。
+            if self._runtime_logger.isEnabledFor(logging.DEBUG):
+                image_size_source = "overlay" if data.get("image_size") else "derived"
+                sample_centers = []
+                for d in detections[:3]:
+                    c = d.get("center", d.get("center_px", (0, 0)))
+                    if c:
+                        sample_centers.append((float(c[0]), float(c[1])))
+                self._runtime_logger.debug(
+                    "roi_overlay_received frame_id=%s det_count=%d image_size=%s image_size_source=%s "
+                    "sample_centers=%s labels=%s",
+                    data.get("source_frame_id", 0),
+                    len(detections),
+                    tuple(image_size) if image_size else None,
+                    image_size_source,
+                    sample_centers,
+                    {d.get("label", ""): 1 for d in detections},
+                )
 
             roi_results = []
             if image_size:
@@ -1617,6 +1683,7 @@ class MainWindow(QMainWindow):
                     int(result.round_id),
                     event_frame_id,
                 )
+                self._set_notice("NG 证据保存失败，请检查磁盘空间和输出目录权限")
         except Exception as exc:
             self._runtime_logger.error(
                 "roi_ng_evidence=save_failed reason=exception round_id=%s "
@@ -1697,11 +1764,8 @@ class MainWindow(QMainWindow):
         """把当前推理帧写入坐标诊断日志（底层能力，不在主界面显示状态）。"""
         if not self._coordinate_logger.active:
             return
-        frame, _frame_id = self.worker.get_display_frame()
-        image_size = None
-        if frame is not None:
-            h, w = frame.shape[:2]
-            image_size = [w, h]
+        size = self._display_frame_size()
+        image_size = list(size) if size else None
         record = build_coordinate_frame_record(
             overlay,
             self.config,
@@ -2039,8 +2103,39 @@ class MainWindow(QMainWindow):
         self._status_label.setText("READY" if not self.state.camera_on else "预览中")
         self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
 
+    def flush_production_stats(self) -> None:
+        """立即写入还在等待合并的计数（关窗时调用）。"""
+        self._stats_store.flush()
+
+    def _persist_production_stats(self) -> None:
+        self._stats_store.persist()
+
+    def _on_clear_production_stats(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "清零确认",
+            "系统会先保存当前统计记录，再清零并开始新批次。\n确定要清零吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        result = self._stats_manager.reset_and_archive()
+        if not result.success:
+            QMessageBox.warning(self, "清零失败", f"保存记录失败，统计未清零：\n{result.error}")
+            return
+        self._on_stats_changed()
+        if result.archived:
+            QMessageBox.information(
+                self, "清零成功",
+                f"已保存生产记录到：\n{result.record_path}\n\n统计已清零，新批次已开始。",
+            )
+        else:
+            QMessageBox.information(self, "清零完成", "当前批次无计数，已刷新开始时间。")
+
     def _on_stats_changed(self) -> None:
-        """配置页归零后同步主界面 KPI。"""
+        """归零后把 0 写入配置，并同步主界面和配置页。"""
+        self._persist_production_stats()
         self._update_kpi()
         if self._config_page is not None:
             self._config_page.refresh_stats_display()
@@ -2079,36 +2174,102 @@ class MainWindow(QMainWindow):
         self._clear_stale_roi_notice()
         return True
 
+    def _run_model_load(self, load: Callable):
+        """在后台线程加载模型，期间界面照常重绘；返回结果或原样抛出异常。
+
+        调用方（配置页保存）依赖同步的成功/失败语义，所以这里等加载完再返回，
+        只是等待时跑本地事件循环，不再让 ONNX/torch 加载冻住整个窗口。
+        加载函数不能碰 Qt 控件，只做纯模型构造。
+        """
+        if self._model_loading:
+            raise RuntimeError("模型正在加载，请稍候再保存")
+        outcome: dict = {}
+
+        def worker() -> None:
+            try:
+                outcome["value"] = load()
+            except BaseException as exc:  # 原样交回界面线程处理
+                outcome["error"] = exc
+
+        self._model_loading = True
+        previous_text = self._status_label.text()
+        self._status_label.setText("模型加载中...")
+        # 加载期间界面只重绘不响应操作：开始检测、清零、返回、再次保存都要等加载结束，
+        # 否则嵌套事件循环里的操作会和正在提交的配置交错。
+        was_enabled = self.centralWidget().isEnabled() if self.centralWidget() else True
+        if self.centralWidget() is not None:
+            self.centralWidget().setEnabled(False)
+        loop = None
+        try:
+            thread = threading.Thread(target=worker, name="model-load", daemon=True)
+            thread.start()
+            # 界面线程自己的定时器轮询线程是否结束，不跨线程调 Qt 对象。
+            loop = QEventLoop(self)
+            poll = QTimer(loop)
+            poll.setInterval(20)
+            poll.timeout.connect(lambda: None if thread.is_alive() else loop.quit())
+            poll.start()
+            if thread.is_alive():
+                loop.exec()
+            poll.stop()
+            thread.join()
+        finally:
+            self._model_loading = False
+            if loop is not None:
+                loop.deleteLater()
+            if self.centralWidget() is not None:
+                self.centralWidget().setEnabled(was_enabled)
+            if self._status_label.text() == "模型加载中...":
+                self._status_label.setText(previous_text)
+            if self._close_after_model_load:
+                self._close_after_model_load = False
+                QTimer.singleShot(0, self.close)
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
+
+    def _close_unused_processor(self, processor) -> None:
+        if processor is None or processor is self.processor:
+            return
+        close = getattr(processor, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                self._runtime_logger.warning("frame_processor=close_failed", exc_info=True)
+
     def _commit_candidate_config(self, candidate) -> None:
         """候选实例全部就绪后提交；失败时旧配置、模型和会话均保留。"""
         from lstm_action.bundle import uses_lstm_sequence
 
         candidate.validate()
-        new_processor = self._create_processor_from_config(candidate)
-        raw_names = new_processor.get_class_names() if hasattr(new_processor, "get_class_names") else []
-        class_names = list(raw_names.values()) if isinstance(raw_names, dict) else list(raw_names)
-        candidate.require_valid_inspection_config(class_names, require_roi_rects=False)
-        session = None
-        if uses_lstm_sequence(candidate):
-            session, reason = self._load_action_session(candidate, new_processor)
-            if session is None:
+
+        def load_runtime():
+            processor = self._create_processor_from_config(candidate)
+            action_session, action_reason = None, ""
+            if uses_lstm_sequence(candidate):
+                action_session, action_reason = self._load_action_session(candidate, processor)
+            return processor, action_session, action_reason
+
+        new_processor, session, reason = self._run_model_load(load_runtime)
+        try:
+            raw_names = new_processor.get_class_names() if hasattr(new_processor, "get_class_names") else []
+            class_names = list(raw_names.values()) if isinstance(raw_names, dict) else list(raw_names)
+            candidate.require_valid_inspection_config(class_names, require_roi_rects=False)
+            if uses_lstm_sequence(candidate) and session is None:
                 raise ValueError(reason or "动作模型未能加载，保留原运行配置")
-        new_step_engine = StepSequenceEngine(
-            step_class_names=candidate.category_names,
-            step_counts=candidate.get_runtime_category_counts(),
-            enter_stable_frames=candidate.action_pass_stable_frames,
-            out_of_order_frames=candidate.action_ng_stable_frames,
-            leave_stable_frames=getattr(candidate, "action_leave_stable_frames", 4),
-            order_constraint_enabled=candidate.action_order_constraint_enabled,
-            fail_retry_enabled=getattr(candidate, "action_fail_retry_enabled", False),
-            fail_retry_frames=candidate.action_ng_stable_frames,
-            detection_updates=not uses_lstm_sequence(candidate),
-        )
+        except Exception:
+            # 校验没过，新加载的模型不会被用上，立即释放会话。
+            self._close_unused_processor(new_processor)
+            raise
+        new_step_engine = build_step_engine(candidate)
         path = Path(candidate.get_config_path())
         old_bytes = path.read_bytes() if path.is_file() else None
         was_running = bool(self.state.inference_on)
         self.worker.stop_inference()
         saved = False
+        # 候选配置是点保存时拷贝的，加载模型期间可能又出了件，用最新计数覆盖。
+        self._stats_store.apply_to(candidate)
         try:
             candidate.save(path)
             saved = True
@@ -2116,6 +2277,8 @@ class MainWindow(QMainWindow):
         except Exception:
             if saved:
                 restore_file(path, old_bytes)
+            if self.worker.frame_processor is not new_processor:
+                self._close_unused_processor(new_processor)
             if was_running and self.state.camera_on:
                 self.worker.start_inference()
             raise
@@ -2472,7 +2635,7 @@ class MainWindow(QMainWindow):
 
         try:
             new_processor = (
-                self._create_processor_from_config()
+                self._run_model_load(self._create_processor_from_config)
                 if self.processor is None or new_signature[:-1] != self._runtime_model_signature[:-1]
                 else self.processor
             )
@@ -2504,9 +2667,8 @@ class MainWindow(QMainWindow):
 
         if was_inference_on and self.state.camera_on:
             self.worker.start_inference()
-            self._status_label.setText("检测中")
-        else:
-            self._status_label.setText("模型已加载")
+        # 按真实状态显示，不按加载前记下的状态猜。
+        self._status_label.setText("检测中" if self.state.inference_on else "模型已加载")
         self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
         return True
 
@@ -2516,17 +2678,7 @@ class MainWindow(QMainWindow):
         self._configure_lstm_action()
         if self.step_engine is None:
             return
-        self.step_engine = StepSequenceEngine(
-            step_class_names=self.config.category_names,
-            step_counts=self.config.get_runtime_category_counts(),
-            enter_stable_frames=self.config.action_pass_stable_frames,
-            out_of_order_frames=self.config.action_ng_stable_frames,
-            leave_stable_frames=getattr(self.config, "action_leave_stable_frames", 4),
-            order_constraint_enabled=self.config.action_order_constraint_enabled,
-            fail_retry_enabled=getattr(self.config, "action_fail_retry_enabled", False),
-            fail_retry_frames=getattr(self.config, "action_ng_stable_frames", 10),
-            detection_updates=not self._uses_lstm_sequence(),
-        )
+        self.step_engine = build_step_engine(self.config)
         self._sticky_ng_step_idx = -1
         self._last_step_focus_key = None
 
@@ -2692,5 +2844,11 @@ class MainWindow(QMainWindow):
         self.close()
 
     def closeEvent(self, event) -> None:
+        if self._model_loading:
+            # 提交还在进行，此时拆相机会和提交交错；等加载结束再关。
+            self._close_after_model_load = True
+            event.ignore()
+            return
         self._close_camera_session(clear_visuals=False)
+        self.flush_production_stats()
         event.accept()

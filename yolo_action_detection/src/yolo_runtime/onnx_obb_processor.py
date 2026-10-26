@@ -42,6 +42,10 @@ class OnnxObbProcessor:
         self._input_size: Tuple[int, int] = (640, 640)  # width, height
         self._class_names: Dict[int, str] = {}
 
+    def close(self) -> None:
+        """释放 ONNX Runtime 会话。换模型后显式调用，不依赖 GC 回收显存/内存。"""
+        self._session = None
+
     def load(self) -> None:
         """Load ONNX Runtime session and metadata."""
         path = Path(self._model_path)

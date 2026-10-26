@@ -596,3 +596,23 @@ class StepSequenceEngine:
             if step.configured and step.status != StepStatus.PASS:
                 return False
         return True
+
+
+def build_step_engine(config) -> StepSequenceEngine:
+    """按配置创建步骤引擎，所有构造入口共用。
+
+    顺序模式由 LSTM 动作结算步骤时，逐帧检测不能推进步骤。
+    """
+    from lstm_action.bundle import uses_lstm_sequence
+
+    return StepSequenceEngine(
+        step_class_names=config.category_names,
+        step_counts=config.get_runtime_category_counts(),
+        enter_stable_frames=config.action_pass_stable_frames,
+        out_of_order_frames=config.action_ng_stable_frames,
+        leave_stable_frames=getattr(config, "action_leave_stable_frames", 4),
+        order_constraint_enabled=config.action_order_constraint_enabled,
+        fail_retry_enabled=getattr(config, "action_fail_retry_enabled", False),
+        fail_retry_frames=getattr(config, "action_ng_stable_frames", 10),
+        detection_updates=not uses_lstm_sequence(config),
+    )

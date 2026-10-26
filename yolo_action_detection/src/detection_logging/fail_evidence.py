@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import cv2
+
+logger = logging.getLogger("yolo_action_detection.runtime")
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,7 @@ class FailEvidenceSaver:
             image_path = folder / "frame.jpg"
             ok, encoded = cv2.imencode(".jpg", frame)
             if not ok:
+                logger.error("fail_evidence=encode_failed folder=%s", folder)
                 return None
             image_path.write_bytes(encoded.tobytes())
 
@@ -69,6 +73,8 @@ class FailEvidenceSaver:
             )
             return folder
         except Exception:
+            # 调用方只拿到 None，具体原因记在这里。
+            logger.exception("fail_evidence=save_failed base_dir=%s", self.base_dir)
             return None
 
     def _build_event_dir(self, event_time: datetime, context: FailEvidenceContext) -> Path:

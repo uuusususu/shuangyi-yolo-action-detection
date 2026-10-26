@@ -36,6 +36,10 @@ class YoloObbProcessor:
         self._model = None
         self._class_names: dict = {}
 
+    def close(self) -> None:
+        """释放模型。换模型后显式调用。"""
+        self._model = None
+
     def load(self) -> None:
         """加载 YOLO 模型。"""
         from ultralytics import YOLO

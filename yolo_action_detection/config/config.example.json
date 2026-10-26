@@ -38,5 +38,9 @@
   "pass_sound_enabled": false,
   "fail_sound_enabled": true,
   "sound_feedback_enabled": true,
-  "fail_evidence_enabled": true
+  "fail_evidence_enabled": true,
+  "production_started_at": 0,
+  "production_total": 0,
+  "production_ok": 0,
+  "production_ng": 0
 }

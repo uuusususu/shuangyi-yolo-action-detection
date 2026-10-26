@@ -203,10 +203,12 @@ def test_roi_runtime_uses_display_frame_size_for_legacy_payload_without_image_si
     passing = [_det("A", 600, 100), _det("B", 700, 100)]
     payload = _payload(passing, 1)
     payload.pop("image_size")
+    # 旧载荷没带 image_size 时，尺寸取自显示帧；界面只读尺寸，不拷贝整帧。
+    monkeypatch.setattr(window.worker, "get_display_frame_size", lambda: (1000, 1000))
     monkeypatch.setattr(
         window.worker,
         "get_display_frame",
-        lambda: (np.zeros((1000, 1000, 3), dtype=np.uint8), 1),
+        lambda: pytest.fail("只需要尺寸时不应拷贝整帧"),
     )
 
     window._on_overlay_updated(payload)

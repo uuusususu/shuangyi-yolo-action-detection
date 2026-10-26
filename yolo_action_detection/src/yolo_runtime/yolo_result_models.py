@@ -70,6 +70,8 @@ class PipelineStats:
     template_ms: float = 0.0
     yolo_ms: float = 0.0
     render_ms: float = 0.0
+    # 界面积压到上限、推理线程等待超时后强行发出的次数。
+    overlay_backlog_timeouts: int = 0
     task_type: str = "ultralytics_obb"
     model_path: str = ""
 
@@ -84,6 +86,7 @@ class PipelineStats:
             "template_ms": float(self.template_ms),
             "yolo_ms": float(self.yolo_ms),
             "render_ms": float(self.render_ms),
+            "overlay_backlog_timeouts": int(self.overlay_backlog_timeouts),
             "task_type": str(self.task_type),
             "model_path": str(self.model_path),
         }
