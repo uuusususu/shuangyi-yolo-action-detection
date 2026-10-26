@@ -2,8 +2,17 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
+
+
+def valid_project_id(project_id: str) -> bool:
+    """一层目录名：非空，不含路径分隔符、盘符，也不是 . / .. 。中文名照常允许。"""
+    text = str(project_id or "")
+    if not text or text != text.strip() or text in {".", ".."}:
+        return False
+    return not any(ch in text for ch in '/\\:\0')
 
 
 class ProjectStore:
@@ -12,6 +21,9 @@ class ProjectStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def project_dir(self, project_id: str) -> Path:
+        """工程名只能是 root 下的一层目录名。URL 里任何位置拿到的 id 都经过这里。"""
+        if not valid_project_id(project_id):
+            raise ValueError("工程名不能带路径")
         return self.root / project_id
 
     def create(self, project_id: str, settings: dict) -> Path:
@@ -54,7 +66,7 @@ class ProjectStore:
         folder = self.open_dir(project_id)
         return json.loads((folder / "annotations.json").read_text(encoding="utf-8"))
 
-    def save_upload(self, project_id: str, relative_name: str, content: bytes) -> Path:
+    def _upload_target(self, project_id: str, relative_name: str) -> Path:
         folder = self.open_dir(project_id)
         relative = Path(relative_name)
         if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
@@ -63,7 +75,17 @@ class ProjectStore:
             raise ValueError("文件名不合法")
         target = folder / "media" / relative
         target.parent.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def save_upload(self, project_id: str, relative_name: str, content: bytes) -> Path:
+        target = self._upload_target(project_id, relative_name)
         target.write_bytes(content)
+        return target
+
+    def move_upload(self, project_id: str, relative_name: str, staged: Path) -> Path:
+        """把已落盘的暂存文件改名到素材目录，不再整段读回内存重写。"""
+        target = self._upload_target(project_id, relative_name)
+        os.replace(staged, target)
         return target
 
     def media_missing(self, project_id: str, relative_names: list[str]) -> list[str]:

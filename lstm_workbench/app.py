@@ -6,6 +6,7 @@ import mimetypes
 import os
 import subprocess
 import threading
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -13,7 +14,7 @@ from urllib.parse import unquote, urlparse
 
 from . import check_clip, feature_store, model_registry, service, settings as settings_module
 from .dataset import check_split
-from .project_store import ProjectStore
+from .project_store import ProjectStore, valid_project_id
 from .service import (
     adopt_clip,
     annotation_blockers,
@@ -30,6 +31,36 @@ HOST = "127.0.0.1"
 PORT = 8771
 
 JOB_ERRORS = (ValueError, FileNotFoundError, KeyError, RuntimeError, OSError)
+LOOPBACK_NAMES = {"127.0.0.1", "localhost"}
+UPLOAD_CHUNK = 1024 * 1024
+
+
+def _host_name(netloc: str) -> str:
+    """Host 头或 Origin 的 netloc 去掉端口，只留主机名。"""
+    netloc = netloc.strip().lower()
+    if netloc.startswith("["):
+        return netloc[1:].split("]", 1)[0]
+    return netloc.rsplit(":", 1)[0] if ":" in netloc else netloc
+
+
+def _parse_range(header: str, file_size: int) -> tuple[int, int] | None:
+    """解析单段 bytes=start-end。格式不对或越界返回 None，由调用方回 416。"""
+    try:
+        start_text, end_text = header.removeprefix("bytes=").split("-", 1)
+        if not start_text:
+            # bytes=-N：最后 N 个字节。
+            suffix = int(end_text)
+            if suffix <= 0:
+                return None
+            return max(0, file_size - suffix), file_size - 1
+        start = int(start_text)
+        end = int(end_text) if end_text else file_size - 1
+    except ValueError:
+        return None
+    end = min(end, file_size - 1)
+    if start < 0 or start > end:
+        return None
+    return start, end
 
 
 class Workbench:
@@ -75,10 +106,47 @@ def make_handler(workbench: Workbench):
                 return {}
             return json.loads(self.rfile.read(length).decode("utf-8"))
 
+        def _request_rejection(self, method: str) -> str:
+            """只放行本机页面发来的请求，返回拒绝原因，空串表示放行。
+
+            只监听 127.0.0.1 挡不住浏览器里别的网站：它们能发不带预检的跨站 POST，
+            或者用 DNS 重绑定把自己的域名指到 127.0.0.1。所以：
+            - Host 必须是 127.0.0.1/localhost（挡 DNS 重绑定）；
+            - 带 Origin 时必须是本机源；
+            - 写操作必须是 JSON 或带 X-Filename 的上传：这两种都会触发 CORS 预检，
+              别的网站发不出来（本服务不回 CORS 头，预检必然失败）。
+            """
+            host = (self.headers.get("Host") or "").strip().lower()
+            if _host_name(host) not in LOOPBACK_NAMES:
+                return "只接受本机访问"
+            origin = (self.headers.get("Origin") or "").strip().lower()
+            if origin and origin != "null" and _host_name(urlparse(origin).netloc) not in LOOPBACK_NAMES:
+                return "不接受其他网站发来的请求"
+            # 写操作的要求依赖"别的网站发不出预检"这一点：本服务刻意不实现 OPTIONS、
+            # 不回任何 CORS 头。以后别为了方便加 CORS，否则这层防护就失效了。
+            if method in {"POST", "PUT", "DELETE"}:
+                content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                try:
+                    has_body = int(self.headers.get("Content-Length", "0") or 0) > 0
+                except ValueError:
+                    return "请求长度不合法"
+                if self.headers.get("X-Filename") is None and (has_body or method != "DELETE"):
+                    if content_type != "application/json":
+                        return "请求格式不对：需要 application/json"
+            return ""
+
+        def _guard(self, method: str) -> bool:
+            reason = self._request_rejection(method)
+            if reason:
+                self._send(403, {"error": reason})
+                return False
+            return True
+
         def _open(self, project_id: str) -> Path | None:
             try:
                 return workbench.store.open_dir(project_id)
-            except FileNotFoundError:
+            except (FileNotFoundError, ValueError):
+                # ValueError：工程名带路径，按不存在处理，不暴露目录结构。
                 self._send(404, {"error": "工程不存在"})
                 return None
 
@@ -88,7 +156,7 @@ def make_handler(workbench: Workbench):
             relative = "/".join(pieces[5:])
             try:
                 folder = workbench.store.open_dir(project_id)
-            except FileNotFoundError:
+            except (FileNotFoundError, ValueError):
                 self._send(404, {"error": "工程不存在"})
                 return
             target = (folder / "media" / relative).resolve()
@@ -99,31 +167,48 @@ def make_handler(workbench: Workbench):
             if not target.is_file():
                 self._send(404, {"error": "素材不存在"})
                 return
+            self._stream_file(target, cache=True)
+
+        def _stream_file(self, target: Path, *, cache: bool) -> None:
+            """按 Range 分块发送文件：视频拖动只读请求的那一段，不把整文件读进内存。"""
             mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
             file_size = target.stat().st_size
+            start, end = 0, max(file_size - 1, 0)
+            status = 200
             range_header = self.headers.get("Range")
-            if range_header and range_header.startswith("bytes="):
-                start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
-                start = int(start_text or 0)
-                end = int(end_text) if end_text else file_size - 1
-                end = min(end, file_size - 1)
-                length = end - start + 1
-                data = target.read_bytes()[start : end + 1]
-                self.send_response(206)
-                self.send_header("Content-Type", mime)
-                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-                self.send_header("Content-Length", str(length))
-                self.send_header("Accept-Ranges", "bytes")
-                self.end_headers()
-                self.wfile.write(data)
-                return
-            data = target.read_bytes()
-            self.send_response(200)
+            if range_header and range_header.startswith("bytes=") and file_size:
+                parsed = _parse_range(range_header, file_size)
+                if parsed is None:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                start, end = parsed
+                status = 206
+            length = end - start + 1 if file_size else 0
+            self.send_response(status)
             self.send_header("Content-Type", mime)
-            self.send_header("Content-Length", str(len(data)))
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.send_header("Content-Length", str(length))
             self.send_header("Accept-Ranges", "bytes")
+            if not cache:
+                self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(data)
+            with target.open("rb") as handle:
+                handle.seek(start)
+                remaining = length
+                try:
+                    while remaining > 0:
+                        chunk = handle.read(min(UPLOAD_CHUNK, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    # 拖动进度条时浏览器会主动断开上一段请求，属正常情况。
+                    self.close_connection = True
 
         def _run_summaries(self, project_id: str, folder: Path) -> tuple[list[str], list[dict]]:
             runs = workbench.store.list_dir(project_id, "runs")
@@ -172,6 +257,8 @@ def make_handler(workbench: Workbench):
             }
 
         def do_GET(self) -> None:  # noqa: N802
+            if not self._guard("GET"):
+                return
             path = urlparse(self.path).path
             if path in {"/", "/index.html"}:
                 self._send(200, (STATIC / "index.html").read_bytes(), "text/html; charset=utf-8", cache=False)
@@ -256,6 +343,8 @@ def make_handler(workbench: Workbench):
             self._send(400, {"error": str(exc)})
 
         def do_POST(self) -> None:  # noqa: N802
+            if not self._guard("POST"):
+                return
             path = urlparse(self.path).path
             parts = path.strip("/").split("/")
             if len(parts) == 4 and parts[0] == "api" and parts[3] == "media":
@@ -267,7 +356,7 @@ def make_handler(workbench: Workbench):
                 if not project_id:
                     self._send(400, {"error": "需要工程名"})
                     return
-                if "/" in project_id or "\\" in project_id or project_id in {".", ".."}:
+                if not valid_project_id(project_id):
                     self._send(400, {"error": "工程名不能带路径"})
                     return
                 try:
@@ -326,6 +415,8 @@ def make_handler(workbench: Workbench):
             self._send(404, {"error": "没有这个接口"})
 
         def do_DELETE(self) -> None:  # noqa: N802
+            if not self._guard("DELETE"):
+                return
             parts = urlparse(self.path).path.strip("/").split("/")
             if len(parts) == 6 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "runs" and parts[5] == "check":
                 run = self._run_dir(parts[2], parts[4])
@@ -380,12 +471,33 @@ def make_handler(workbench: Workbench):
                 return
             self._send(201, {"clip": adopted})
 
+        def _drain_body(self) -> None:
+            """丢掉还没读的请求体，避免提前回错误时连接里残留数据。"""
+            remaining = int(self.headers.get("Content-Length", "0") or 0)
+            while remaining > 0:
+                chunk = self.rfile.read(min(UPLOAD_CHUNK, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+
+        def _receive_to(self, path: Path) -> None:
+            """把请求体分块写到 path，上传大视频时不整段放进内存。"""
+            remaining = int(self.headers.get("Content-Length", "0") or 0)
+            with path.open("wb") as handle:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(UPLOAD_CHUNK, remaining))
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    remaining -= len(chunk)
+
         def _media(self, project_id: str) -> None:
             name = (self.headers.get("X-Filename") or "upload.bin").replace("\\", "/")
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length)
-            folder = self._open(project_id)
-            if folder is None:
+            try:
+                folder = workbench.store.open_dir(project_id)
+            except (FileNotFoundError, ValueError):
+                self._drain_body()
+                self._send(404, {"error": "工程不存在"})
                 return
             single = "/" not in name
             replace = self.headers.get("X-Replace") == "1"
@@ -393,14 +505,17 @@ def make_handler(workbench: Workbench):
                 try:
                     collision = clip_named(workbench.store.load_annotations(project_id), name)
                 except ValueError as exc:
+                    self._drain_body()
                     self._send(400, {"error": str(exc)})
                     return
                 if collision and not replace:
+                    self._drain_body()
                     self._send(409, {"error": f"已经有这条片子：{collision.get('file') or name}。要换掉它，先确认替换。"})
                     return
-            staging = folder / "media" / (".incoming-" + Path(name).name)
+            # 加随机后缀：同名文件并发上传时暂存文件不会互相覆盖。
+            staging = folder / "media" / f".incoming-{uuid.uuid4().hex[:8]}-{Path(name).name}"
             staging.parent.mkdir(parents=True, exist_ok=True)
-            staging.write_bytes(raw)
+            self._receive_to(staging)
             probe = _probe_or_empty(staging)
             if "frame_count" not in probe:
                 staging.unlink(missing_ok=True)
@@ -416,12 +531,16 @@ def make_handler(workbench: Workbench):
                         self._send(400, {"error": f"删不掉原来的片子：{exc}"})
                         return
             try:
-                target = workbench.store.save_upload(project_id, name, staging.read_bytes())
+                target = workbench.store.move_upload(project_id, name, staging)
             except ValueError as exc:
                 staging.unlink(missing_ok=True)
                 self._send(400, {"error": str(exc)})
                 return
-            staging.unlink(missing_ok=True)
+            except OSError as exc:
+                # Windows 上目标正被播放器占用时改名会失败。
+                staging.unlink(missing_ok=True)
+                self._send(409, {"error": f"写不进素材目录，文件可能正被占用：{exc}"})
+                return
             adopted = None
             if single:
                 adopted = adopt_clip(workbench.store, project_id, name, probe, replace=False)
@@ -548,35 +667,7 @@ def make_handler(workbench: Workbench):
             if not target.is_file():
                 self._send(404, {"error": "文件不存在"})
                 return
-            mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-            file_size = target.stat().st_size
-            start, end = 0, max(file_size - 1, 0)
-            status = 200
-            range_header = self.headers.get("Range")
-            if range_header and range_header.startswith("bytes=") and file_size:
-                start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
-                start = int(start_text or 0)
-                end = int(end_text) if end_text else file_size - 1
-                end = min(end, file_size - 1)
-                if start < 0 or start > end:
-                    self.send_response(416)
-                    self.send_header("Content-Range", f"bytes */{file_size}")
-                    self.end_headers()
-                    return
-                status = 206
-            length = end - start + 1 if file_size else 0
-            with target.open("rb") as handle:
-                handle.seek(start)
-                data = handle.read(length)
-            self.send_response(status)
-            self.send_header("Content-Type", mime)
-            if status == 206:
-                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(data)
+            self._stream_file(target, cache=False)
 
         def _check_get(self, parts: list[str]) -> None:
             run = self._run_dir(parts[2], parts[4])
