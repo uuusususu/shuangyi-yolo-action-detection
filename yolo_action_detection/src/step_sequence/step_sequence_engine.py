@@ -66,6 +66,7 @@ class StepSequenceState:
     action_start_time: float = 0.0
     action_end_time: float = 0.0
     action_decision_time: float = 0.0
+    action_failed_boundary_frames: List[int] = field(default_factory=list)
 
 
 class StepSequenceEngine:
@@ -112,6 +113,7 @@ class StepSequenceEngine:
         # 本轮结束后到达的完整动作属于下一件，换轮时重放；上限防止长冷却积压。
         self._pending_events: List[dict] = []
         self._next_round_boundary: int | None = None
+        self._await_action_first_step = False
         self._boundary_frame = 0
         self._decision_frame = 0
         self._seen_parts: List[str] = []
@@ -121,6 +123,7 @@ class StepSequenceEngine:
         self._action_start_time = 0.0
         self._action_end_time = 0.0
         self._action_decision_time = 0.0
+        self._failed_action_context: dict[int, dict] = {}
 
         self._steps: List[StepState] = []
         self._round_id = 0
@@ -181,10 +184,12 @@ class StepSequenceEngine:
         if continue_from_previous and self._next_round_boundary is not None:
             threshold: int | None = self._next_round_boundary
             boundary_source = "previous_round"
+            self._await_action_first_step = True
         else:
             threshold = int(action_min_source_frame) if action_min_source_frame is not None else None
             boundary_source = "preview"
             self._pending_events.clear()
+            self._await_action_first_step = False
         self._next_round_boundary = None
         self._action_min_source_frame = threshold
         self._boundary_frame = 0
@@ -196,6 +201,7 @@ class StepSequenceEngine:
         self._action_start_time = 0.0
         self._action_end_time = 0.0
         self._action_decision_time = 0.0
+        self._failed_action_context.clear()
         self._round_started_at = time.time()
         self._round_result = RoundResult.IN_PROGRESS
         self._action_ng_step = -1
@@ -255,6 +261,10 @@ class StepSequenceEngine:
             action_start_time=self._action_start_time,
             action_end_time=self._action_end_time,
             action_decision_time=self._action_decision_time,
+            action_failed_boundary_frames=sorted({
+                int(item["_boundary_frame"]) for item in self._failed_action_context.values()
+                if item.get("_boundary_frame")
+            }),
         )
 
     def _first_configured_step_passed(self) -> bool:
@@ -392,11 +402,16 @@ class StepSequenceEngine:
         return self._settle_action_event(event)
 
     def _queue_event(self, event: dict) -> None:
+        if len(self._pending_events) >= self.PENDING_EVENT_LIMIT:
+            self._trace_event(event, "fault", "queue_overflow", "动作暂存队列已满，禁止继续放行")
+            raise RuntimeError("动作暂存队列已满，请停止检测并检查事件处理")
         self._pending_events.append(event)
         self._trace_event(event, "queued", "queued", "本轮已结束，留给下一轮", queued=len(self._pending_events))
-        if len(self._pending_events) > self.PENDING_EVENT_LIMIT:
-            dropped = self._pending_events.pop(0)
-            self._trace_event(dropped, "reject", "queue_overflow", "间隔中暂存的动作太多，丢弃最早一个")
+
+    @property
+    def pending_action_count(self) -> int:
+        """等待消费的完整动作数量，不向界面暴露可变队列。"""
+        return len(self._pending_events)
 
     def _settle_action_event(self, event: dict) -> StepSequenceState:
         if self._action_min_source_frame is not None:
@@ -411,6 +426,12 @@ class StepSequenceEngine:
             self._trace_event(event, "reject", "idle", "空闲不结算")
             return self.get_state()
         name = str(event.get("name") or "")
+        if self._await_action_first_step:
+            first = self._first_configured_step_index()
+            if first < 0 or name != self._steps[first].class_name:
+                self._trace_event(event, "reject", "await_first_step", "续轮等待新产品首步，忽略上一件尾部动作")
+                return self.get_state()
+            self._await_action_first_step = False
         if self._starts_next_product(name):
             self._roll_over_to_next_round(event)
             return self.get_state()
@@ -497,6 +518,19 @@ class StepSequenceEngine:
         step.ng_at = time.time()
         step.ng_reason = reason
         step.current_count = 0
+        # 后续动作仍可继续，但不能把真正出错动作的帧与缺件列表覆盖成
+        # 最后一个合格动作，整轮 NG 的取证需要这份独立快照。
+        self._failed_action_context.setdefault(step.index, {
+            "_boundary_frame": self._boundary_frame,
+            "_decision_frame": self._decision_frame,
+            "_seen_parts": list(self._seen_parts),
+            "_missing_parts": list(self._missing_parts),
+            "_event_name": self._event_name,
+            "_weights_sha256": self._weights_sha256,
+            "_action_start_time": self._action_start_time,
+            "_action_end_time": self._action_end_time,
+            "_action_decision_time": self._action_decision_time,
+        })
         self._mark_open_steps_not_detected(before=step.index)
         self._finish_action_round()
 
@@ -520,6 +554,10 @@ class StepSequenceEngine:
         if any(step.class_name == name and step.status not in (StepStatus.PASS, StepStatus.NG) for step in configured):
             return False
         resolved = [step.index for step in configured if step.status in (StepStatus.PASS, StepStatus.NG)]
+        # 一个完整首步只属于一件产品。再次完成首步时，不能用后来的
+        # 封装补齐上一件漏步；同件返工也按保守的重新开件处理。
+        if configured and name == configured[0].class_name and configured[0].index in resolved:
+            return True
         if not resolved or self._steps[max(resolved)].class_name == name:
             return False
         return any(step.class_name == name and step.index < max(resolved) for step in configured)
@@ -547,6 +585,11 @@ class StepSequenceEngine:
         self._round_result = RoundResult.ACTION_NG
         self._action_ng_step = failed[0].index
         self._action_ng_reason = "；".join(step.ng_reason for step in failed if step.ng_reason)
+        context = self._failed_action_context.get(failed[0].index)
+        if context is None and self._failed_action_context:
+            context = next(iter(self._failed_action_context.values()))
+        for key, value in (context or {}).items():
+            setattr(self, key, value)
         self._round_completed_at = time.time()
         trace(
             "round_result",

@@ -231,8 +231,10 @@ def test_captured_during_cooldown_action_cannot_pass_when_inference_lags(qapp, t
     assert window._stats_manager.batch.ok == 0
     new_event = dict(late_event, event_id=2, start_frame=46, end_frame=70, decision_frame=75)
     window._on_overlay_updated({"source_frame_id": 75, "lstm_action": {"events": [new_event]}})
-    assert window.step_engine.get_state().round_result == RoundResult.PASS
+    # 类别全部完成即计 PASS，并立刻进入下一轮等待下一件。
     assert window._stats_manager.batch.ok == 1
+    assert window.step_engine.get_state().round_result == RoundResult.IN_PROGRESS
+    assert window._result_label.text() == "PASS"
     window._round_pass_timer.stop()
 
 
@@ -268,7 +270,107 @@ def test_lstm_events_during_cooldown_are_kept_for_the_next_round(qapp, tmp_path,
     monkeypatch.setattr(window.worker, "get_latest_preview_frame_id", lambda: 75, raising=False)
     window._round_pass_timer.stop()
     window._on_round_pass_settled()
-    assert window.step_engine.get_state().round_result == RoundResult.PASS
+    # 间隔中到达的动作照常计入下一件；展示时间到后结果清掉，进入新一轮等待下一件。
+    assert window.step_engine.get_state().round_result == RoundResult.IN_PROGRESS
+    assert window._stats_manager.batch.ok == 2
+    window._round_pass_timer.stop()
+
+
+def _continuous_window(tmp_path):
+    window = make_window(tmp_path)
+    window.config.action_order_constraint_enabled = True
+    window.config.category_names = ["包装", "封装", "", "", "", ""]
+    window.step_engine = StepSequenceEngine(
+        step_class_names=window.config.category_names, detection_updates=False,
+    )
+    window._refresh_steps()
+    window.state.set_camera_on(True)
+    window.state.set_inference_on(True)
+    window._begin_step_round()
+    return window
+
+
+def _completed(index, name, start, end, missing=()):
+    return {
+        "session_id": 1, "event_id": index, "class_id": name, "name": name,
+        "start_frame": start, "end_frame": end, "decision_frame": end,
+        "parts": [], "missing_parts": list(missing),
+    }
+
+
+@pytest.mark.parametrize("hold_seconds", [0.0, 1.0, 5.0, 60.0])
+def test_all_rounds_in_one_overlay_are_counted_without_waiting_for_display(qapp, tmp_path, hold_seconds, monkeypatch):
+    window = _continuous_window(tmp_path)
+    window.config.round_cooldown_seconds = hold_seconds
+    window.config.pass_sound_enabled = True
+    sounds = []
+    monkeypatch.setattr(window._sound_feedback, "play_pass", lambda: sounds.append("pass"))
+    events = [_completed(i, "包装" if i % 2 else "封装", i * 20, (i + 1) * 20) for i in range(1, 25)]
+    window._on_overlay_updated({"source_frame_id": 500, "lstm_action": {"events": events}})
+    assert window._stats_manager.batch.ok == 12
+    assert window._stats_manager.batch.ng == 0
+    assert len(sounds) == 12
+    assert not window.step_engine._pending_events
+    window._round_pass_timer.stop()
+
+
+def test_display_timeout_does_not_reset_the_next_product_in_progress(qapp, tmp_path):
+    window = _continuous_window(tmp_path)
+    events = [_completed(1, "包装", 10, 30), _completed(2, "封装", 30, 50), _completed(3, "包装", 50, 70)]
+    window._on_overlay_updated({"source_frame_id": 70, "lstm_action": {"events": events}})
+    round_id = window.step_engine.get_state().round_id
+    assert window.step_engine.get_state().steps[0].status.value == "pass"
+    window._round_pass_timer.stop()
+    window._on_round_pass_settled()
+    state = window.step_engine.get_state()
+    assert state.round_id == round_id
+    assert state.steps[0].status.value == "pass"
+    assert window._stats_manager.batch.ok == 1
+
+
+def test_real_qt_timeout_keeps_the_next_product_progress(qapp, tmp_path):
+    from PySide6.QtTest import QTest
+
+    window = _continuous_window(tmp_path)
+    window.config.round_cooldown_seconds = 0.01
+    events = [_completed(1, "包装", 10, 30), _completed(2, "封装", 30, 50), _completed(3, "包装", 50, 70)]
+    window._on_overlay_updated({"source_frame_id": 70, "lstm_action": {"events": events}})
+    round_id = window.step_engine.get_state().round_id
+    QTest.qWait(50)
+    assert not window._round_pass_timer.isActive()
+    assert window.step_engine.get_state().round_id == round_id
+    assert window.step_engine.get_state().steps[0].status.value == "pass"
+    assert window._stats_manager.batch.ok == 1
+
+
+def test_delayed_ng_keeps_its_image_after_five_newer_action_boundaries(qapp, tmp_path):
+    import cv2
+    from yolo_runtime.yolo_result_models import DetectionOverlayState
+
+    window = _continuous_window(tmp_path)
+    window.worker.set_action_session(SimpleNamespace(reset=lambda: None))
+    window.worker.overlay_state_updated.disconnect(window._on_overlay_updated)
+    delivered = []
+    window.worker.overlay_state_updated.connect(delivered.append)
+    for index in range(1, 7):
+        end = index * 30 + 10
+        frame = np.full((12, 16, 3), index * 20, np.uint8)
+        event = _completed(index, "包装" if index % 2 else "封装", end - 30, end,
+                           ["路由器"] if index == 1 else [])
+        window.worker._cache_action_evidence(frame, end, float(end), [], "test.onnx")
+        report = {"events": [event], "evidence_frames": []}
+        window.worker._prune_action_evidence(report)
+        window.worker._publish_inference_result(frame, end, DetectionOverlayState(), report)
+    assert window.worker.get_action_boundary_evidence(40) is None
+    for payload in delivered:
+        window._on_overlay_updated(payload)
+    metadata_files = list((tmp_path / "evidence").rglob("metadata.json"))
+    assert len(metadata_files) == 1
+    metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+    assert metadata["source_frame_id"] == 40
+    image = cv2.imdecode(np.frombuffer((metadata_files[0].parent / "frame.jpg").read_bytes(), np.uint8), cv2.IMREAD_COLOR)
+    assert np.allclose(image, 20, atol=2)
+    assert window._stats_manager.batch.ng == 1
     assert window._stats_manager.batch.ok == 2
     window._round_pass_timer.stop()
 
@@ -371,3 +473,48 @@ def test_runtime_paths_and_bundle_hash_are_independent_of_cwd(qapp, tmp_path, mo
     monkeypatch.setattr(lstm_action.bundle, "load_runtime_bundle", capture)
     window._load_action_session()
     assert calls == [(tmp_path / "bundle", str(tmp_path / "models/yolo.pt"))]
+
+
+def test_finished_round_clears_the_step_list_immediately_and_waits_for_the_next_action(qapp, tmp_path):
+    """配置的类别（包装、封装）都完成，这一件就结束：识别列表马上清空，
+    顶部 PASS 按间隔时间保留；下一件检测到动作再继续显示。"""
+    window = _continuous_window(tmp_path)
+    first_round = window.step_engine.get_state().round_id
+    events = [_completed(1, "包装", 10, 30), _completed(2, "封装", 30, 50)]
+    window._on_overlay_updated({"source_frame_id": 50, "lstm_action": {"events": events}})
+
+    state = window.step_engine.get_state()
+    assert window._stats_manager.batch.ok == 1
+    assert state.round_result == RoundResult.IN_PROGRESS
+    assert state.round_id == first_round + 1
+    assert all(step.status.value not in ("pass", "ng") for step in state.steps if step.configured)
+    assert all(card.isHidden() for card in window._step_cards)
+    assert window._result_label.text() == "PASS"
+    assert window._round_pass_timer.isActive()
+
+    window._round_pass_timer.stop()
+    window._on_round_pass_settled()
+    assert window._result_label.text() == ""
+    assert window.step_engine.get_state().round_id == first_round + 1
+
+    # 下一件开始做：第一步出现在列表里，做完照常计第二个 PASS。
+    window._on_overlay_updated({"source_frame_id": 70, "lstm_action": {"events": [_completed(3, "包装", 60, 70)]}})
+    assert not window._step_cards[0].isHidden()
+    assert window._step_cards[0].state_name() == "pass"
+    window._on_overlay_updated({"source_frame_id": 90, "lstm_action": {"events": [_completed(4, "封装", 70, 90)]}})
+    assert window._stats_manager.batch.ok == 2
+    assert all(card.isHidden() for card in window._step_cards)
+    window._round_pass_timer.stop()
+
+
+def test_ng_round_clears_the_step_list_but_keeps_the_reason(qapp, tmp_path):
+    window = _continuous_window(tmp_path)
+    events = [_completed(1, "封装", 10, 30)]
+    window._on_overlay_updated({"source_frame_id": 30, "lstm_action": {"events": events}})
+    if window._stats_manager.batch.ng == 0:
+        window._on_overlay_updated({"source_frame_id": 60, "lstm_action": {"events": [_completed(2, "包装", 30, 60)]}})
+    assert window._stats_manager.batch.ng == 1
+    assert window.step_engine.get_state().round_result == RoundResult.IN_PROGRESS
+    assert window._result_label.text() == "NG"
+    assert window._notice_label.text()
+    window._round_pass_timer.stop()

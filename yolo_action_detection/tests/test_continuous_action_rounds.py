@@ -4,6 +4,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from step_sequence.step_sequence_engine import RoundResult, StepSequenceEngine, StepStatus
@@ -107,7 +109,11 @@ def test_the_hold_queue_is_bounded():
     engine.apply_action_event(_event(1, "包装", 24, 68))
     engine.apply_action_event(_event(2, "封装", 68, 103))
     for event_id in range(3, 3 + StepSequenceEngine.PENDING_EVENT_LIMIT + 5):
-        engine.apply_action_event(_event(event_id, "包装", 103 + event_id, 104 + event_id))
+        if event_id < 3 + StepSequenceEngine.PENDING_EVENT_LIMIT:
+            engine.apply_action_event(_event(event_id, "包装", 103 + event_id, 104 + event_id))
+        else:
+            with pytest.raises(RuntimeError, match="暂存队列已满"):
+                engine.apply_action_event(_event(event_id, "包装", 103 + event_id, 104 + event_id))
     assert len(engine._pending_events) == StepSequenceEngine.PENDING_EVENT_LIMIT
 
 
@@ -135,10 +141,46 @@ def test_an_earlier_action_after_later_steps_starts_the_next_product():
     assert state.steps[1].status == StepStatus.WAITING
 
 
-def test_the_same_action_split_by_a_short_pause_does_not_start_a_new_product():
+def test_another_complete_first_step_is_a_conservative_new_product_boundary():
     engine = _engine()
     engine.apply_action_event(_event(1, "包装", 24, 60))
     state = engine.apply_action_event(_event(2, "包装", 63, 80))
-    assert state.round_result == RoundResult.IN_PROGRESS
+    assert state.round_result == RoundResult.ACTION_NG
     assert state.steps[0].status == StepStatus.PASS
+    assert state.steps[1].status == StepStatus.NG
+
+
+def test_a_second_complete_first_action_closes_the_product_with_a_missing_last_step():
+    engine = _engine()
+    engine.apply_action_event(_event(1, "包装", 24, 60))
+    state = engine.apply_action_event(_event(2, "包装", 60, 100))
+    assert state.round_result == RoundResult.ACTION_NG
+    assert "未检测到步骤2(封装)" in state.action_ng_reason
+    engine.start_round(action_min_source_frame=999, continue_from_previous=True)
+    state = engine.apply_action_event(_event(3, "封装", 100, 140))
+    assert state.round_result == RoundResult.PASS
+
+
+def test_a_missing_part_in_a_new_pack_is_not_assigned_to_seal():
+    engine = _engine()
+    engine.apply_action_event(_event(1, "包装", 24, 60))
+    engine.apply_action_event(_event(2, "包装", 60, 100, missing=["充电器"]))
+    engine.start_round(action_min_source_frame=999, continue_from_previous=True)
+    state = engine.get_state()
+    assert state.steps[0].status == StepStatus.NG
+    assert "充电器" in state.steps[0].ng_reason
     assert state.steps[1].status == StepStatus.WAITING
+
+
+def test_a_repeated_last_action_does_not_create_an_extra_ng_after_a_pass():
+    engine = _engine()
+    engine.apply_action_event(_event(1, "包装", 24, 60))
+    engine.apply_action_event(_event(2, "封装", 60, 100))
+    engine.apply_action_event(_event(3, "封装", 100, 140))
+    engine.start_round(action_min_source_frame=999, continue_from_previous=True)
+    state = engine.get_state()
+    assert state.round_result == RoundResult.IN_PROGRESS
+    assert state.steps[0].status == StepStatus.WAITING
+    engine.apply_action_event(_event(4, "包装", 140, 180))
+    state = engine.apply_action_event(_event(5, "封装", 180, 220))
+    assert state.round_result == RoundResult.PASS

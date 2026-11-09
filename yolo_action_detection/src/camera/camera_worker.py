@@ -471,7 +471,19 @@ class CameraWorker(QObject):
         if overlay.hand_landmarks:
             payload["hand_landmarks"] = overlay.hand_landmarks
         if action_report is not None:
-            payload["lstm_action"] = action_report
+            report = dict(action_report)
+            events = []
+            for original in action_report.get("events", []):
+                event = dict(original)
+                evidence = self.get_action_boundary_evidence(int(event.get("end_frame") or 0))
+                if evidence is not None:
+                    image, detections, metadata = evidence
+                    metadata["runtime_generation"] = self.runtime_generation
+                    # 图片归该 Qt 消息所有，缓存驱逐不能使尚未消费的 NG 丢图。
+                    event["_boundary_evidence"] = (image, detections, metadata)
+                events.append(event)
+            report["events"] = events
+            payload["lstm_action"] = report
         payload["source_frame"] = frame
         payload["runtime_generation"] = self.runtime_generation
         with self._overlay_backlog_cond:

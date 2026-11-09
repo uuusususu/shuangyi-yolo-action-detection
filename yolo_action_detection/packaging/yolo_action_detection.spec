@@ -96,7 +96,14 @@ def _cpu_only_binary(entry) -> bool:
     return not any(marker in name for marker in _CUDA_LIBRARY_MARKERS)
 
 
-a.binaries = [entry for entry in a.binaries if _cpu_only_binary(entry)]
+# Qt 使用 Windows 自带 ICU 的无版本后缀接口。构建机 PATH 中的 Poppler
+# 可能提供同名但导出 ICU_78 接口的 icuuc.dll，打入包内会使 QtWidgets
+# 在启动日志初始化前即因入口点缺失而失败。这两项由目标 Windows 提供。
+_WINDOWS_SYSTEM_ICU = {"icuuc.dll", "icuin.dll"}
+a.binaries = [
+    entry for entry in a.binaries
+    if _cpu_only_binary(entry) and Path(entry[0]).name.lower() not in _WINDOWS_SYSTEM_ICU
+]
 
 pyz = PYZ(a.pure, a.zipped_data)
 

@@ -693,8 +693,10 @@ def test_hold_timer_skips_step_engine_update(qapp, tmp_path):
     window._round_pass_timer.stop()
 
 
-def test_round_cooldown_delays_next_round_start(qapp, tmp_path):
+@pytest.mark.parametrize("lstm_mode", [False, True])
+def test_round_cooldown_advances_only_the_yolo_round(qapp, tmp_path, lstm_mode):
     config = _config(tmp_path)
+    config.action_order_constraint_enabled = lstm_mode
     config.round_cooldown_seconds = 10.0
     window = _window(config, lambda runtime_config, **_: DummyProcessor(runtime_config.yolo_model_path), DummyProcessor("old"))
     window.step_engine.start_round()
@@ -706,7 +708,7 @@ def test_round_cooldown_delays_next_round_start(qapp, tmp_path):
     assert window._round_pass_timer.interval() == 10000
     window._round_pass_timer.stop()
     window._on_round_pass_settled()
-    assert window.step_engine.get_state().round_id == original_round_id + 1
+    assert window.step_engine.get_state().round_id == original_round_id + int(not lstm_mode)
 
 
 def test_runtime_recognition_list_holds_pass_and_quantity_during_cooldown(qapp, tmp_path):

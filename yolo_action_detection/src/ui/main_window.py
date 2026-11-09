@@ -1028,6 +1028,10 @@ class MainWindow(QMainWindow):
             if boundary:
                 evidence = self.worker.get_action_boundary_evidence(boundary)
                 if evidence is None:
+                    candidate = getattr(self, "_action_feedback_evidence", {}).get(boundary)
+                    if candidate is not None and candidate[2].get("runtime_generation") == self.worker.runtime_generation:
+                        evidence = candidate
+                if evidence is None:
                     self._action_evidence_warning = f"动作边界第 {boundary} 帧证据不可用"
                     self._set_notice(f"NG 已记录，{self._action_evidence_warning}")
                     self._runtime_logger.error("action_evidence=unavailable boundary=%s decision=%s", boundary, decision)
@@ -1199,7 +1203,7 @@ class MainWindow(QMainWindow):
         self._kpi_row.set_value("ng", str(batch.ng))
 
     def _on_round_pass_settled(self) -> None:
-        """完成一轮间隔结束后再启动新一轮。"""
+        """LSTM 只结束结果展示；原 YOLO 模式仍按间隔开始下一轮。"""
         if self._pending_step_engine_rebuild:
             self._pending_step_engine_rebuild = False
             self._rebuild_step_engine()
@@ -1207,6 +1211,14 @@ class MainWindow(QMainWindow):
         self._clear_result_label()
         self._status_label.setText("检测中")
         self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
+        if self._uses_lstm_sequence():
+            # 连续作业时，下一件的首步可能在展示期间就已经开轮（引擎回到进行中），
+            # 这时不能重置，否则会清掉下一件已经完成的步骤。
+            # 但如果展示结束时引擎仍停在上一件的 PASS/NG，就必须开新轮：
+            # 以前这里直接 return，下一件没动作之前界面一直显示上一件的标签，不会消失。
+            if self.step_engine and self.step_engine.get_state().round_result != RoundResult.IN_PROGRESS:
+                self._start_new_round_now()
+            return
         self._start_new_round_now()
 
     def _set_result_label(self, text: str, color: str) -> None:
@@ -1425,8 +1437,15 @@ class MainWindow(QMainWindow):
                 state = self.step_engine.get_state()
                 events = list(report.get("events") or [])
                 if self.state.inference_on:
-                    for event in events:
-                        state = self.step_engine.apply_action_event(event)
+                    try:
+                        for event in events:
+                            state = self._consume_lstm_action_event(event, str(report.get("action") or ""))
+                    except RuntimeError as exc:
+                        self._action_runtime_fault = str(exc)
+                        self.worker.stop_inference()
+                        self._round_pass_timer.stop()
+                        self._set_notice(f"动作处理故障，已停止检测，禁止放行：{exc}")
+                        self._runtime_logger.exception("action_processing=failed")
                 else:
                     for event in events:
                         trace(
@@ -1442,7 +1461,11 @@ class MainWindow(QMainWindow):
                         )
                 self._show_action_progress(report)
             self._log_step_sequence_frame(data, obb_dets, judged, state, frozen)
-            if not getattr(self, "_action_runtime_fault", ""):
+            if (
+                not getattr(self, "_action_runtime_fault", "")
+                and state is not None
+                and state.round_result == RoundResult.IN_PROGRESS
+            ):
                 self._update_step_display(state, live_action=str(report.get("action") or ""))
         elif self.step_engine:
             frozen = self._round_pass_timer.isActive()
@@ -1473,6 +1496,44 @@ class MainWindow(QMainWindow):
         # 渲染不在事件路径上进行：积压时判定仍逐帧推进，而画面由定时器统一取最新状态渲染。
         self._latest_runtime_overlay = overlay
         self._record_coordinate_log(overlay, state)
+
+    def _consume_lstm_action_event(self, event: dict, live_action: str = ""):
+        """每个事件及时记账；结果显示停留不参与业务换轮。"""
+        if self.step_engine.get_state().round_result != RoundResult.IN_PROGRESS:
+            self._start_new_round_now()
+        generation = self.worker.runtime_generation
+        if getattr(self, "_action_feedback_evidence_generation", None) != generation:
+            self._action_feedback_evidence = {}
+            self._action_feedback_evidence_generation = generation
+        evidence = event.get("_boundary_evidence")
+        boundary = int(event.get("end_frame") or 0)
+        if (
+            evidence is not None
+            and evidence[2].get("source_frame_id") == boundary
+            and evidence[2].get("runtime_generation") == generation
+        ):
+            self._action_feedback_evidence[boundary] = evidence
+        state = self.step_engine.apply_action_event(event)
+        self._update_step_display(state, live_action=live_action)
+        # 配置的类别全部完成（PASS 或 NG），这一件就结束：计数、声音、证据在上面
+        # _update_step_display 里已经做完，这里立刻开新一轮，识别列表马上清空，
+        # 等下一件检测到动作再显示。顶部 PASS/NG 徽章按"间隔时间"保留，到点由
+        # _on_round_pass_settled 清掉。新轮可能重放暂存动作又结束一件，所以循环。
+        finished = None
+        notice = self._notice_label.text()
+        while state.round_result != RoundResult.IN_PROGRESS:
+            finished = state
+            self._start_new_round_now()
+            state = self.step_engine.get_state()
+        if finished is not None and finished.round_result == RoundResult.ACTION_NG and notice:
+            # 开新轮会清提示，NG 原因要留给操作员看。
+            self._set_notice(notice)
+        keep = set(getattr(state, "action_failed_boundary_frames", []))
+        keep.update(list(self._action_feedback_evidence)[-2:])
+        self._action_feedback_evidence = {
+            frame: owned for frame, owned in self._action_feedback_evidence.items() if frame in keep
+        }
+        return state
 
     def _handle_roi_results(
         self,
@@ -1791,7 +1852,6 @@ class MainWindow(QMainWindow):
             if self.worker.open_camera():
                 self._runtime_logger.info("camera_open=ok")
                 self._display_timer.start(33)
-                self._set_scanline_active(True)
                 self._status_label.setText("预览中")
                 self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
             else:
@@ -2353,7 +2413,6 @@ class MainWindow(QMainWindow):
             self.worker.stop_inference()
         self.worker.reset_action_session()
         self._display_timer.stop()
-        self._set_scanline_active(False)
         self._round_pass_timer.stop()
         self._stop_template_diagnostics()
         if self._coordinate_logger.active:
@@ -2383,7 +2442,7 @@ class MainWindow(QMainWindow):
         self._refresh_steps()
 
     def _build_viewfinder_overlays(self, frame: QFrame) -> None:
-        """取景器 HUD：四角 L 标 + 垂直扫描线（无辉光/模糊，只用描边）。"""
+        """取景器 HUD：四角 L 标（无辉光/模糊，只用描边）。"""
         self._viewfinder_corners = []
         for v_edge, h_edge in (("top", "left"), ("top", "right"), ("bottom", "left"), ("bottom", "right")):
             mark = QFrame(frame)
@@ -2398,26 +2457,13 @@ class MainWindow(QMainWindow):
             mark.raise_()
             self._viewfinder_corners.append((mark, v_edge, h_edge))
 
-        self._scanline = QFrame(frame)
-        self._scanline.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._scanline.setStyleSheet(f"QFrame {{ background-color: {TEXT_ACCENT}; border: none; }}")
-        self._scanline.setFixedHeight(2)
-        self._scanline.setVisible(False)
-        self._scanline.raise_()
-
-        self._scan_offset = 0
-        self._scan_timer = QTimer(self)
-        self._scan_timer.setInterval(60)
-        self._scan_timer.timeout.connect(self._advance_scanline)
-
         frame.installEventFilter(self)
         self._position_hud_overlays()
 
     def _position_hud_overlays(self) -> None:
         frame = getattr(self, "_video_frame", None)
-        scanline = getattr(self, "_scanline", None)
         corners = getattr(self, "_viewfinder_corners", None)
-        if frame is None or scanline is None or not corners:
+        if frame is None or not corners:
             return
         inset = 12
         width = frame.width()
@@ -2426,34 +2472,7 @@ class MainWindow(QMainWindow):
             x = inset if h_edge == "left" else max(0, width - inset - mark.width())
             y = inset if v_edge == "top" else max(0, height - inset - mark.height())
             mark.move(x, y)
-        scanline.setFixedWidth(max(0, width - inset * 2))
-        scanline.move(inset, inset + self._scan_offset)
-        scanline.raise_()
-        for mark, _v_edge, _h_edge in corners:
             mark.raise_()
-
-    def _advance_scanline(self) -> None:
-        frame = getattr(self, "_video_frame", None)
-        scanline = getattr(self, "_scanline", None)
-        if frame is None or scanline is None or not scanline.isVisible():
-            return
-        span = max(1, frame.height() - 24 - scanline.height())
-        self._scan_offset = (self._scan_offset + 8) % span
-        scanline.move(scanline.x(), 12 + self._scan_offset)
-
-    def _set_scanline_active(self, active: bool) -> None:
-        scanline = getattr(self, "_scanline", None)
-        timer = getattr(self, "_scan_timer", None)
-        if scanline is None or timer is None:
-            return
-        if active:
-            self._scan_offset = 0
-            self._position_hud_overlays()
-            scanline.setVisible(True)
-            timer.start()
-        else:
-            timer.stop()
-            scanline.setVisible(False)
 
     def eventFilter(self, obj, event):
         if obj is getattr(self, "_video_frame", None) and event.type() == QEvent.Type.Resize:
@@ -2554,7 +2573,7 @@ class MainWindow(QMainWindow):
         new_signature = self._step_engine_config_signature(self.config)
         if new_signature == self._step_engine_signature:
             return False
-        if self._round_pass_timer.isActive():
+        if self._round_pass_timer.isActive() and not self._uses_lstm_sequence():
             self._pending_step_engine_rebuild = True
             return False
         self._rebuild_step_engine()
