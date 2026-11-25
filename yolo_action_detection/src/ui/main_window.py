@@ -49,23 +49,30 @@ from step_sequence.step_sequence_engine import (
     build_step_engine,
 )
 from ui.runtime_ui_tokens import (
+    CHIP_BG,
     FONT_MICRO,
-    FONT_TITLE,
     FONT_SMALL,
+    FONT_TITLE,
     MONO_FAMILY,
     PAGE_BG,
     PAGE_MARGIN,
+    PAGE_SPACING,
     PANEL_BG,
     PANEL_BG_DARK,
     PRIMARY_CONTROL_HEIGHT,
+    RIGHT_PANEL_MAX_WIDTH,
+    RIGHT_PANEL_MIN_WIDTH,
     STEP_NG_BORDER,
     STEP_PASS_BORDER,
     STROKE_MAIN,
+    STROKE_SUBTLE,
     TEXT_ACCENT,
     TEXT_DANGER,
     TEXT_MUTED,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
+    TEXT_SUCCESS,
+    TEXT_WARNING,
     TOP_BAR_HEIGHT,
     VIEWPORT_BG,
     frame_style,
@@ -77,6 +84,7 @@ from ui.frame_text import draw_bgr_texts
 from ui.widgets.native_panels import (
     KpiRow,
     RecognitionListItem,
+    ResultBannerWidget,
 )
 from yolo_runtime.yolo_result_models import DetectionOverlayState, ObbDetection
 from template_matching.template_store import resolve_template_path, template_file_signature, restore_file
@@ -129,7 +137,7 @@ class MainWindow(QMainWindow):
         self._runtime_logger = get_runtime_logger()
         self._runtime_log_path = Path(runtime_log_path) if runtime_log_path else None
 
-        self.setWindowTitle("双翼科技视觉行为引导系统")
+        self.setWindowTitle("双翼视觉防错系统")
         self.setMinimumSize(1200, 760)
         self.setStyleSheet(f"QMainWindow {{ background-color: {PAGE_BG}; }}")
 
@@ -211,7 +219,9 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._refresh_steps()
         self._update_kpi()
+        self._sync_header_context()
         self._sync_button_states()
+        self._sync_idle_banner()
         self._runtime_logger.info(
             "main_window=ready processor_available=%s log_path=%s",
             self.processor is not None,
@@ -265,7 +275,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
         outer.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
-        outer.setSpacing(12)
+        outer.setSpacing(PAGE_SPACING)
 
         self._stacked = QStackedWidget()
         outer.addWidget(self._stacked)
@@ -276,133 +286,162 @@ class MainWindow(QMainWindow):
         self._main_page.setStyleSheet("QWidget#mainPage { background: transparent; }")
         main_layout = QVBoxLayout(self._main_page)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(12)
+        main_layout.setSpacing(PAGE_SPACING)
 
-        # 顶部标题栏
+        # 顶部工位状态栏
         self._header = QFrame()
-        self._header.setStyleSheet(frame_style(PANEL_BG_DARK, border=STROKE_MAIN, radius=10))
+        self._header.setObjectName("mainTopBar")
+        self._header.setStyleSheet(frame_style(PANEL_BG_DARK, border=STROKE_SUBTLE, radius=10))
         self._header.setFixedHeight(TOP_BAR_HEIGHT)
-        self._header_layout = QGridLayout(self._header)
-        self._header_layout.setContentsMargins(16, 6, 16, 6)
-        self._header_layout.setHorizontalSpacing(0)
-        self._header_layout.setColumnStretch(0, 1)
-        self._header_layout.setColumnStretch(2, 1)
+        self._header_layout = QHBoxLayout(self._header)
+        self._header_layout.setContentsMargins(16, 6, 14, 6)
+        self._header_layout.setSpacing(12)
 
-        self._title_label = QLabel("双翼科技AI系统")
-        self._title_label.setFixedSize(280, 42)
-        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title_label.setStyleSheet(
-            f"background-color: #0B2343; border: 1px solid {TEXT_ACCENT}; border-radius: 7px; "
-            f"color: {TEXT_PRIMARY}; font-size: 20px; font-weight: 700;"
+        brand_dot = QLabel(self._header)
+        brand_dot.setFixedSize(10, 10)
+        brand_dot.setStyleSheet(f"background-color: {TEXT_ACCENT}; border: none; border-radius: 5px;")
+        self._title_label = QLabel("双翼视觉防错系统", self._header)
+        self._title_label.setStyleSheet(text_style(TEXT_PRIMARY, size=17, weight=800))
+
+        self._mode_badge = QLabel("顺序防错模式", self._header)
+        self._mode_badge.setStyleSheet(
+            f"background-color: {CHIP_BG}; border: 1px solid {STROKE_MAIN}; border-radius: 6px; "
+            f"color: {TEXT_ACCENT}; font-size: {FONT_SMALL}px; font-weight: 700; padding: 3px 10px;"
         )
-        self._module_tag = QLabel("VISION MODULE · 01", self._header)
-        self._module_tag.setStyleSheet(
-            text_style(
-                TEXT_MUTED,
-                size=FONT_MICRO,
-                weight=700,
-                extra=f"font-family: '{MONO_FAMILY}'; letter-spacing: 0.12em;",
-            )
+
+        self._model_badge = QLabel("模型：未加载", self._header)
+        self._model_badge.setStyleSheet(
+            f"background-color: transparent; border: 1px solid {STROKE_SUBTLE}; border-radius: 6px; "
+            f"color: {TEXT_SECONDARY}; font-size: {FONT_SMALL}px; font-weight: 600; padding: 3px 10px;"
         )
-        self._status_label = QLabel("READY")
+
+        self._camera_indicator = QLabel("● 相机未连接", self._header)
+        self._camera_indicator.setStyleSheet(text_style(TEXT_MUTED, size=FONT_SMALL, weight=700))
+
+        self._fps_badge = QLabel("", self._header)
+        self._fps_badge.setVisible(False)
+        self._fps_badge.setStyleSheet(
+            f"background-color: {CHIP_BG}; border: 1px solid {STROKE_SUBTLE}; border-radius: 6px; "
+            f"color: {TEXT_SECONDARY}; font-family: '{MONO_FAMILY}'; font-size: {FONT_SMALL}px; "
+            "font-weight: 700; padding: 3px 9px;"
+        )
+
+        self._status_label = QLabel("待机", self._header)
         self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
         self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._result_label = QLabel("")
-        self._result_label.setFont(QFont("Microsoft YaHei UI", 14, QFont.Bold))
-        self._result_label.setMinimumWidth(64)
-        self._result_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self._result_label = QLabel("", self._header)
+        self._result_label.setFont(QFont("Microsoft YaHei UI", 13, QFont.Bold))
+        self._result_label.setMinimumWidth(60)
+        self._result_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._result_label.setVisible(False)
-        self._btn_config = QPushButton("配置")
-        self._btn_config.setFixedSize(72, 40)
-        self._btn_close = QPushButton("关闭")
-        self._btn_close.setFixedSize(72, 40)
-        self._btn_close.setProperty("buttonRole", "danger")
 
-        actions = QWidget(self._header)
-        actions.setObjectName("topBarActions")
-        actions.setStyleSheet("QWidget#topBarActions { background: transparent; border: none; }")
-        actions_layout = QHBoxLayout(actions)
-        actions_layout.setContentsMargins(0, 0, 0, 0)
-        actions_layout.setSpacing(10)
-        actions_layout.addWidget(self._status_label, 0, Qt.AlignmentFlag.AlignVCenter)
-        actions_layout.addWidget(self._result_label, 0, Qt.AlignmentFlag.AlignVCenter)
-        actions_layout.addWidget(self._btn_config, 0, Qt.AlignmentFlag.AlignVCenter)
-        actions_layout.addWidget(self._btn_close, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._btn_config = QPushButton("系统设置", self._header)
+        self._btn_config.setMinimumSize(96, 38)
 
-        self._header_layout.addWidget(
-            self._module_tag, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-        )
-        self._header_layout.addWidget(self._title_label, 0, 1, Qt.AlignmentFlag.AlignCenter)
-        self._header_layout.addWidget(actions, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._header_layout.addWidget(brand_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._header_layout.addWidget(self._title_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._header_layout.addWidget(self._mode_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._header_layout.addWidget(self._model_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._header_layout.addStretch(1)
+        self._header_layout.addWidget(self._camera_indicator, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._header_layout.addWidget(self._fps_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._header_layout.addWidget(self._status_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._header_layout.addWidget(self._result_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._header_layout.addWidget(self._btn_config, 0, Qt.AlignmentFlag.AlignVCenter)
         main_layout.addWidget(self._header)
 
-        # 中部双栏：左实时画面 + 右业务面板
+        # 中部双栏：左实时画面（视口优先） + 右受控宽度工业 HMI 面板
         mid_layout = QHBoxLayout()
-        mid_layout.setSpacing(12)
+        mid_layout.setSpacing(PAGE_SPACING)
 
         # 左侧实时检测主窗口
         video_frame = QFrame()
-        video_frame.setStyleSheet(frame_style(VIEWPORT_BG, border=STROKE_MAIN, radius=12))
+        video_frame.setObjectName("videoFrame")
+        video_frame.setStyleSheet(frame_style(VIEWPORT_BG, border=STROKE_SUBTLE, radius=10))
         video_layout = QVBoxLayout(video_frame)
-        video_layout.setContentsMargins(8, 8, 8, 8)
+        video_layout.setContentsMargins(0, 0, 0, 0)
+        video_layout.setSpacing(0)
+
         self._video_label = QLabel()
         self._video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._video_label.setStyleSheet(
-            f"background-color: {VIEWPORT_BG}; border: none; border-radius: 8px;"
-        )
+        self._video_label.setWordWrap(True)
         self._video_label.setMinimumSize(640, 480)
         self._video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        video_layout.addWidget(self._video_label)
-        self._timing_label = QLabel("")
-        self._timing_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        self._timing_label.setStyleSheet(text_style(TEXT_SECONDARY, size=12, weight=600))
-        self._timing_label.setVisible(False)
-        video_layout.addWidget(self._timing_label)
-        self._video_frame = video_frame
-        self._build_viewfinder_overlays(video_frame)
-        mid_layout.addWidget(video_frame, 7)
+        self._set_viewport_empty_state()
+        video_layout.addWidget(self._video_label, 1)
 
-        # 右侧业务面板
+        # 视口底部常驻精简遥测条（避免检测启停引发画面高度跳动）
+        self._viewport_footer = QFrame(video_frame)
+        self._viewport_footer.setObjectName("viewportFooter")
+        self._viewport_footer.setFixedHeight(30)
+        self._viewport_footer.setStyleSheet(
+            f"QFrame#viewportFooter {{ background-color: {PANEL_BG_DARK}; border: none; "
+            f"border-top: 1px solid {STROKE_SUBTLE}; border-bottom-left-radius: 9px; "
+            "border-bottom-right-radius: 9px; }"
+        )
+        vf_layout = QHBoxLayout(self._viewport_footer)
+        vf_layout.setContentsMargins(14, 0, 14, 0)
+        vf_layout.setSpacing(12)
+        self._resolution_label = QLabel("等待相机画面", self._viewport_footer)
+        self._resolution_label.setStyleSheet(
+            text_style(TEXT_MUTED, size=FONT_MICRO, weight=600, extra=f"font-family: '{MONO_FAMILY}';")
+        )
+        self._timing_label = QLabel("", self._viewport_footer)
+        self._timing_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._timing_label.setStyleSheet(
+            text_style(TEXT_SECONDARY, size=FONT_MICRO, weight=600, extra=f"font-family: '{MONO_FAMILY}';")
+        )
+        self._timing_label.setVisible(False)
+        vf_layout.addWidget(self._resolution_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        vf_layout.addStretch(1)
+        vf_layout.addWidget(self._timing_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        video_layout.addWidget(self._viewport_footer)
+
+        self._video_frame = video_frame
+        mid_layout.addWidget(video_frame, 1)
+
+        # 右侧受控宽度业务面板（380px ~ 440px）
         right_panel = QFrame()
-        right_panel.setStyleSheet(frame_style(PANEL_BG, border=STROKE_MAIN, radius=12))
-        right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        right_panel.setObjectName("rightHmiPanel")
+        right_panel.setStyleSheet(frame_style(PANEL_BG, border=STROKE_SUBTLE, radius=10))
+        right_panel.setMinimumWidth(RIGHT_PANEL_MIN_WIDTH)
+        right_panel.setMaximumWidth(RIGHT_PANEL_MAX_WIDTH)
+        right_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self._right_panel = right_panel
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(12, 12, 12, 12)
-        right_layout.setSpacing(12)
+        right_layout.setSpacing(10)
 
-        # 右上：KPI 单行，清零先归档再把配置里的计数写成 0
-        self._kpi_row = KpiRow()
-        self._btn_clear_stats = QPushButton("清零")
-        self._btn_clear_stats.setFixedSize(72, 72)
-        self._btn_clear_stats.setProperty("buttonRole", "danger")
-        self._btn_clear_stats.clicked.connect(self._on_clear_production_stats)
-        kpi_line = QHBoxLayout()
-        kpi_line.setContentsMargins(0, 0, 0, 0)
-        kpi_line.setSpacing(8)
-        kpi_line.addWidget(self._kpi_row, 1)
-        kpi_line.addWidget(self._btn_clear_stats)
-        right_layout.addLayout(kpi_line)
+        # 1. Hero 判定状态横幅
+        self._result_banner = ResultBannerWidget(right_panel)
+        right_layout.addWidget(self._result_banner)
 
-        # 右中：紧凑识别进度列表
+        # 2. 四色语义 KPI 卡片（移除高危红块清零，归零统一收口至系统设置）
+        self._kpi_row = KpiRow(right_panel)
+        right_layout.addWidget(self._kpi_row)
+
+        # 3. 识别进度列表区（降噪边框，标题随模式动态切换）
         steps_head = QHBoxLayout()
-        steps_title = QLabel("步骤检测")
-        steps_title.setStyleSheet(text_style(TEXT_ACCENT, size=15, weight=700))
-        self._recognized_count_label = QLabel("0 / 0")
+        steps_head.setContentsMargins(2, 2, 2, 0)
+        self._steps_title_label = QLabel("工艺步骤引导", right_panel)
+        self._steps_title_label.setStyleSheet(text_style(TEXT_PRIMARY, size=14, weight=700))
+        self._recognized_count_label = QLabel("0 / 0", right_panel)
         self._recognized_count_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._recognized_count_label.setStyleSheet(text_style(TEXT_SECONDARY, size=FONT_SMALL, weight=700))
-        steps_head.addWidget(steps_title)
+        self._recognized_count_label.setStyleSheet(
+            text_style(TEXT_SECONDARY, size=FONT_SMALL, weight=700, extra=f"font-family: '{MONO_FAMILY}';")
+        )
+        steps_head.addWidget(self._steps_title_label)
         steps_head.addStretch(1)
         steps_head.addWidget(self._recognized_count_label)
         right_layout.addLayout(steps_head)
 
-        self._steps_scroll = QScrollArea()
+        self._steps_scroll = QScrollArea(right_panel)
         self._steps_scroll.setWidgetResizable(True)
-        self._steps_scroll.setMinimumHeight(280)
+        self._steps_scroll.setMinimumHeight(220)
         self._steps_scroll.setStyleSheet(
             scroll_area_style()
-            + f"QScrollArea {{ background-color: #081A34; border: 1px solid {TEXT_ACCENT}; border-radius: 8px; }}"
+            + f"QScrollArea {{ background-color: #08162B; border: 1px solid {STROKE_SUBTLE}; border-radius: 8px; }}"
         )
         self._steps_container = QWidget()
         self._steps_container.setObjectName("recognitionListContainer")
@@ -412,33 +451,46 @@ class MainWindow(QMainWindow):
         self._steps_layout = QVBoxLayout(self._steps_container)
         self._steps_layout.setContentsMargins(10, 10, 10, 10)
         self._steps_layout.setSpacing(8)
+        self._steps_idle_hint = QLabel("等待检测启动\n按配置顺序完成作业步骤后将在此实时显示", self._steps_container)
+        self._steps_idle_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._steps_idle_hint.setWordWrap(True)
+        self._steps_idle_hint.setMinimumHeight(140)
+        self._steps_idle_hint.setStyleSheet(text_style(TEXT_MUTED, size=13, weight=500))
+        self._steps_layout.addWidget(self._steps_idle_hint)
         self._steps_layout.addStretch(1)
         self._steps_scroll.setWidget(self._steps_container)
         right_layout.addWidget(self._steps_scroll, 1)
 
-        self._lstm_status_label = QLabel("时序动作：未启用")
+        # 时序动作状态微卡（未启用时默认隐藏，不在主屏展示内部调试噪音）
+        self._lstm_status_label = QLabel("", right_panel)
         self._lstm_status_label.setWordWrap(True)
-        self._lstm_status_label.setStyleSheet(text_style(TEXT_SECONDARY, size=FONT_SMALL, weight=600))
+        self._lstm_status_label.setVisible(False)
+        self._lstm_status_label.setStyleSheet(
+            f"background-color: {PANEL_BG_DARK}; border: 1px solid {STROKE_SUBTLE}; border-radius: 8px; "
+            f"color: {TEXT_SECONDARY}; font-size: {FONT_SMALL}px; font-weight: 600; padding: 8px 10px;"
+        )
         right_layout.addWidget(self._lstm_status_label)
-        self._notice_label = QLabel("")
+
+        # 异常通知条（仅在异常/告警时显示）
+        self._notice_label = QLabel("", right_panel)
         self._notice_label.setWordWrap(True)
         self._notice_label.setVisible(False)
         self._notice_label.setStyleSheet(
             f"background-color: #321521; border: 1px solid {TEXT_DANGER}; border-radius: 8px; "
-            "color: #FFD8DC; font-size: 13px; font-weight: 600; padding: 10px 12px;"
+            "color: #FFD8DC; font-size: 13px; font-weight: 600; padding: 9px 12px;"
         )
         right_layout.addWidget(self._notice_label)
 
-        # 右下：核心操作区
+        # 4. 底部核心操作区（左次级按钮 + 右唯一实心主按钮）
         ctrl_layout = QGridLayout()
-        ctrl_layout.setContentsMargins(0, 4, 0, 0)
+        ctrl_layout.setContentsMargins(0, 2, 0, 0)
         ctrl_layout.setHorizontalSpacing(10)
         ctrl_layout.setVerticalSpacing(8)
 
-        self._btn_camera = QPushButton("打开相机")
+        self._btn_camera = QPushButton("打开相机", right_panel)
         self._btn_camera.setMinimumHeight(PRIMARY_CONTROL_HEIGHT)
-        self._btn_camera.setProperty("buttonRole", "primary")
-        self._btn_detect = QPushButton("开始检测")
+
+        self._btn_detect = QPushButton("开始检测", right_panel)
         self._btn_detect.setMinimumHeight(PRIMARY_CONTROL_HEIGHT)
         self._btn_detect.setProperty("buttonRole", "primary")
 
@@ -446,10 +498,63 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(self._btn_detect, 0, 1)
         right_layout.addLayout(ctrl_layout)
 
-        mid_layout.addWidget(right_panel, 4)
+        mid_layout.addWidget(right_panel, 0)
         main_layout.addLayout(mid_layout, 1)
 
         self._stacked.addWidget(self._main_page)
+
+    def _set_viewport_empty_state(self) -> None:
+        self._video_label.clear()
+        self._video_label.setText("相机未连接\n\n点击右下角「打开相机」启动实时预览")
+        self._video_label.setStyleSheet(
+            f"background-color: {VIEWPORT_BG}; color: {TEXT_MUTED}; border: none; "
+            "border-top-left-radius: 9px; border-top-right-radius: 9px; "
+            "font-size: 15px; font-weight: 600;"
+        )
+        if hasattr(self, "_resolution_label"):
+            self._resolution_label.setText("等待相机画面")
+
+    def _sync_header_context(self) -> None:
+        """刷新顶栏模式胶囊、模型名称与步骤区标题。"""
+        roi_mode = bool(getattr(self.config, "roi_inspection_enabled", False))
+        lstm_mode = self._uses_lstm_sequence()
+        if roi_mode:
+            mode_text = "固定工位计数"
+            steps_title = "工位目标检测"
+        elif lstm_mode:
+            mode_text = "时序动作防错"
+            steps_title = "工艺步骤引导"
+        else:
+            mode_text = "顺序防错模式"
+            steps_title = "工艺步骤引导"
+
+        if hasattr(self, "_mode_badge"):
+            self._mode_badge.setText(mode_text)
+        if hasattr(self, "_steps_title_label"):
+            self._steps_title_label.setText(steps_title)
+
+        raw_path = str(getattr(self.config, "yolo_model_path", "") or "").strip()
+        model_name = Path(raw_path).name if raw_path else "未配置"
+        if hasattr(self, "_model_badge"):
+            self._model_badge.setText(f"模型：{model_name}")
+            self._model_badge.setToolTip(raw_path or "未配置模型文件")
+
+    def _sync_idle_banner(self) -> None:
+        """无 PASS/NG 结果时同步 Hero 横幅为当前设备运行态。"""
+        if not hasattr(self, "_result_banner"):
+            return
+        if self.state.inference_on:
+            roi_mode = bool(getattr(self.config, "roi_inspection_enabled", False))
+            if roi_mode:
+                self._result_banner.set_banner_state("active", "检测运行中", "等待工件进入识别区域")
+            else:
+                names = self._effective_step_names()
+                first_step = names[0] if names else "第 1 步"
+                self._result_banner.set_banner_state("active", "等待首步触发", f"请按作业顺序执行：{first_step}")
+        elif self.state.camera_on:
+            self._result_banner.set_banner_state("idle", "相机预览中", "确认画面与工位无误后点击「开始检测」")
+        else:
+            self._result_banner.set_banner_state("idle", "待机中", "点击右下角「打开相机」启动实时预览")
 
     def _connect_signals(self) -> None:
         self.worker.error_occurred.connect(self._on_error)
@@ -460,7 +565,6 @@ class MainWindow(QMainWindow):
         self._btn_camera.clicked.connect(self._on_toggle_camera)
         self._btn_detect.clicked.connect(self._on_toggle_detect)
         self._btn_config.clicked.connect(self._on_config_clicked)
-        self._btn_close.clicked.connect(self._on_close_clicked)
 
     # ------------------------------------------------------------------
     # 动态识别进度项
@@ -496,15 +600,16 @@ class MainWindow(QMainWindow):
 
         # 无有效步骤时给出提示
         if not self._step_cards:
-            hint = QLabel("未配置有效步骤，请进入配置页设置步骤类别")
+            hint = QLabel("尚未配置作业步骤或检测目标\n请点击右上角「系统设置」完成配置")
             hint.setStyleSheet(text_style(TEXT_SECONDARY, size=13, weight=500))
             hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
             hint.setWordWrap(True)
-            hint.setMinimumHeight(180)
+            hint.setMinimumHeight(160)
             self._steps_layout.insertWidget(self._steps_layout.count() - 1, hint)
             self._steps_hint = hint
 
         self._recognized_count_label.setText(f"0 / {len(self._step_cards)}")
+        self._sync_header_context()
 
         if self._roi_engine is not None:
             self._sync_roi_cards()
@@ -734,12 +839,16 @@ class MainWindow(QMainWindow):
     def _show_frame(self, frame: np.ndarray) -> None:
         # 先缩到控件尺寸再做色彩转换与 Qt 构图：后面每一步的数据量都按显示分辨率计算，
         # 而不是按相机分辨率，这在高像素相机上是渲染耗时的主要来源。
+        src_h, src_w = frame.shape[:2]
+        if hasattr(self, "_resolution_label"):
+            self._resolution_label.setText(f"{src_w} × {src_h}")
         scaled = self._scale_frame_to_label(frame)
         rgb = cv2.cvtColor(scaled, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         # QImage 直接引用 numpy 缓冲区，QPixmap.fromImage 在光栅平台上可能共享这块内存；
         # rgb 回收后 pixmap 就指向已释放内存。先 copy 让 Qt 自己持有像素（显示尺寸，代价很小）。
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+        self._video_label.setText("")
         self._video_label.setPixmap(QPixmap.fromImage(qimg))
 
     def _scale_frame_to_label(self, frame: np.ndarray) -> np.ndarray:
@@ -869,39 +978,66 @@ class MainWindow(QMainWindow):
                         ct = f"{(time.time() - self._round_start_time):.1f}s"
                     if ct:
                         self._status_label.setText(f"PASS  CT {ct}")
-                    self._set_result_label("PASS", "#4CAF50")
+                    self._set_result_label("PASS", "#4CAF50", meta=f"CT {ct}" if ct else "", subtitle="本件工艺步骤全部合格")
                     self._update_kpi()
                     self._start_next_round_after_pass()
                     return
-                self._set_result_label("PASS", "#4CAF50")
+                self._set_result_label("PASS", "#4CAF50", subtitle="本件工艺步骤全部合格")
                 self._update_kpi()
             elif state.round_result == RoundResult.ACTION_NG:
                 notice = state.action_ng_reason or "检测到顺序异常，请按配置顺序重新执行当前步骤。"
                 if self._uses_lstm_sequence() or "数量不符" in notice or "未检出" in notice:
                     self._set_notice(notice)
+                    display_reason = notice
                 else:
-                    self._set_notice("检测到顺序异常，请按配置顺序重新执行当前步骤。")
+                    display_reason = "检测到顺序异常，请按配置顺序重新执行当前步骤。"
+                    self._set_notice(display_reason)
                 ng_key = (state.round_id, state.action_ng_step)
                 if ng_key != self._last_counted_ng_key:
                     self._last_counted_ng_key = ng_key
                     self._stats_manager.record_ng()
                     self._handle_action_ng_feedback(state)
-                    self._set_result_label("NG", "#F44336")
-                    self._status_label.setText("NG 已记录，下一轮检测中")
+                    self._set_result_label("NG", "#F44336", subtitle=display_reason)
+                    self._status_label.setText("异常已记录")
                     self._update_kpi()
                     self._start_next_round_after_ng()
                     return
-                self._set_result_label("NG", "#F44336")
-                self._status_label.setText("NG 已记录")
+                self._set_result_label("NG", "#F44336", subtitle=display_reason)
+                self._status_label.setText("异常已记录")
                 if getattr(self, "_action_evidence_warning", ""):
                     self._set_notice(f"{notice}；{self._action_evidence_warning}")
                 self._update_kpi()
+            elif self.state.inference_on and hasattr(self, "_result_banner") and not self._result_label.isVisible():
+                names = self._effective_step_names()
+                if 0 <= current_idx < len(names):
+                    self._result_banner.set_banner_state(
+                        "active",
+                        f"请执行第 {current_idx + 1} 步",
+                        f"当前目标：{names[current_idx]}",
+                        meta=f"{recognized_count} / {len(self._step_cards)}",
+                    )
+                else:
+                    self._sync_idle_banner()
 
         self._sync_step_focus_scroll(state)
 
     def _sync_recognition_empty_state(self, recognized_count: int) -> None:
         if self._steps_hint is not None:
             self._steps_hint.setVisible(not self._step_cards)
+        if hasattr(self, "_steps_idle_hint") and self._steps_idle_hint is not None:
+            show_idle = bool(self._step_cards) and recognized_count == 0
+            if show_idle:
+                if self.state.inference_on:
+                    roi_mode = bool(getattr(self.config, "roi_inspection_enabled", False))
+                    if roi_mode:
+                        self._steps_idle_hint.setText("检测运行中\n等待目标进入识别区域")
+                    else:
+                        names = self._effective_step_names()
+                        first = names[0] if names else "第 1 步"
+                        self._steps_idle_hint.setText(f"等待首步触发\n请先执行：{first}")
+                else:
+                    self._steps_idle_hint.setText("等待检测启动\n按配置顺序完成作业步骤后将在此实时显示")
+            self._steps_idle_hint.setVisible(show_idle)
         self._recognized_count_label.setText(f"{recognized_count} / {len(self._step_cards)}")
 
     def _set_notice(self, text: str) -> None:
@@ -1221,13 +1357,19 @@ class MainWindow(QMainWindow):
             return
         self._start_new_round_now()
 
-    def _set_result_label(self, text: str, color: str) -> None:
-        """显示顶部 PASS/NG 结果，避免无结果时保留空白占位。"""
-        # 实心徽章：PASS 绿底黑字 / NG 红底白字，远距离可读；签名保持不变。
+    def _set_result_label(
+        self,
+        text: str,
+        color: str,
+        *,
+        subtitle: str = "",
+        meta: str = "",
+    ) -> None:
+        """同步顶栏结果徽章与右侧 Hero 判定横幅。"""
         key = text.strip().upper()
         if key == "PASS":
             background, foreground = STEP_PASS_BORDER, "#04160E"
-        elif key == "NG":
+        elif key in ("NG", "FAIL"):
             background, foreground = STEP_NG_BORDER, "#FFFFFF"
         else:
             background, foreground = "", color
@@ -1235,26 +1377,47 @@ class MainWindow(QMainWindow):
         if background:
             self._result_label.setStyleSheet(
                 f"background-color: {background}; color: {foreground}; border: none; "
-                "border-radius: 6px; padding: 4px 14px; font-size: 14px; font-weight: 800;"
+                "border-radius: 6px; padding: 3px 12px; font-size: 13px; font-weight: 800;"
             )
         else:
             self._result_label.setStyleSheet(f"color: {color}; font-weight: bold;")
         self._result_label.setVisible(True)
+        if hasattr(self, "_result_banner"):
+            if key == "PASS":
+                self._result_banner.set_banner_state("pass", "PASS", subtitle or "本轮检测合格", meta=meta)
+            elif key in ("NG", "FAIL"):
+                self._result_banner.set_banner_state("ng", "FAIL", subtitle or "检测到异常，请核对工位", meta=meta)
+            else:
+                self._result_banner.set_banner_state("warn", text, subtitle, meta=meta)
 
     def _clear_result_label(self) -> None:
         self._result_label.setText("")
         self._result_label.setStyleSheet("")
         self._result_label.setVisible(False)
+        self._sync_idle_banner()
 
     # ------------------------------------------------------------------
     # 按钮状态同步
     # ------------------------------------------------------------------
     def _sync_button_states(self) -> None:
-        """按钮文本与可用状态跟真实运行态同步。"""
+        """按钮文本、主次角色与设备指示灯跟真实运行态同步。"""
         cam_on = self.state.camera_on
         infer_on = self.state.inference_on
         self._btn_camera.setText("关闭相机" if cam_on else "打开相机")
         self._btn_detect.setText("停止检测" if infer_on else "开始检测")
+        desired_role = "warning" if infer_on else "primary"
+        if self._btn_detect.property("buttonRole") != desired_role:
+            self._btn_detect.setProperty("buttonRole", desired_role)
+            self._btn_detect.style().unpolish(self._btn_detect)
+            self._btn_detect.style().polish(self._btn_detect)
+        # 相机连接状态灯
+        if hasattr(self, "_camera_indicator"):
+            if cam_on:
+                self._camera_indicator.setText("● 相机在线")
+                self._camera_indicator.setStyleSheet(text_style(TEXT_SUCCESS, size=FONT_SMALL, weight=700))
+            else:
+                self._camera_indicator.setText("● 相机未连接")
+                self._camera_indicator.setStyleSheet(text_style(TEXT_MUTED, size=FONT_SMALL, weight=700))
         # 检测按钮依赖相机和处理器
         can_detect = cam_on and self.processor is not None
         self._btn_detect.setVisible(True)
@@ -1264,6 +1427,8 @@ class MainWindow(QMainWindow):
             if cam_on and self.processor is None:
                 self._status_label.setText("处理器未加载")
                 self._status_label.setStyleSheet(_status_badge_style(TEXT_SECONDARY))
+        if not self._result_label.isVisible():
+            self._sync_idle_banner()
 
     # ------------------------------------------------------------------
     # 信号槽
@@ -1274,6 +1439,8 @@ class MainWindow(QMainWindow):
         self._status_label.setText(f"错误: {msg}")
         self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
         self._set_notice(msg)
+        if hasattr(self, "_result_banner"):
+            self._result_banner.set_banner_state("ng", "运行异常", msg)
 
     def _overlay_image_size(self, data: dict) -> tuple:
         raw_image_size = tuple((data or {}).get("image_size") or ())
@@ -1429,8 +1596,11 @@ class MainWindow(QMainWindow):
                 self._set_notice(f"模型故障，已停止检测，禁止放行：{fault}")
                 self._status_label.setText("模型故障，检测已停止")
                 self._status_label.setStyleSheet(_status_badge_style(TEXT_DANGER))
-                self._lstm_status_label.setText(f"时序动作：故障，{fault}")
+                self._lstm_status_label.setText(f"动作识别异常：{fault}")
+                self._lstm_status_label.setVisible(True)
                 self._clear_result_label()
+                if hasattr(self, "_result_banner"):
+                    self._result_banner.set_banner_state("ng", "模型故障", f"检测已停止：{fault}")
                 self._sync_button_states()
                 state = self.step_engine.get_state()
             else:
@@ -1552,16 +1722,16 @@ class MainWindow(QMainWindow):
             if result.outcome == InspectionOutcome.PASS:
                 self._stats_manager.record_pass()
                 self._play_pass_feedback(("roi", result.feedback_key))
-                self._set_result_label("PASS", "#4CAF50")
-                self._status_label.setText("ROI 轮次 PASS")
+                self._set_result_label("PASS", "#4CAF50", subtitle="工位目标数量全部合格")
+                self._status_label.setText("工位判定 PASS")
                 self._set_notice("")
             elif result.outcome == InspectionOutcome.FAIL:
                 self._stats_manager.record_ng()
                 self._save_roi_fail_evidence(result, overlay_data)
                 failed = " / ".join(result.failed_categories)
-                self._set_result_label("NG", "#F44336")
-                self._status_label.setText(f"ROI 轮次 NG：{failed}")
-                self._set_notice(f"识别 ROI 数量异常：{failed}")
+                self._set_result_label("NG", "#F44336", subtitle=f"目标数量异常：{failed}")
+                self._status_label.setText(f"工位判定异常：{failed}")
+                self._set_notice(f"识别区域数量异常：{failed}")
                 self._show_roi_fail_alert(result, overlay_data)
             self._update_kpi()
 
@@ -1800,6 +1970,8 @@ class MainWindow(QMainWindow):
         stats = self._last_pipeline_stats
         if not stats or not self.state.inference_on:
             self._timing_label.setVisible(False)
+            if hasattr(self, "_fps_badge"):
+                self._fps_badge.setVisible(False)
             return
         segments = [
             ("采集", float(stats.get("capture_ms", 0.0) or 0.0)),
@@ -1810,12 +1982,17 @@ class MainWindow(QMainWindow):
         measured = [(name, value) for name, value in segments if value > 0.0]
         if not measured:
             self._timing_label.setVisible(False)
+            if hasattr(self, "_fps_badge"):
+                self._fps_badge.setVisible(False)
             return
         slowest = max(measured, key=lambda item: item[1])[0]
         parts = "   ".join(f"{name} {value:.1f}ms" for name, value in measured)
         fps = float(stats.get("infer_fps", 0.0) or 0.0)
         self._timing_label.setText(f"{parts}   瓶颈 {slowest}   推理 {fps:.1f} fps")
         self._timing_label.setVisible(True)
+        if hasattr(self, "_fps_badge"):
+            self._fps_badge.setText(f"{fps:.1f} FPS")
+            self._fps_badge.setVisible(fps > 0.0)
 
     @Slot(dict)
     def _on_camera_params(self, params: dict) -> None:
@@ -1845,19 +2022,21 @@ class MainWindow(QMainWindow):
         if self.state.camera_on:
             self._runtime_logger.info("camera_action=close")
             self._close_camera_session()
-            self._status_label.setText("READY")
+            self._status_label.setText("待机")
             self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
         else:
             self._runtime_logger.info("camera_action=open")
             if self.worker.open_camera():
                 self._runtime_logger.info("camera_open=ok")
-                self._display_timer.start(33)
+                self._display_timer.start(50)
                 self._status_label.setText("预览中")
                 self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
             else:
                 self._runtime_logger.error("camera_open=failed")
                 self._status_label.setText("相机打开失败")
                 self._status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+                if hasattr(self, "_result_banner"):
+                    self._result_banner.set_banner_state("ng", "相机连接失败", "请检查工业相机接线或在「系统设置」重新选择设备")
         self._sync_button_states()
 
     @Slot()
@@ -2130,8 +2309,8 @@ class MainWindow(QMainWindow):
         self._config_page.refresh_stats_display()
         self._sync_template_diagnostics_status()
         self._stacked.setCurrentWidget(self._config_page)
-        self._status_label.setText("配置页")
-        self._status_label.setStyleSheet("color: #9C27B0; font-weight: bold;")
+        self._status_label.setText("系统设置")
+        self._status_label.setStyleSheet(_status_badge_style(TEXT_SECONDARY))
 
     def _refresh_camera_devices(self) -> None:
         """Refresh the in-memory MvSDK device catalog without changing cameras."""
@@ -2158,9 +2337,10 @@ class MainWindow(QMainWindow):
         self._apply_step_engine_config()
         self._apply_roi_engine_config()
         self._invalidate_render_cache()
+        self._sync_header_context()
         self._sync_button_states()
         self._update_kpi()
-        self._status_label.setText("READY" if not self.state.camera_on else "预览中")
+        self._status_label.setText("待机" if not self.state.camera_on else "预览中")
         self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
 
     def flush_production_stats(self) -> None:
@@ -2398,7 +2578,7 @@ class MainWindow(QMainWindow):
         self._close_camera_session()
 
         if self.worker.open_camera():
-            self._display_timer.start(33)
+            self._display_timer.start(50)
             self._status_label.setText("预览中")
             self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
             return True
@@ -2424,7 +2604,7 @@ class MainWindow(QMainWindow):
 
     def _clear_camera_session_visuals(self) -> None:
         """Remove all camera-specific frames, overlays, results, and trackers."""
-        self._video_label.clear()
+        self._set_viewport_empty_state()
         self._latest_runtime_overlay = DetectionOverlayState()
         self._invalidate_render_cache()
         self._last_overlay_data = {}
@@ -2480,11 +2660,15 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def _sync_hand_overlay_enabled(self) -> None:
-        """顺序模式且正在检测时才开 Hands；ROI / 停止检测立即关掉。"""
-        enabled = bool(self.state.inference_on) and not bool(
-            getattr(self.config, "roi_inspection_enabled", False)
-        )
-        self.worker.set_hand_overlay_enabled(enabled)
+        """仅当正在检测且已加载需要手部特征的动作模型时才开启 Hands，其余模式彻底关闭以节省 CPU。"""
+        if not bool(self.state.inference_on) or bool(getattr(self.config, "roi_inspection_enabled", False)):
+            self.worker.set_hand_overlay_enabled(False)
+            return
+        action_session = self.worker.get_action_session()
+        bundle = getattr(action_session, "bundle", None)
+        needs_hands = bool(getattr(bundle, "hands_in_training", False))
+        legacy_lstm = bool(getattr(self.config, "lstm_action_enabled", False))
+        self.worker.set_hand_overlay_enabled(needs_hands or legacy_lstm)
 
     @staticmethod
     def _normalize_hand_landmarks(raw) -> list:
@@ -2689,6 +2873,7 @@ class MainWindow(QMainWindow):
         # 按真实状态显示，不按加载前记下的状态猜。
         self._status_label.setText("检测中" if self.state.inference_on else "模型已加载")
         self._status_label.setStyleSheet(_status_badge_style(TEXT_ACCENT))
+        self._sync_header_context()
         return True
 
     def _rebuild_step_engine(self) -> None:
@@ -2815,28 +3000,40 @@ class MainWindow(QMainWindow):
     def _show_lstm_state(self, state) -> None:
         if not hasattr(self, "_lstm_status_label"):
             return
+        uses_lstm = self._uses_lstm_sequence()
+        legacy_lstm = bool(getattr(self.config, "lstm_action_enabled", False))
         if not state.loaded:
-            self._lstm_status_label.setText(f"时序动作：{state.reason}")
+            if not uses_lstm and not legacy_lstm:
+                self._lstm_status_label.setText("")
+                self._lstm_status_label.setVisible(False)
+                return
+            self._lstm_status_label.setText(f"动作识别：{state.reason}")
+            self._lstm_status_label.setVisible(True)
             return
-        if self._uses_lstm_sequence():
+        if uses_lstm:
             folder = self._loaded_action_folder_name()
             if folder:
-                self._lstm_status_label.setText(f"时序动作：已加载 {folder}")
+                self._lstm_status_label.setText(f"动作模型：{folder}")
             else:
-                self._lstm_status_label.setText("时序动作：连续模型已加载")
+                self._lstm_status_label.setText("动作模型：已加载")
+            self._lstm_status_label.setVisible(True)
             return
         passed = "、".join(state.passed_categories) if state.passed_categories else "无"
-        self._lstm_status_label.setText(f"时序动作：{state.reason}，已 Pass {passed}")
+        self._lstm_status_label.setText(f"动作识别：{state.reason}，已完成 {passed}")
+        self._lstm_status_label.setVisible(True)
 
     def _show_action_progress(self, report: dict) -> None:
         if not hasattr(self, "_lstm_status_label"):
             return
         phase = str(report.get("phase") or "")
         action = str(report.get("action") or "")
-        seen = "、".join(report.get("seen_parts") or []) or "无"
-        missing = "、".join(report.get("missing_parts") or []) or "无"
-        if phase:
-            self._lstm_status_label.setText(f"时序动作：{phase} {action}，已见 {seen}，缺少 {missing}".strip())
+        missing_list = [str(item) for item in (report.get("missing_parts") or []) if str(item)]
+        if phase or action:
+            parts = [f"当前动作：{action or phase}"]
+            if missing_list:
+                parts.append(f"缺少零件：{'、'.join(missing_list)}")
+            self._lstm_status_label.setText("  ·  ".join(parts))
+            self._lstm_status_label.setVisible(True)
 
     def _update_lstm_action(self, data: dict, detections, image_size) -> None:
         if not bool(getattr(self.config, "lstm_action_enabled", False)):

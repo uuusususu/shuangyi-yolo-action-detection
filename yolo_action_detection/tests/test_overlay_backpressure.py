@@ -37,6 +37,9 @@ class _Processor:
 
 def _worker_with_frames():
     worker = CameraWorker(ConfigManager(), AppState())
+    # 本组用例专测高频合成帧下的积压背压，不测产线 CPU 节流
+    worker._max_infer_fps = 0.0
+    worker._min_infer_cooldown_s = 0.0
     processor = _Processor()
     worker.frame_processor = processor
     worker.running = True

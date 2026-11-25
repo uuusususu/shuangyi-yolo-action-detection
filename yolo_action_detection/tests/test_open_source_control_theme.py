@@ -122,13 +122,18 @@ def test_open_source_theme_defines_complete_standard_control_affordances(themed_
 def test_config_page_uses_theme_controls_without_local_border_overrides(themed_app):
     page = ConfigPage(ConfigManager())
 
+    assert not hasattr(page, "_sidebar_back_btn")
     buttons = [
-        page._sidebar_back_btn,
+        page._mode_sequence_btn,
+        page._mode_roi_btn,
         page._select_model_btn,
+        page._advanced_model_section.toggle_button,
+        page._diag_section.toggle_button,
         page._camera_refresh_btn,
         page._back_btn,
         page._save_btn,
         page._reset_btn,
+        *page._roi_kind_buttons,
         *page._nav_buttons,
     ]
     assert all(isinstance(button, QPushButton) for button in buttons)
@@ -164,13 +169,13 @@ def test_config_page_preserves_native_control_types_and_binary_api(themed_app):
 def test_main_window_uses_theme_button_roles_without_local_styles(themed_app):
     window = _window(ConfigManager())
 
+    assert not hasattr(window, "_btn_close")
+    assert not hasattr(window, "_btn_clear_stats")
     assert window._btn_config.styleSheet() == ""
-    assert window._btn_close.styleSheet() == ""
     assert window._btn_camera.styleSheet() == ""
     assert window._btn_detect.styleSheet() == ""
-    assert window._btn_close.property("buttonRole") == "danger"
-    assert window._btn_close.isDefault() is False
-    assert window._btn_camera.property("buttonRole") == "primary"
+    assert window._btn_config.property("buttonRole") is None
+    assert window._btn_camera.property("buttonRole") is None
     assert window._btn_detect.property("buttonRole") == "primary"
 
 

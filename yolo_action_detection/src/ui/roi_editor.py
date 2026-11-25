@@ -20,9 +20,9 @@ class RoiKind(str, Enum):
 
 
 _ROI_LABELS = {
-    RoiKind.LOCATOR: "模板框选区域",
-    RoiKind.INSPECTION: "识别 ROI",
-    RoiKind.SEARCH: "搜索 ROI",
+    RoiKind.LOCATOR: "定位模板",
+    RoiKind.INSPECTION: "识别区域",
+    RoiKind.SEARCH: "搜索区域",
 }
 _ROI_COLORS = {
     RoiKind.LOCATOR: QColor("#35D7FF"),

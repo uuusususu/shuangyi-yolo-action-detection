@@ -105,16 +105,17 @@ def test_config_navigation_preserves_unsaved_values(qapp):
     page._show_section(1)
     page._show_section(0)
 
-    assert page._section_stack.count() == 6
+    assert page._section_stack.count() == 5
     assert [button.text() for button in page._nav_buttons] == [
-        "模型与步骤",
-        "动作判定",
-        "工业相机",
-        "显示与反馈",
-        "ROI 配置",
-        "生产统计",
+        "检测方案",
+        "判定规则",
+        "区域与定位",
+        "相机与采集",
+        "反馈与统计",
     ]
     assert page._model_path_input.text() == "unsaved-model.onnx"
+    assert page.has_unsaved_changes() is True
+    assert page._dirty_label.isHidden() is False
 
 
 def test_round_interval_has_single_action_judgement_control(qapp):
@@ -132,17 +133,17 @@ def test_recognition_item_displays_quantity_and_semantic_states(qapp):
     item.set_quantity_progress(3, 4)
     assert item.quantity_text() == "3 / 4"
     assert item.state_name() == "active"
-    assert item.status_text() == "检测中"
+    assert item.status_text() == "请操作"
 
     item.set_step_state("pass")
     item.set_quantity_progress(4, 4)
     assert item.quantity_text() == "4 / 4"
     assert item.state_name() == "pass"
-    assert item.status_text() == "PASS"
+    assert item.status_text() == "合格"
 
     item.set_step_state("ng")
     assert item.state_name() == "ng"
-    assert item.status_text() == "NG"
+    assert item.status_text() == "异常"
 
 
 def test_runtime_and_config_use_live_widgets_not_retired_shell(qapp):
@@ -589,3 +590,83 @@ def test_sequential_ng_paints_only_failed_class_red(qapp):
 
     window.step_engine.start_round(require_first_step_rearm=False)
     assert window._overlay_box_color("B") == (0, 255, 128)
+
+
+def test_main_window_hero_banner_branding_and_hmi_constraints(qapp):
+    config = ConfigManager()
+    config.roi_inspection_enabled = False
+    config.action_order_constraint_enabled = False
+    config.category_names = ["散热片", "导热垫", "", "", "", ""]
+    window = _window(config)
+
+    assert window.windowTitle() == "双翼视觉防错系统"
+    assert window._title_label.text() == "双翼视觉防错系统"
+    assert window._status_label.text() == "待机"
+    assert window._steps_title_label.text() == "工艺步骤引导"
+    assert window._lstm_status_label.isHidden() is True
+    assert window._right_panel.minimumWidth() == 380
+    assert window._right_panel.maximumWidth() == 440
+
+    all_main_labels = " ".join(label.text() for label in window.findChildren(QLabel))
+    for banned in ("VISION MODULE", "双翼科技AI系统", "READY", "时序动作：未启用"):
+        assert banned not in all_main_labels
+
+    window._set_result_label("PASS", "#4CAF50", meta="CT 2.6s", subtitle="本件工艺步骤全部合格")
+    assert window._result_banner.kind_name() == "pass"
+    assert window._result_banner.title_text() == "PASS"
+    assert window._result_banner.meta_text() == "CT 2.6s"
+
+    window._set_result_label("NG", "#F44336", subtitle="检测到顺序异常")
+    assert window._result_banner.kind_name() == "ng"
+    assert window._result_banner.title_text() == "FAIL"
+    assert "顺序异常" in window._result_banner.subtitle_text()
+
+    window._clear_result_label()
+    assert window._result_banner.kind_name() == "idle"
+
+
+def test_main_window_switches_steps_title_for_roi_mode(qapp):
+    config = ConfigManager()
+    config.roi_inspection_enabled = True
+    config.category_names = ["A", "", "", "", "", ""]
+    window = _window(config)
+
+    assert window._mode_badge.text() == "固定工位计数"
+    assert window._steps_title_label.text() == "工位目标检测"
+
+
+def test_config_page_terminology_hygiene_dirty_state_and_collapsed_diagnostics(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    config = ConfigManager()
+    config._config_path = str(tmp_path / "config.json")
+    config.action_order_constraint_enabled = False
+    page = ConfigPage(config)
+
+    assert page.has_unsaved_changes() is False
+    assert page._diag_section.is_expanded() is False
+    assert page._advanced_model_section.is_expanded() is False
+    assert page._model_page.maximumWidth() == 900
+    assert page._action_page.maximumWidth() == 900
+
+    all_config_labels = " ".join(label.text() for label in page.findChildren(QLabel))
+    for banned in ("CONFIGURATION", "CONFIG SCHEMA", "YOLO OBB", "只切换认法", "等待枚举", "旧契约路径"):
+        assert banned not in all_config_labels
+
+    page._cooldown_input.setValue(2.5)
+    assert page.has_unsaved_changes() is True
+    assert page._dirty_label.isHidden() is False
+
+    # 未保存返回时弹窗确认；选择 No 不离开
+    back_emitted = []
+    page.back_clicked.connect(lambda: back_emitted.append(True))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No)
+    page._on_back_clicked()
+    assert back_emitted == []
+
+    # 保存成功后清除脏状态
+    page._on_save()
+    assert page.has_unsaved_changes() is False
+    assert page._dirty_label.isHidden() is True
+    page._on_back_clicked()
+    assert back_emitted == [True]

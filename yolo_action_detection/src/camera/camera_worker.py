@@ -29,6 +29,8 @@ class CameraWorker(QObject):
     _ACTION_EVIDENCE_LIMIT = 16
     _OVERLAY_BACKLOG_LIMIT = 4
     _OVERLAY_WAIT_LIMIT_S = 1.0
+    _DEFAULT_MAX_INFER_FPS = 10.0
+    _DEFAULT_MIN_COOLDOWN_S = 0.025
 
     def __init__(self, config, state) -> None:
         super().__init__()
@@ -75,6 +77,10 @@ class CameraWorker(QObject):
         self._last_inferred_frame_id = 0
         # 采集到新帧时唤醒推理线程，替代固定间隔轮询。
         self._frame_ready = threading.Event()
+        # 推理帧率上限与最小帧间冷却：防止低核 CPU（如 i3-7100）被背靠背推理打满 100%。
+        self._max_infer_fps = self._DEFAULT_MAX_INFER_FPS
+        self._min_infer_cooldown_s = self._DEFAULT_MIN_COOLDOWN_S
+        self._stop_pacing = threading.Event()
         # 已发出、界面还没处理完的推理结果数量。
         self._overlay_backlog = 0
         self._overlay_backlog_cond = threading.Condition()
@@ -281,11 +287,13 @@ class CameraWorker(QObject):
             self.state.camera_on,
             type(self.frame_processor).__name__ if self.frame_processor is not None else "None",
         )
+        self._stop_pacing.clear()
         self.state.set_inference_on(True)
 
     def stop_inference(self) -> None:
         self._runtime_logger.info("inference_state=stop")
         self.state.set_inference_on(False)
+        self._stop_pacing.set()
         self._wake_overlay_waiters()
 
     def _start_threads(self) -> None:
@@ -401,6 +409,7 @@ class CameraWorker(QObject):
                     captured_wall_time = getattr(self, "_latest_infer_captured_wall_time", None)
             dropped = max(0, fid - self._last_inferred_frame_id - 1)
             self._last_inferred_frame_id = fid
+            loop_started = time.monotonic()
             self._runtime_lock.acquire()
             try:
                 if not self.state.inference_on:
@@ -411,7 +420,7 @@ class CameraWorker(QObject):
                 if not self.running or generation != self._session_generation:
                     break
                 action_session = self.get_action_session()
-                uses_hands = bool(getattr(getattr(action_session, "bundle", None), "hands_in_training", action_session is not None))
+                uses_hands = bool(getattr(getattr(action_session, "bundle", None), "hands_in_training", False))
                 hand_landmarks = self._hand_landmarks_payload(
                     frame,
                     force=uses_hands,
@@ -458,6 +467,17 @@ class CameraWorker(QObject):
                 self.error_occurred.emit(f"推理异常: {exc}")
             finally:
                 self._runtime_lock.release()
+            self._pace_inference_loop(loop_started)
+
+    def _pace_inference_loop(self, loop_started: float) -> None:
+        """每帧推理后按帧率上限和最小冷却主动让步，防止低核工控机 CPU 持续 100%。"""
+        if not self.running or not self.state.inference_on:
+            return
+        elapsed = max(0.0, time.monotonic() - loop_started)
+        min_period = (1.0 / self._max_infer_fps) if self._max_infer_fps > 0 else 0.0
+        sleep_for = max(self._min_infer_cooldown_s, min_period - elapsed)
+        if sleep_for > 0.0:
+            self._stop_pacing.wait(sleep_for)
 
     def _publish_inference_result(self, frame, frame_id: int, overlay, action_report) -> None:
         """同一次输入的图片、帧号和结果一起发布，包括故障结果。"""
@@ -510,6 +530,7 @@ class CameraWorker(QObject):
                 self._overlay_backlog_cond.wait(remaining)
 
     def _wake_overlay_waiters(self) -> None:
+        self._stop_pacing.set()
         with self._overlay_backlog_cond:
             self._overlay_backlog_cond.notify_all()
 

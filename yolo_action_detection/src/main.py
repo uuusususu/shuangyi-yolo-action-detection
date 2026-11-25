@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-APP_WINDOW_TITLE = "双翼科技视觉行为引导系统"
+APP_WINDOW_TITLE = "双翼视觉防错系统"
 ERROR_ALREADY_EXISTS = 183
 _instance_mutex = None
 
@@ -236,8 +236,21 @@ def _create_pt_processor(config: ConfigManager, model_path_text: str):
     )
 
 
+def configure_runtime_thread_limits() -> None:
+    """限制 OpenCV 内部线程池，避免在低核工控机上与 ONNX Runtime / Qt 界面争抢 CPU。"""
+    import os
+    import cv2
+
+    cv_threads = max(1, min(2, (os.cpu_count() or 2) // 2))
+    try:
+        cv2.setNumThreads(cv_threads)
+    except Exception:
+        pass
+
+
 def create_yolo_processor(config: ConfigManager, app_base_dir: Path | str | None = None):
     """从配置创建最终运行处理器，包括可选的模板门控。"""
+    configure_runtime_thread_limits()
     base_dir = Path(app_base_dir) if app_base_dir is not None else resolve_app_paths().base_dir
     model_path = resolve_model_path(config, base_dir)
     model_path_text = str(model_path)
@@ -573,7 +586,7 @@ def main():
     )
 
     app = QApplication(sys.argv)
-    app.setApplicationName("YOLO OBB 动作检测系统")
+    app.setApplicationName(APP_WINDOW_TITLE)
     app.setOrganizationName("WingTech")
     apply_application_theme(app)
     app.setQuitOnLastWindowClosed(False)

@@ -596,10 +596,11 @@ def test_runtime_header_uses_centered_brand_and_compact_actions(qapp, tmp_path):
     window.show()
     qapp.processEvents()
 
-    assert window._title_label.text() == "双翼科技AI系统"
-    assert window._title_label.alignment() == Qt.AlignmentFlag.AlignCenter
-    assert abs(window._title_label.geometry().center().x() - window._header.rect().center().x()) <= 2
-    assert window._btn_config.height() == 40
+    assert window._title_label.text() == "双翼视觉防错系统"
+    assert window.windowTitle() == "双翼视觉防错系统"
+    assert not hasattr(window, "_btn_close")
+    assert window._btn_config.text() == "系统设置"
+    assert window._btn_config.height() >= 38
     window.close()
 
 

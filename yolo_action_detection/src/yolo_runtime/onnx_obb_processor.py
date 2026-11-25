@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import math
+import os
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -11,6 +12,12 @@ import cv2
 import numpy as np
 
 from yolo_runtime.yolo_result_models import DetectionOverlayState, ObbDetection
+
+
+def recommended_cpu_threads(logical_cpus: Optional[int] = None) -> int:
+    """通用产线核心预算：推理最多占一半逻辑核（1~4），为界面与相机采集留出余量。"""
+    count = int(logical_cpus if logical_cpus is not None else (os.cpu_count() or 2))
+    return max(1, min(4, count // 2))
 
 
 class OnnxObbProcessor:
@@ -26,6 +33,7 @@ class OnnxObbProcessor:
         session_factory: Optional[Callable[..., object]] = None,
         intra_op_threads: int = 0,
         graph_optimization: str = "all",
+        allow_spinning: bool = False,
     ) -> None:
         self._model_path = model_path
         self._conf_threshold = float(conf_threshold)
@@ -35,6 +43,7 @@ class OnnxObbProcessor:
         self._session_factory = session_factory
         self._intra_op_threads = max(0, int(intra_op_threads))
         self._graph_optimization = str(graph_optimization or "all")
+        self._allow_spinning = bool(allow_spinning)
 
         self._session = None
         self._input_name = ""
@@ -84,10 +93,18 @@ class OnnxObbProcessor:
         }
 
     def _build_session_options(self, ort):
-        """把配置里的会话参数翻译成 ONNX Runtime 的 SessionOptions。"""
+        """把会话参数翻译成 ONNX Runtime 的 SessionOptions（默认限核并关闭自旋空转）。"""
         options = ort.SessionOptions()
-        if self._intra_op_threads > 0:
-            options.intra_op_num_threads = self._intra_op_threads
+        effective_threads = (
+            self._intra_op_threads
+            if self._intra_op_threads > 0
+            else recommended_cpu_threads()
+        )
+        options.intra_op_num_threads = effective_threads
+        options.inter_op_num_threads = 1
+        spin_value = "1" if self._allow_spinning else "0"
+        options.add_session_config_entry("session.intra_op.allow_spinning", spin_value)
+        options.add_session_config_entry("session.inter_op.allow_spinning", spin_value)
         levels = {
             "disabled": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
             "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,

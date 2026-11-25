@@ -160,7 +160,7 @@ def test_roi_editor_has_one_save_action_and_no_separate_template_controls(qapp):
     assert not hasattr(page, "_create_template_btn")
     assert not hasattr(page, "_save_template_btn")
     assert not hasattr(page, "_template_preview")
-    assert page._save_roi_btn.text() == "保存当前 ROI"
+    assert page._save_roi_btn.text() == "保存当前区域"
     assert page._roi_template_cb.isEnabled() is False
     assert page._save_roi_btn.isEnabled() is False
 
@@ -195,7 +195,7 @@ def test_roi_type_dropdown_creates_and_deletes_selected_kind(qapp):
     page._refresh_roi_frame()
 
     labels = [page._roi_kind_input.itemText(index) for index in range(page._roi_kind_input.count())]
-    assert labels == ["识别 ROI", "模板 ROI", "搜索 ROI"]
+    assert labels == ["识别区域", "定位模板", "搜索区域"]
 
     search_index = page._roi_kind_input.findData(RoiKind.SEARCH.value)
     page._roi_kind_input.setCurrentIndex(search_index)

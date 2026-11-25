@@ -108,10 +108,47 @@ def test_session_options_translate_to_onnxruntime_levels(level, expected_attribu
     )
 
 
-def test_automatic_thread_count_leaves_onnxruntime_default():
+def test_automatic_thread_count_uses_safe_cpu_budget_and_disables_spinning():
     ort = pytest.importorskip("onnxruntime")
-    processor = OnnxObbProcessor(model_path="unused.onnx", intra_op_threads=0)
+    from yolo_runtime.onnx_obb_processor import recommended_cpu_threads
 
+    assert recommended_cpu_threads(2) == 1
+    assert recommended_cpu_threads(4) == 2
+    assert recommended_cpu_threads(8) == 4
+    assert recommended_cpu_threads(20) == 4
+
+    processor = OnnxObbProcessor(model_path="unused.onnx", intra_op_threads=0)
     options = processor._build_session_options(ort)
 
-    assert options.intra_op_num_threads == ort.SessionOptions().intra_op_num_threads
+    assert options.intra_op_num_threads == recommended_cpu_threads()
+    assert options.inter_op_num_threads == 1
+    assert options.get_session_config_entry("session.intra_op.allow_spinning") == "0"
+    assert options.get_session_config_entry("session.inter_op.allow_spinning") == "0"
+
+
+def test_worker_inference_pacing_enforces_cooldown_and_wakes_on_stop():
+    import time
+    from app_state import AppState
+    from camera.camera_worker import CameraWorker
+
+    worker = CameraWorker(ConfigManager(), AppState())
+    worker.running = True
+    worker.state.set_camera_on(True)
+    worker.start_inference()
+
+    # 单帧耗时较短时按 10 FPS 上限补齐间隔；超过 100ms 时仍至少执行 25ms 最小冷却
+    waited: list[float] = []
+    worker._stop_pacing.wait = lambda timeout=None: waited.append(float(timeout or 0.0)) or False
+    worker._pace_inference_loop(time.monotonic() - 0.01)
+    assert waited and 0.07 <= waited[-1] <= 0.10
+    worker._pace_inference_loop(time.monotonic() - 0.15)
+    assert waited[-1] == pytest.approx(worker._min_infer_cooldown_s, rel=0.05)
+
+    # 停止检测时立刻置位唤醒，不阻塞退出
+    worker2 = CameraWorker(ConfigManager(), AppState())
+    worker2.running = True
+    worker2.state.set_camera_on(True)
+    worker2.start_inference()
+    assert worker2._stop_pacing.is_set() is False
+    worker2.stop_inference()
+    assert worker2._stop_pacing.is_set() is True

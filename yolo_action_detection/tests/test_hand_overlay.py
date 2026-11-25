@@ -250,7 +250,7 @@ def test_worker_factory_failure_does_not_raise():
     assert worker._hand_landmarks_payload(frame) == []
 
 
-def test_sequential_detect_enables_and_stop_disables_hands(qapp):
+def test_sequential_detect_keeps_hands_off_when_not_required_and_enables_only_for_hand_bundle(qapp):
     config = ConfigManager()
     config.roi_inspection_enabled = False
     config.action_order_constraint_enabled = False
@@ -261,10 +261,26 @@ def test_sequential_detect_enables_and_stop_disables_hands(qapp):
     flags: list[bool] = []
     window.worker.set_hand_overlay_enabled = flags.append
 
+    # 纯 YOLO 顺序模式不启用手部模型，避免白耗 CPU
     window._on_toggle_detect()
     assert window.state.inference_on is True
+    assert flags[-1] is False
+
+    # 加载无手部动作模型仍保持关闭
+    window.worker.set_action_session(
+        SimpleNamespace(bundle=SimpleNamespace(hands_in_training=False), reset=lambda: None)
+    )
+    window._sync_hand_overlay_enabled()
+    assert flags[-1] is False
+
+    # 加载带手部特征的动作模型后才按需开启
+    window.worker.set_action_session(
+        SimpleNamespace(bundle=SimpleNamespace(hands_in_training=True), reset=lambda: None)
+    )
+    window._sync_hand_overlay_enabled()
     assert flags[-1] is True
 
+    # 停止检测立即关闭
     window._on_toggle_detect()
     assert window.state.inference_on is False
     assert flags[-1] is False
