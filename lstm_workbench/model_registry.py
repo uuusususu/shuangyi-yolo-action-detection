@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
 import threading
 import time
@@ -11,13 +12,107 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
-STATION_SRC = ROOT.parent / "yolo_action_detection" / "src"
+# 手部追踪和 YOLO 推理与工位共用同一份代码。在仓库里用工位源码；
+# 单独把 lstm_workbench 文件夹复制到别的电脑时，用文件夹里随带的 station 副本。
+_REPO_STATION_SRC = ROOT.parent / "yolo_action_detection" / "src"
+_BUNDLED_STATION_SRC = ROOT / "station"
+STATION_SRC = _REPO_STATION_SRC if (_REPO_STATION_SRC / "hand_tracking").is_dir() else _BUNDLED_STATION_SRC
+# 工程和模型库所在目录，默认就是 lstm_workbench 文件夹本身，整个文件夹搬走数据跟着走。
+HOME = Path(os.environ.get("LSTM_WORKBENCH_HOME") or ROOT).resolve()
 
 # 全局模型库。所有工程共用一份，不随工程走 —— 换模型是换库里的文件，
 # 不是每个工程各存一份。库放在工作台目录里，整个 lstm_workbench 文件夹搬走时模型跟着走。
-MODEL_LIBRARY = ROOT / "models"
+MODEL_LIBRARY = HOME / "models"
 YOLO_LIBRARY = MODEL_LIBRARY / "yolo"
 HANDS_LIBRARY = MODEL_LIBRARY / "hands"
+SAM_LIBRARY = MODEL_LIBRARY / "sam"
+
+SMART_MODEL_CATALOG: tuple[dict, ...] = (
+    {
+        "name": "sam3.pt",
+        "label": "Meta SAM 3（默认优先）",
+        "family": "sam3",
+        "capabilities": ["interactive", "video", "text", "visual_prompt"],
+        "vram_gb": 3.5,
+        "gated": True,
+        "downloadable": False,
+        "download_url": "",
+        "text_dep": "clip",
+        "note": "Meta 旗舰模型：支持点选/拉框交互、视频追踪及文本/示例零样本；需从 Meta/HuggingFace 授权获取后放入 models/sam/sam3.pt",
+    },
+    {
+        "name": "sam2.1_b.pt",
+        "label": "Meta SAM 2.1 Base（8G 推荐备选）",
+        "family": "sam2",
+        "capabilities": ["interactive", "video"],
+        "vram_gb": 1.8,
+        "gated": False,
+        "downloadable": True,
+        "download_url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/sam2.1_b.pt",
+        "text_dep": "",
+        "note": "精度与速度均衡，8GB 显卡流畅运行，支持点选交互与连续视频帧追踪（无需 CLIP）",
+    },
+    {
+        "name": "sam2.1_t.pt",
+        "label": "Meta SAM 2.1 Tiny（极速低显存）",
+        "family": "sam2",
+        "capabilities": ["interactive", "video"],
+        "vram_gb": 1.0,
+        "gated": False,
+        "downloadable": True,
+        "download_url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/sam2.1_t.pt",
+        "text_dep": "",
+        "note": "体积小、响应快，适合低显存或大批量连续帧快速追踪（无需 CLIP）",
+    },
+    {
+        "name": "sam2.1_s.pt",
+        "label": "Meta SAM 2.1 Small",
+        "family": "sam2",
+        "capabilities": ["interactive", "video"],
+        "vram_gb": 1.3,
+        "gated": False,
+        "downloadable": True,
+        "download_url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/sam2.1_s.pt",
+        "text_dep": "",
+        "note": "轻量级 SAM 2.1，支持交互点选与视频追踪",
+    },
+    {
+        "name": "mobile_sam.pt",
+        "label": "MobileSAM（超轻量兼容）",
+        "family": "sam",
+        "capabilities": ["interactive"],
+        "vram_gb": 0.5,
+        "gated": False,
+        "downloadable": True,
+        "download_url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/mobile_sam.pt",
+        "text_dep": "",
+        "note": "极低显存占用（约 40MB 权重），适合作为轻量交互点选兜底",
+    },
+    {
+        "name": "yoloe-26s-seg.pt",
+        "label": "YOLOE-26s-Seg（零样本视觉示例/文本）",
+        "family": "yoloe",
+        "capabilities": ["visual_prompt", "text"],
+        "vram_gb": 0.8,
+        "gated": False,
+        "downloadable": True,
+        "download_url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yoloe-26s-seg.pt",
+        "text_dep": "mobileclip",
+        "note": "0 标注冷启动：框选 1 个视觉示例即可免 CLIP 批量匹配同类零件并拟合 OBB",
+    },
+    {
+        "name": "yoloe-11s-seg.pt",
+        "label": "YOLOE-11s-Seg（零样本视觉示例/文本）",
+        "family": "yoloe",
+        "capabilities": ["visual_prompt", "text"],
+        "vram_gb": 0.8,
+        "gated": False,
+        "downloadable": True,
+        "download_url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yoloe-11s-seg.pt",
+        "text_dep": "mobileclip",
+        "note": "YOLOE-11 分割零样本模型，支持视觉示例批量标与文本提示",
+    },
+)
 
 # 手部模型指纹要跟着实际加载的文件走。0 是 lite，1 是 full。
 HANDS_MODEL_FILES = {
@@ -61,6 +156,39 @@ def _describe(path: Path) -> dict:
     return {"name": path.name, "path": str(path), "bytes": path.stat().st_size}
 
 
+def portable_yolo_path(path_text: str) -> str:
+    """要写进工程设置的 YOLO 路径：在模型库里就只存文件名，整个文件夹搬走后仍然有效。"""
+    text = str(path_text or "").strip()
+    if not text:
+        return ""
+    path = Path(text)
+    if not path.is_absolute():
+        return text.replace("\\", "/")
+    try:
+        return path.resolve().relative_to(YOLO_LIBRARY.resolve()).as_posix()
+    except ValueError:
+        return text
+
+
+def resolve_yolo_path(path_text: str) -> str:
+    """把工程设置里的 YOLO 路径换成本机能打开的绝对路径。
+
+    - 相对路径：相对于模型库 models/yolo。
+    - 旧工程存的绝对路径：本文件夹模型库里有同名文件就用库里的，否则原样使用（库外的模型）。
+    """
+    text = str(path_text or "").strip()
+    if not text:
+        return ""
+    path = Path(text)
+    if not path.is_absolute():
+        return str(YOLO_LIBRARY / path)
+    # 本文件夹模型库里有同名文件就用它：复制出来的文件夹不去读原来那份。
+    local = YOLO_LIBRARY / path.name
+    if local.is_file():
+        return str(local)
+    return text
+
+
 def list_yolo_models() -> list[dict]:
     """模型库里的 ONNX 清单。目录不在或空的就是空列表，不抛。"""
     if not YOLO_LIBRARY.is_dir():
@@ -72,12 +200,104 @@ def list_yolo_models() -> list[dict]:
     return [
         {
             "name": item.name,
-            "path": str(item),
+            # 存进工程设置的是这个值。只写库内文件名，文件夹复制到别的电脑后照样认得。
+            "path": portable_yolo_path(str(item)),
             "bytes": item.stat().st_size,
             "mtime": datetime.fromtimestamp(item.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
         }
         for item in found
     ]
+
+
+def sam_library_dir() -> Path:
+    """智能标注模型（Meta SAM 3 / SAM 2.1 / MobileSAM / YOLOE）统一存放在 models/sam。"""
+    return MODEL_LIBRARY / "sam"
+
+
+_SAM_README = (
+    "Meta SAM / 智能标注模型权重存放目录\n"
+    "====================================\n"
+    "请将下载好的 Meta SAM 3 (sam3.pt)、SAM 2.1 (sam2.1_b.pt / sam2.1_t.pt / sam2.1_s.pt)、\n"
+    "MobileSAM (mobile_sam.pt)、YOLOE (yoloe-26s-seg.pt) 或其他兼容 .pt / .pth 模型文件直接放入本文件夹。\n"
+    "放入后在工作台的「模型库」或「零件标注」页点击刷新扫描，即可自由选择加载启用或随时停止释放显存。\n"
+)
+
+
+def ensure_sam_library() -> Path:
+    """确保 models/sam 物理文件夹已存在，并写入简明存放说明（不干扰 .pt/.pth 扫描）。"""
+    folder = sam_library_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    readme = folder / "README.txt"
+    if not readme.exists():
+        try:
+            readme.write_text(_SAM_README, encoding="utf-8")
+        except OSError:
+            pass
+    return folder
+
+
+def smart_model_family(name: str) -> str:
+    stem = Path(str(name or "")).stem.lower()
+    if "sam3" in stem:
+        return "sam3"
+    if "sam2" in stem:
+        return "sam2"
+    if "yoloe" in stem:
+        return "yoloe"
+    if "world" in stem:
+        return "yolo_world"
+    if "fastsam" in stem or "sam" in stem:
+        return "sam"
+    return "custom"
+
+
+def resolve_sam_path(name: str) -> Path:
+    """将智能标注权重文件名安全解析到 models/sam 内，拒绝越界路径。"""
+    raw = str(name or "").strip()
+    if not raw or "/" in raw or "\\" in raw or ":" in raw or "\x00" in raw or raw in {".", ".."}:
+        raise ValueError("智能标注模型文件名不合法")
+    folder = sam_library_dir().resolve()
+    target = (folder / raw).resolve()
+    if target.parent != folder or target.suffix.lower() not in {".pt", ".pth"}:
+        raise ValueError("智能标注模型必须是 models/sam 目录下的 .pt 或 .pth 文件")
+    return target
+
+
+def list_sam_models() -> list[dict]:
+    """扫描 models/sam 中本地已就绪的智能标注权重。"""
+    folder = sam_library_dir()
+    if not folder.is_dir():
+        return []
+    catalog_by_name = {item["name"].lower(): item for item in SMART_MODEL_CATALOG}
+    found = sorted(
+        (item for item in folder.iterdir() if item.is_file() and item.suffix.lower() in {".pt", ".pth"} and item.stat().st_size > 0),
+        key=lambda item: item.name.lower(),
+    )
+    items: list[dict] = []
+    for entry in found:
+        meta = catalog_by_name.get(entry.name.lower())
+        family = meta["family"] if meta else smart_model_family(entry.name)
+        capabilities = list(meta["capabilities"]) if meta else (
+            ["interactive", "video", "text", "visual_prompt"] if family == "sam3"
+            else ["interactive", "video"] if family == "sam2"
+            else ["visual_prompt", "text"] if family == "yoloe"
+            else ["interactive"]
+        )
+        items.append(
+            {
+                "name": entry.name,
+                "label": meta["label"] if meta else f"{entry.name}（本地自定义）",
+                "family": family,
+                "capabilities": capabilities,
+                "vram_gb": meta["vram_gb"] if meta else 2.0,
+                "text_dep": meta["text_dep"] if meta else ("clip" if family == "sam3" else "mobileclip" if family == "yoloe" else ""),
+                "path": str(entry.resolve()),
+                "bytes": entry.stat().st_size,
+                "mtime": datetime.fromtimestamp(entry.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                "local": True,
+            }
+        )
+    return items
 
 
 def library_info() -> dict:
@@ -90,9 +310,16 @@ def library_info() -> dict:
     for item in list(source["models"]) + ([source["graph"]] if source.get("graph") is not None else []):
         if item.is_file():
             files.append(_describe(item))
+    sam_dir = sam_library_dir()
     return {
         "root": str(MODEL_LIBRARY),
         "yolo": {"dir": str(YOLO_LIBRARY), "exists": YOLO_LIBRARY.is_dir(), "files": list_yolo_models()},
+        "sam": {
+            "dir": str(sam_dir),
+            "exists": sam_dir.is_dir(),
+            "files": list_sam_models(),
+            "catalog": [dict(item) for item in SMART_MODEL_CATALOG],
+        },
         "hands": {
             "dir": source["dir"] or str(HANDS_LIBRARY),
             "exists": bool(files),
@@ -347,7 +574,7 @@ def probe_yolo(path_text: str, conf_threshold: float) -> dict:
     """真加载一次 ONNX，拿到类名和文件指纹。"""
     if not path_text:
         return {"ok": False, "error": "还没有填写 YOLO 路径"}
-    path = Path(path_text)
+    path = Path(resolve_yolo_path(path_text))
     if not path.is_file():
         return {"ok": False, "error": f"YOLO 文件不存在：{path}"}
     try:
@@ -383,8 +610,8 @@ def yolo_backend(settings: dict):
     yolo_path = str(settings.get("yolo_path") or "")
     if not yolo_path:
         raise FileNotFoundError("还没有选定 YOLO，先去「模型」页检查并保存")
-    conf_threshold = float(settings.get("yolo_conf_threshold") or _DEFAULT_CONF)
-    processor = load_yolo(yolo_path, conf_threshold)
+    conf_threshold = _DEFAULT_CONF if settings.get("yolo_conf_threshold") in (None, "") else float(settings["yolo_conf_threshold"])
+    processor = load_yolo(resolve_yolo_path(yolo_path), conf_threshold)
 
     def detect(frame: np.ndarray) -> list[dict]:
         state = processor.process_frame(frame)

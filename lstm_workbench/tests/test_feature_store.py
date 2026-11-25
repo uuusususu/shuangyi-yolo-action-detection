@@ -135,7 +135,7 @@ def test_mixed_feature_lengths_are_refused(tmp_path, monkeypatch):
     frame = np.zeros((8, 16, 3), dtype=np.uint8)
     lengths = [131, 136]
 
-    def fake_rows(frames, detect, hands, names, conf, on_frame=None, frame_count=None, include_hands=True):
+    def fake_rows(frames, detect, hands, names, conf, on_frame=None, frame_count=None, include_hands=True, should_stop=None):
         frames = list(frames)
         length = lengths.pop(0)
         return (

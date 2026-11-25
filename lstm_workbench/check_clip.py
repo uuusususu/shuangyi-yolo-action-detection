@@ -9,10 +9,21 @@ from pathlib import Path
 import numpy as np
 
 from .features import FEATURE_CODE_VERSION, build_feature_row, feature_size, hands_in_training, safe_feature_std
-from .model import ActionLSTM, CausalMSTCN
+from .feature_store import conf_threshold_of
 from .part_gate import apply_part_gate
 from .service import resample_indices
-from .trainer import resolve_device
+
+
+def ActionLSTM(*args, **kwargs):  # noqa: N802
+    from .model import ActionLSTM as _ActionLSTM
+
+    return _ActionLSTM(*args, **kwargs)
+
+
+def resolve_device(*args, **kwargs):
+    from .trainer import resolve_device as _resolve_device
+
+    return _resolve_device(*args, **kwargs)
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
@@ -182,8 +193,8 @@ def require_same_models(settings: dict, contract: dict) -> None:
     recorded_hands = str(contract.get("hands_sha256") or "")
     if use_hands and hands_sha and recorded_hands and hands_sha != recorded_hands:
         raise ValueError("现在的手部模型和这一轮不是同一个文件")
-    current_conf = float(settings.get("yolo_conf_threshold") or 0)
-    trained_conf = float(contract.get("yolo_conf_threshold") or 0)
+    current_conf = conf_threshold_of(settings)
+    trained_conf = conf_threshold_of(contract)
     if abs(current_conf - trained_conf) > 1e-6:
         raise ValueError("现在的置信度阈值和这一轮不同")
 
@@ -426,6 +437,29 @@ def save_overlay(run_dir: Path, frames: list) -> None:
         raise last_error
 
 
+def _backend_settings_for(contract: dict, settings: dict, conf: float) -> dict:
+    """验证视频时抽特征用的设置：手部开关跟着这一轮的契约走，不跟当前工程设置。
+
+    以前只传 yolo_path 和阈值，hands_in_training 判断恒为假：带手部训练的一轮，
+    验证时抽出来的特征少了手部那 126 维，送进模型直接报形状错误，叠加图上也没有手。
+    """
+    return {
+        "yolo_path": settings.get("yolo_path") or "",
+        "yolo_conf_threshold": conf,
+        "hands_in_training": hands_in_training(contract),
+    }
+
+
+def _require_feature_width(rows: np.ndarray, contract: dict) -> None:
+    expected = int(contract.get("input_size") or 0)
+    actual = int(rows.shape[-1]) if rows.ndim == 2 else 0
+    if expected and actual != expected:
+        raise ValueError(
+            f"抽出的特征是 {actual} 维，这一轮模型要 {expected} 维。"
+            "多半是零件类别或手部开关和训练时不一样，请用同一套模型设置。"
+        )
+
+
 def _extract_rows(path: Path, settings: dict, part_names: list[str], conf: float, on_frame, should_stop, on_overlay=None) -> tuple[np.ndarray, list]:
     from .model_registry import live_backends, yolo_backend
 
@@ -623,23 +657,16 @@ def _load_model(contract: dict, weights: Path, device):
     if not class_ids:
         raise ValueError("这一轮没有类别")
     network = str(contract.get("network") or "lstm")
-    if network == "mstcn":
-        model = CausalMSTCN(
-            int(contract["input_size"]),
-            len(class_ids),
-            channels=int(contract.get("mstcn_channels") or 64),
-            layers=int(contract.get("mstcn_layers") or 8),
-            stages=int(contract.get("mstcn_stages") or 2),
-            dropout=float(contract.get("dropout") or 0.0),
-        )
-    else:
-        model = ActionLSTM(
-            int(contract["input_size"]),
-            len(class_ids),
-            hidden_size=int(contract.get("hidden_size") or 128),
-            num_layers=int(contract.get("num_layers") or 2),
-            dropout=float(contract.get("dropout") or 0.0),
-        )
+    if network != "lstm":
+        # MS-TCN 已从工作台移除（产线也加载不了）。旧轮次给出明确原因，不再尝试加载。
+        raise ValueError("这一轮是用 MS-TCN 训练的，工作台已不再支持，请用 LSTM 重新训练")
+    model = ActionLSTM(
+        int(contract["input_size"]),
+        len(class_ids),
+        hidden_size=int(contract.get("hidden_size") or 128),
+        num_layers=int(contract.get("num_layers") or 2),
+        dropout=float(contract.get("dropout") or 0.0),
+    )
     state = torch.load(weights, map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     model.to(device)
@@ -669,10 +696,7 @@ def run_check(run_dir: Path, settings: dict, annotations: dict, on_progress=None
 
     part_names = list(contract.get("part_class_names") or [])
     conf = float(contract.get("yolo_conf_threshold") or 0)
-    backend_settings = {
-        "yolo_path": settings.get("yolo_path") or "",
-        "yolo_conf_threshold": conf,
-    }
+    backend_settings = _backend_settings_for(contract, settings, conf)
     total_hint = int(probe["frame_count"])
 
     def publish(done: int) -> None:
@@ -686,6 +710,7 @@ def run_check(run_dir: Path, settings: dict, annotations: dict, on_progress=None
         on_overlay=lambda frames: save_overlay(run_dir, frames),
     )
     save_overlay(run_dir, overlays)
+    _require_feature_width(rows, contract)
     device, _info = resolve_device()
     model, class_ids = _load_model(contract, weights, device)
     names = _class_names(annotations, class_ids)
@@ -747,7 +772,7 @@ def fill_overlay(run_dir: Path, settings: dict, on_progress=None, should_stop=No
 
     _rows, overlays = _extract_rows(
         video,
-        {"yolo_path": settings.get("yolo_path") or "", "yolo_conf_threshold": conf},
+        _backend_settings_for(contract, settings, conf),
         part_names,
         conf,
         publish,
@@ -944,14 +969,19 @@ def check_project_clip(
     if base <= 0:
         raise ValueError("这一轮没有时间基")
     scaled, indices = scale_clip_to_time_base(clip, base)
-    gathered = np.asarray(rows, dtype=np.float32)[np.asarray(indices, dtype=np.int64)]
+    rows = np.asarray(rows, dtype=np.float32)
+    # 实际解码帧数可能比标注里的估计值少几帧，越界的索引落到最后一帧，不报 IndexError。
+    safe = np.minimum(np.asarray(indices, dtype=np.int64), max(rows.shape[0] - 1, 0))
+    gathered = rows[safe]
     class_ids = [str(item) for item in contract.get("class_ids") or []]
     names = _class_names(annotations, class_ids)
     device, _info = resolve_device()
     model, class_ids = _load_model(contract, weights, device)
     part_names = list(contract.get("part_class_names") or [])
     if contract.get("train_unit") == "timeline":
-        segments, frame_index = decode_timeline(gathered, float(scaled.fps or base), model, contract, part_names, names)
+        # gathered 已经按时间基取过帧，这里必须传时间基帧率。scale_clip_to_time_base 在帧数没变时
+        # 原样返回片子（fps 仍是源帧率，比如 25.02 对 25），传 scaled.fps 会让 decode_timeline 再重采一遍。
+        segments, frame_index = decode_timeline(gathered, base, model, contract, part_names, names)
     else:
         segments, frame_index = _legacy_scaled_decode(
             gathered, indices, scaled, model, class_ids, device, contract, names

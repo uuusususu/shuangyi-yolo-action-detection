@@ -31,6 +31,7 @@ def _settings():
 def _clip(clip_id: str, step_end: int):
     return {
         "id": clip_id,
+        "annotation_complete": True,
         "frame_count": 160,
         "fps": 10,
         "width": 64,
@@ -238,25 +239,3 @@ def test_validation_clip_does_not_add_required_parts(tmp_path, monkeypatch):
     features["b"][:, 0] = 1
     start_training(store, "job", features)
     assert captured["required_parts"] == {"step1": []}
-
-
-def test_causal_mstcn_ignores_future_frames_and_smoothing_is_finite():
-    import torch
-    from torch import nn
-
-    from lstm_workbench.model import CausalMSTCN
-    from lstm_workbench.trainer import frame_loss
-
-    model = CausalMSTCN(4, 2, channels=8, layers=3, stages=2, dropout=0.0)
-    model.eval()
-    past = torch.zeros(1, 12, 4)
-    changed = past.clone()
-    changed[:, 8:] = 1
-    with torch.no_grad():
-        before = model(past, all_steps=True)
-        after = model(changed, all_steps=True)
-    assert before.shape == (1, 12, 2)
-    assert torch.allclose(before[:, :8], after[:, :8])
-    sequences = [np.zeros((10, 4), dtype=np.float32), np.ones((6, 4), dtype=np.float32)]
-    loss = frame_loss(model, sequences, [0, 1], torch.device("cpu"), nn.CrossEntropyLoss(), smooth=True)
-    assert torch.isfinite(loss)

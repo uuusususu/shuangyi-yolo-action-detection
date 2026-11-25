@@ -48,9 +48,9 @@
   }
 
   function openProject(name) {
-    if (name === global.OD.live.current()) { S.go('model'); return; }
+    if (name === global.OD.live.current() && global.OD.live.isLive()) { S.go('pdata'); return Promise.resolve(); }
     S.toast('正在读取工程 ' + name + '…');
-    global.OD.live.loadProject(name).then(function () {
+    return global.OD.live.loadProject(name).then(function () {
       S.toast('已切到 ' + name, 'ok');
       S.render();
     }).catch(function (err) {
@@ -65,14 +65,29 @@
       el('dt', { text: '片子' }), el('dd', { text: clips.length + ' 条' }),
       el('dt', { text: '类别' }), el('dd', { text: data.classes.length + ' 个' }),
       el('dt', { text: '标注段' }), el('dd', { text: segments + ' 段' }),
-      el('dt', { text: '最近训练' }), el('dd', { text: data.runs.length ? data.runs[0].at : '还没有' })
+      el('dt', { text: '最近训练' }), el('dd', { text: data.runs.length ? data.runs[0].at : '还没有' }),
+      /* 一条产线要两套模型都就绪才能上线：零件模型来自模型库，动作模型来自最近一轮。 */
+      el('dt', { text: '零件模型' }), el('dd', { class: 'mono', text: yoloName(data) }),
+      el('dt', { text: '动作模型' }), el('dd', { text: actionState(data) })
     ];
+  }
+
+  function yoloName(data) {
+    var path = (data.settings && data.settings.yolo_path) || '';
+    return path ? String(path).split(/[\\/]/).pop() : '还没选';
+  }
+
+  function actionState(data) {
+    var run = data.runs && data.runs[0];
+    if (!run) return '还没训练';
+    var f1 = run.metrics && run.metrics.f1_50;
+    return run.name + (typeof f1 === 'number' ? ' · F1 ' + f1.toFixed(2) : '');
   }
 
   function projectCard(data, name) {
     var issues = S.allGateItems();
     /* 整张卡就是一个控件：不再另外放一个"打开"按钮，两处入口就是两套状态。 */
-    function open() { S.go('model'); }
+    function open() { S.go('pdata'); }
     return el('article', {
       class: 'card is-click', role: 'button', tabindex: '0',
       onclick: open,
@@ -128,10 +143,10 @@
         var name = nameInput.value.trim();
         hint.className = 'help';
         if (!name) { hint.className = 'help bad'; hint.textContent = '工程名不能为空。'; return; }
-        /* 名字同时是目录名，服务端也会拦，这里先拦一次省一个来回。 */
-        if (/[\\/]/.test(name) || name === '.' || name === '..') {
+        /* 名字同时是 Windows 目录名，规则和 project_store.project_id_problem 一致，服务端也会拦。 */
+        if (/[<>:"\/\\|?*\x00-\x1f]/.test(name) || name === '.' || name === '..' || /\.$/.test(name)) {
           hint.className = 'help bad';
-          hint.textContent = '工程名里不能有 / \\ 或单独的 . 与 ..，它同时是目录名。';
+          hint.textContent = '工程名不能包含 < > : " / \\ | ? * ，也不能以 . 结尾，它同时是目录名。';
           return;
         }
         if (!api.available) {
@@ -144,7 +159,8 @@
           hint.className = 'help';
           nameInput.value = '';
           /* 先重新拉一遍工程名单，新的那张卡才会出现在这一页上；
-             新工程是空的，切过去正好从"模型与工位"开始走一遍流程。 */
+             新工程是空的，切过去正好从"模型与工位"开始走一遍流程。
+             openProject 必须 return：以前它不返回 Promise，打开失败时按钮已恢复、错误只闪一下 toast。 */
           return global.OD.live.refreshProjects().then(function () {
             S.toast('工程 ' + name + ' 已建立', 'ok');
             return openProject(name);

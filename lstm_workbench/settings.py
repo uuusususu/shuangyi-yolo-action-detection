@@ -29,7 +29,7 @@ DEFAULT_SETTINGS = {
     "split_val": [],
     # 不参加这次训练的片子 id。空列表表示全部参加。
     "train_excluded": [],
-    # lstm：现在这套。mstcn：因果 MS-TCN，训练时加相邻帧平滑。
+    # 只有 LSTM。产线只能加载 LSTM，旧设置里的 mstcn 读出来一律按 LSTM。
     "network": "lstm",
     # 新训练只按整条片子留验证。读到旧的 segment 会转成 clip 并清掉按段划分。
     "split_mode": "clip",
@@ -191,8 +191,9 @@ def clean(patch: object, current: dict | None = None) -> dict:
     if "network" in patch:
         name = str(patch["network"] or "lstm").strip()
         if name not in {"lstm", "mstcn"}:
-            raise ValueError("网络只能选 LSTM 或因果 MS-TCN")
-        merged["network"] = name
+            raise ValueError("网络只能选 LSTM")
+        # MS-TCN 已移除：旧页面或旧设置交来 mstcn 时按 LSTM 存，不报错。
+        merged["network"] = "lstm"
     if "split_mode" in patch and str(patch["split_mode"] or "clip").strip() not in {"clip", "segment"}:
         raise ValueError("划分方式只能是整条片子")
     if "val_clip_ids" in patch:

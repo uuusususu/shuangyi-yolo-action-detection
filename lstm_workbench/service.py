@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,9 +25,13 @@ from .dataset import (
 )
 from .project_store import ProjectStore
 from .timeline import ClipAnnotation, Segment, WINDOW_SECONDS, find_overlaps, window_frames
-from .model import mstcn_layers_for, receptive_field
 from .part_gate import required_parts_from_labeled_rows
-from .trainer import train_timeline
+
+
+def train_timeline(*args, **kwargs):
+    from .trainer import train_timeline as _train_timeline
+
+    return _train_timeline(*args, **kwargs)
 
 SAMPLE_SHORTFALL = 10
 
@@ -94,6 +99,9 @@ def time_base(clips: list[ClipAnnotation], override: float = 0.0) -> float:
     """
     rated = [clip for clip in clips if clip.fps > 0]
     if not rated:
+        # 全是连续图的工程：以前不管有没有手动指定都直接报错，按提示填了时间基也永远训不了。
+        if override and override > 0:
+            return float(override)
         raise ValueError("所有片子都读不到帧率（图片序列没有帧率），请在模型页显式指定时间基帧率")
     if override and override > 0:
         slow = min(rated, key=lambda clip: (clip.fps, clip.clip_id))
@@ -196,6 +204,97 @@ def prepare_clips(payload: dict, settings: dict) -> PreparedClips:
     )
 
 
+def validate_annotations(payload: dict) -> str:
+    """保存标注前检查结构。返回问题描述，空串表示可以保存。
+
+    以前只检查 classes / clips 是不是列表就落盘，一份缺字段的标注会让之后每次打开工程都抛异常，
+    工程页一直打不开，只能手改 annotations.json。片子 id 还会拼进特征缓存路径，不能带路径分隔符。
+    """
+    classes = payload.get("classes")
+    clips = payload.get("clips")
+    if not isinstance(classes, list) or not isinstance(clips, list):
+        return "标注要带 classes 和 clips 两个列表"
+
+    def bad_id(value) -> bool:
+        text = str(value) if isinstance(value, (str, int)) else ""
+        return not text or text in {".", ".."} or any(ch in text for ch in "/\\:\0")
+
+    class_ids = set()
+    for item in classes:
+        if not isinstance(item, dict) or bad_id(item.get("id")):
+            return "动作类别缺少合法的 id"
+        class_ids.add(str(item["id"]))
+
+    def span_ok(item, frame_count: int) -> bool:
+        try:
+            start, end = int(item["start"]), int(item["end"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return 0 <= start < end <= frame_count
+
+    seen_clips = set()
+    for raw in clips:
+        if not isinstance(raw, dict) or bad_id(raw.get("id")):
+            return "片子缺少合法的 id"
+        clip_id = str(raw["id"])
+        if clip_id in seen_clips:
+            return f"片子 id 重复：{clip_id}"
+        seen_clips.add(clip_id)
+        if "annotation_complete" in raw and not isinstance(raw["annotation_complete"], bool):
+            return f"片子 {clip_id} 的标注完成状态必须是布尔值"
+        try:
+            frame_count = int(raw["frame_count"])
+        except (KeyError, TypeError, ValueError):
+            return f"片子 {clip_id} 缺少帧数"
+        for item in raw.get("segments") or []:
+            if not isinstance(item, dict) or bad_id(item.get("id")):
+                return f"片子 {clip_id} 有动作段缺少 id"
+            if str(item.get("class_id")) not in class_ids:
+                return f"片子 {clip_id} 有动作段用了不存在的类别"
+            if not span_ok(item, frame_count):
+                return f"片子 {clip_id} 有动作段起止帧不合法"
+        for item in raw.get("excluded") or []:
+            if not isinstance(item, dict) or not span_ok(item, frame_count):
+                return f"片子 {clip_id} 有剔除段起止帧不合法"
+    confirmations = payload.get("completion_confirmations", [])
+    if (not isinstance(confirmations, list)
+            or any(not isinstance(item, str) or item not in seen_clips for item in confirmations)
+            or len(set(confirmations)) != len(confirmations)):
+        return "标注完成确认必须是当前片子 id 的不重复列表"
+    return ""
+
+
+def apply_annotation_completion(previous: dict, payload: dict) -> dict:
+    """保存前撤销已变更内容的旧确认；本次明确勾选的确认随内容一起生效。
+
+    completion_confirmations 仅为请求动作，不落盘。调用方应先 validate_annotations，
+    并在工程数据锁内读上一版、调用本函数、保存结果，避免旧客户端沿用过时的 true。
+    """
+    result = deepcopy(payload)
+    confirmations = set(result.pop("completion_confirmations", []))
+    old_clips = {str(item["id"]): item for item in previous.get("clips", [])}
+
+    def content(raw: dict) -> dict:
+        # 段的显示顺序或 id 变化不改变空闲语义；媒体及实际区间变化要求重新检查。
+        spans = sorted((str(s.get("class_id", "")), int(s["start"]), int(s["end"]))
+                       for s in raw.get("segments") or [])
+        cuts = sorted((int(s["start"]), int(s["end"])) for s in raw.get("excluded") or [])
+        return {
+            "file": raw.get("file") or raw.get("id"),
+            "frame_count": raw.get("frame_count"), "fps": raw.get("fps") or 0,
+            "width": raw.get("width"), "height": raw.get("height"),
+            "segments": spans, "excluded": cuts,
+        }
+
+    for raw in result.get("clips", []):
+        clip_id = str(raw["id"])
+        old = old_clips.get(clip_id)
+        wanted = raw.get("annotation_complete", old.get("annotation_complete", False) if old else False) is True
+        unchanged = old is not None and content(old) == content(raw)
+        raw["annotation_complete"] = wanted and (unchanged or clip_id in confirmations)
+    return result
+
+
 def annotations_to_clips(payload: dict, settings: dict) -> list[ClipAnnotation]:
     clips = []
     for raw in payload.get("clips", []):
@@ -251,6 +350,15 @@ def resolve_split(
     return propose_split(clips, window, seed, val_windows), False
 
 
+def annotation_completion_blockers(payload: dict, settings: dict) -> list[str]:
+    """训练请求先检查整条审核状态；后台特征准备不使用此门禁。"""
+    return [
+        f"{raw['id']} 尚未确认整条视频标注完成，请检查全部画面并保存确认"
+        for raw in clips_for_training(payload, settings).get("clips", [])
+        if raw.get("annotation_complete") is not True
+    ]
+
+
 def annotation_blockers(payload: dict, settings: dict) -> list[str]:
     scoped = clips_for_training(payload, settings)
     originals = annotations_to_clips(scoped, settings)
@@ -259,6 +367,7 @@ def annotation_blockers(payload: dict, settings: dict) -> list[str]:
         return ["还没有勾选参加训练的片子"]
     if not originals:
         return ["还没有片子，先放入素材"]
+    reasons.extend(annotation_completion_blockers(payload, settings))
     for clip in originals:
         if find_overlaps(clip.segments):
             reasons.append(f"{clip.clip_id} 有交叠，不能训练")
@@ -346,10 +455,17 @@ def start_training(
     feature_arrays: dict[str, np.ndarray],
     should_stop=None,
     display_name: str = "",
+    annotations: dict | None = None,
+    settings: dict | None = None,
 ) -> dict:
+    """annotations / settings 传入时用调用方的快照。
+
+    训练前要先抽特征，可能要好几分钟。以前这里重新从磁盘读一次，期间页面改了参加训练的片子
+    或删了片子，读到的片子和已经抽好的特征对不上，直接 KeyError。
+    """
     folder = store.open_dir(project_id)
-    settings = settings_module.clean({}, store.load_settings(project_id))
-    payload = store.load_annotations(project_id)
+    settings = settings_module.clean({}, settings if settings is not None else store.load_settings(project_id))
+    payload = annotations if annotations is not None else store.load_annotations(project_id)
     blockers = annotation_blockers(payload, settings)
     if blockers:
         raise ValueError(blockers[0])
@@ -358,8 +474,19 @@ def start_training(
     for clip in prepared.originals:
         if find_overlaps(clip.segments):
             raise ValueError(f"{clip.clip_id} 有交叠，不能训练")
-        source = feature_arrays[clip.clip_id]
-        feature_arrays[clip.clip_id] = np.asarray(source)[prepared.indices[clip.clip_id]]
+        source = np.asarray(feature_arrays[clip.clip_id])
+        wanted = np.asarray(prepared.indices[clip.clip_id], dtype=np.int64)
+        # 视频头里的帧数是估计值，真解码出来常常少几帧（mp4、变帧率、截断的文件）。
+        # 少一两帧就直接越界报 IndexError，用户看不懂。差得不多时用最后一帧补齐，差太多才明确报错。
+        missing = int(wanted.max(initial=-1)) + 1 - source.shape[0]
+        if missing > 0:
+            if source.shape[0] == 0 or missing > max(3, int(0.01 * clip.frame_count)):
+                raise ValueError(
+                    f"{clip.clip_id} 实际只读出 {source.shape[0]} 帧，比标注记录的少了 {missing} 帧。"
+                    "视频可能被截断，请重新上传这条片子。"
+                )
+            source = np.concatenate([source, np.repeat(source[-1:], missing, axis=0)], axis=0)
+        feature_arrays[clip.clip_id] = source[wanted]
     split, confirmed = resolve_split(clips, window, settings, prepared.signature)
     if not split.ok:
         raise ValueError(split.blocked_reason)
@@ -415,14 +542,8 @@ def start_training(
     names = {"idle": "空闲"}
     for item in payload.get("classes", []):
         names[item["id"]] = item["name"]
-    network = str(settings.get("network") or "lstm")
-    budget = max(1, int(float(settings.get("context_seconds") or 30.0) * base))
-    if network == "mstcn":
-        layers = mstcn_layers_for(budget)
-        context_frames = receptive_field(layers, 2)
-    else:
-        layers = 8
-        context_frames = window_frames(base, float(settings.get("context_seconds") or 30.0))
+    network = "lstm"
+    context_frames = window_frames(base, float(settings.get("context_seconds") or 30.0))
     target_frames = window_frames(base, float(settings.get("target_seconds") or 30.0))
     run = store.create_run(project_id)
     store.write_run_files(run, {"split.json": {
@@ -467,7 +588,6 @@ def start_training(
         batch_size=int(settings.get("batch_size") or 8),
         time_base_fps=base,
         window_seconds=prepared.window_seconds,
-        mstcn_layers=layers,
         same_source_validation=False,
         part_class_names=part_names,
         required_parts=required_parts_out,
@@ -475,7 +595,7 @@ def start_training(
         yolo_sha256=str(settings.get("yolo_sha256") or ""),
         hands_sha256=str(settings.get("hands_sha256") or "") if settings.get("hands_in_training") else "",
         hands_in_training=bool(settings.get("hands_in_training")),
-        conf_threshold=float(settings.get("yolo_conf_threshold") or 0.8),
+        conf_threshold=feature_store.conf_threshold_of(settings),
         station_debounce_frames=int(settings.get("station_debounce_frames") or 3),
         station_min_confidence=float(settings.get("station_min_confidence") or 0.5),
         should_stop=should_stop,
@@ -529,15 +649,19 @@ def clear_confirmed_split(store: ProjectStore, project_id: str) -> None:
     store.save_settings(project_id, current)
 
 
-def forget_clip(store: ProjectStore, project_id: str, clip_id: str) -> dict:
-    """删掉一条片子的视频、标注和特征。已经训完的轮次留在 runs/。"""
+def forget_clip(store: ProjectStore, project_id: str, clip_id: str, *, keep_media: bool = False) -> dict:
+    """删掉一条片子的视频、标注和特征。已经训完的轮次留在 runs/。
+
+    keep_media：同名替换时新文件已经放在原位置，只清旧标注和旧特征，不能把新文件删掉。
+    """
     folder = store.open_dir(project_id)
     annotations = store.load_annotations(project_id)
     clips = list(annotations.get("clips") or [])
     found = next((clip for clip in clips if clip.get("id") == clip_id), None)
     if found is None:
         raise FileNotFoundError(clip_id)
-    _remove_media(folder, found)
+    if not keep_media:
+        _remove_media(folder, found)
     feature_store.drop_clip_cache(folder, clip_id)
     annotations["clips"] = [clip for clip in clips if clip.get("id") != clip_id]
     store.save_annotations(project_id, annotations)
@@ -552,7 +676,8 @@ def adopt_clip(store: ProjectStore, project_id: str, relative: str, probe: dict,
     if existing and not replace:
         raise FileExistsError(str(existing.get("file") or existing.get("id")))
     if existing and replace:
-        forget_clip(store, project_id, str(existing["id"]))
+        # 调用前新素材已经放到 media/ 里同一位置，这里只清旧片子的标注和特征。
+        forget_clip(store, project_id, str(existing["id"]), keep_media=True)
         annotations = store.load_annotations(project_id)
     clip_id, file_field = clip_identity(relative)
     clips = list(annotations.get("clips") or [])
@@ -564,6 +689,7 @@ def adopt_clip(store: ProjectStore, project_id: str, relative: str, probe: dict,
         "width": int(probe["width"]),
         "height": int(probe["height"]),
         "segments": [],
+        "annotation_complete": False,
     })
     annotations["clips"] = clips
     store.save_annotations(project_id, annotations)

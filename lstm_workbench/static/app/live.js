@@ -250,6 +250,7 @@
         source: 'real',
         hasMedia: !noteById[raw.id],
         frame_count: num(raw.frame_count, 0),
+        annotation_complete: raw.annotation_complete === true,
         fps: num(raw.fps, 0),
         /* 分辨率只用于显示。真实接口不给就是 null，视图渲染成 —，不拿一个默认尺寸顶上。 */
         width: num(raw.width),
@@ -329,6 +330,7 @@
       clips: clips,
       settings: settings,
       library: library,
+      preparation: payload.preparation || null,
       probe: {
         sample: false,
         /* 指纹非空 = 上一次"检查并保存"真的加载成功过；这里只是还原，不重新探测。
@@ -366,29 +368,39 @@
     global.OD.data = toData(payload, details);
     source = 'live';
     projectId = id;
+    bootError = '';
     if (global.OD.shell && global.OD.shell.state) {
       global.OD.shell.state.source = 'live';
       global.OD.shell.state.projectId = id;
     }
   }
 
-  function loadProject(id) {
+  /* 每次切工程加一。慢的请求晚回来时，若中间已经切到别的工程，就丢掉它，
+     不能用 A 工程的数据把刚打开的 B 工程覆盖掉。 */
+  var loadSerial = 0;
+
+  function loadProject(id, shouldApply) {
+    var serial = ++loadSerial;
     return api.project(id).then(function (payload) {
       /* payload.runs 是升序的，最近的在最后；只拉最近几轮的详情，够结果页对比用。 */
       var recent = arr(payload.runs).slice(-RUN_DETAIL_LIMIT).reverse();
       return Promise.all(recent.map(function (name) {
         return api.run(id, name).catch(function () { return { name: name, files: [] }; });
       })).then(function (details) {
+        if (serial !== loadSerial || (shouldApply && !shouldApply())) return payload;
+        var switched = projectId !== id;
         apply(id, payload, details);
+        /* 换工程时，上一个工程的进度轮询、标注页选中的片子等都不能带过来。 */
+        if (switched && global.OD.shell && global.OD.shell.resetForProject) global.OD.shell.resetForProject();
         return payload;
       });
     });
   }
 
   /* 写操作之后重新拉一遍：磁盘已经变了，界面必须跟着真的数据走，不能凭返回值拼。 */
-  function reload() {
+  function reload(options) {
     if (!isLive()) return Promise.resolve(null);
-    return loadProject(projectId).then(function (payload) {
+    return loadProject(projectId, options && options.shouldApply).then(function (payload) {
       if (global.OD.shell) { global.OD.shell.render(); }
       return payload;
     });
@@ -409,9 +421,12 @@
     if (!api.available) return Promise.resolve(null);
     return api.models().then(function (info) {
       library = info;
+      /* 模型库页直接读 OD.data.library；导出新模型后不整页重载也要看得到。 */
+      if (global.OD.data) global.OD.data.library = info;
       return info;
     }).catch(function () {
       library = null;
+      if (global.OD.data) global.OD.data.library = null;
       return null;
     });
   }
@@ -424,9 +439,14 @@
     return api.projects().then(function (names) {
       projectNames = names;
       if (!names.length) {
-        bootError = '训练台里一个工程都还没有';
-        mount();
-        return false;
+        /* 后端是通的，只是还没有工程。模型库照常读，首页的「新建工程」走在线流程。
+           以前这里直接按离线处理：新机器上建完第一个工程也一直显示示例数据，打不开新工程。 */
+        bootError = '训练台里一个工程都还没有，先在首页新建一个';
+        return refreshLibrary().then(function () {
+          mount();
+          watchHandsLoad(POLL_LIMIT);
+          return false;
+        });
       }
       return refreshLibrary().then(function () { return loadProject(names[0]); }).then(function () {
         mount();

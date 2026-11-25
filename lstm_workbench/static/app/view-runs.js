@@ -815,8 +815,7 @@
           el('div', null, [
             el('h3', { class: 'subhead', text: '这一轮的结构' }),
             el('dl', { class: 'keyval' }, [
-              el('dt', { text: '网络' }), el('dd', { text: run.network === 'mstcn' ? '因果 MS-TCN' : 'LSTM' }),
-              el('dt', { text: '相邻帧平滑' }), el('dd', { text: run.smoothing ? '有' : '没有' }),
+              el('dt', { text: '网络' }), el('dd', { text: run.network === 'mstcn' ? '因果 MS-TCN（已停用，产线不能用）' : 'LSTM' }),
               el('dt', { text: '特征长度' }), el('dd', { text: run.input_size }),
               el('dt', { text: '窗长' }), el('dd', { text: D.fmtNum(run.window, 0) + ' 帧 = ' + D.fmtNum(run.window_seconds, 2) + ' 秒' }),
               el('dt', { text: '时间基' }), el('dd', { text: D.fmtNum(run.time_base_fps, 2) + ' fps' }),

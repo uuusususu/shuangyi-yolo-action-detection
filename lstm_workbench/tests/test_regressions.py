@@ -58,6 +58,8 @@ def _project(tmp_path: Path, *, native_fps: float, patch: dict | None = None):
     store = ProjectStore(tmp_path)
     store.create("p", settings_module.clean({"epochs": 2, **(patch or {})}))
     payload = _annotations(native_fps)
+    for clip in payload["clips"]:
+        clip["annotation_complete"] = True
     store.save_annotations("p", payload)
     width = payload["clips"][0]["frame_count"]
     state = np.random.RandomState(0)

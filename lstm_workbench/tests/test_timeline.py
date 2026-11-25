@@ -15,7 +15,6 @@ from lstm_workbench.metrics import (
     segments_from_labels,
     timeline_mistakes,
 )
-from lstm_workbench.model import mstcn_layers_for, receptive_field
 from lstm_workbench.timeline import ClipAnnotation, Segment
 from lstm_workbench.trainer import fit_feature_norm
 
@@ -120,15 +119,6 @@ def test_best_epoch_follows_segmentation_not_frame_accuracy():
     assert history[pick_best(history)]["epoch"] == 60
 
 
-def test_mstcn_depth_follows_a_six_fps_clock():
-    budget = int(30 * 6.25)
-    assert budget == 187
-    layers = mstcn_layers_for(budget)
-    assert layers == 5
-    assert receptive_field(layers, 2) == 125
-    assert receptive_field(layers + 1, 2) > budget
-
-
 def test_crops_cover_every_frame_and_repeat():
     first = draw_crops([40, 25], target=10, context=4, seed=7, epoch=1)
     again = draw_crops([40, 25], target=10, context=4, seed=7, epoch=1)
@@ -178,15 +168,12 @@ def test_a_constant_feature_uses_std_one_not_a_tiny_floor():
 def test_future_frames_do_not_change_past_outputs():
     import torch
 
-    from lstm_workbench.model import ActionLSTM, CausalMSTCN
+    from lstm_workbench.model import ActionLSTM
 
     past = torch.zeros(1, 16, 4)
     changed = past.clone()
     changed[:, 10:] = 1
-    for model in (
-        ActionLSTM(4, 2, hidden_size=8, num_layers=1, dropout=0.0),
-        CausalMSTCN(4, 2, channels=8, layers=4, stages=2, dropout=0.0),
-    ):
+    for model in (ActionLSTM(4, 2, hidden_size=8, num_layers=1, dropout=0.0),):
         model.eval()
         with torch.no_grad():
             before = model(past, all_steps=True)
@@ -238,13 +225,14 @@ def test_held_out_clip_is_learned_by_both_networks(tmp_path: Path):
         clips.append({
             "id": clip_id, "frame_count": len(rows), "fps": 10.0,
             "width": 8, "height": 8, "segments": segments,
+            "annotation_complete": True,
         })
         features[clip_id] = rows.copy()
     store.save_annotations("job", {
         "classes": [{"id": "pack", "name": "包装"}, {"id": "seal", "name": "封装"}],
         "clips": clips,
     })
-    for network in ("lstm", "mstcn"):
+    for network in ("lstm",):
         settings = store.load_settings("job")
         settings["network"] = network
         settings["val_clip_ids"] = ["v"]

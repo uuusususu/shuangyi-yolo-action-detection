@@ -106,6 +106,7 @@
         el('h1', { text: '模型与工位' }),
         el('p', { text: 'YOLO 和手部模型只在这里检查，不重训。两个模型都来自工程根的全局模型库，所有工程共用一份；检查出来的指纹会写进每轮训练的契约文件，锁定这一轮用的是哪几个文件。' })
       ]),
+      global.OD.preparation.render(),
       st === 'bad' ? el('div', { class: 'callout bad sp-mb-4' }, [
         icon('alert', 16),
         el('div', null, [el('strong', { text: '还有后端没就绪。 ' }), '训练前每一项都要检查通过；没通过的项不会写指纹，特征缓存也就不会建立。'])

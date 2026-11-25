@@ -13,6 +13,21 @@ Detect = Callable[[np.ndarray], list[dict]]
 Hands = Callable[[np.ndarray], list[list[tuple[float, float, float]]]]
 
 
+def read_image(path):
+    """读图片。cv2.imread 在 Windows 上打不开带中文的路径（返回 None），
+    项目放在 E:\双翼科技项目 这类目录下时连续图整组都读不出来。改为先读字节再解码。"""
+    import cv2
+    import numpy as np
+
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
 def rows_from_frames(
     frames: list[np.ndarray],
     detect: Detect,
@@ -33,7 +48,7 @@ def iter_frames(path: Path):
         if not names:
             raise ValueError(f"{path} 里没有连续图")
         for name in names:
-            image = cv2.imread(str(path / name))
+            image = read_image(str(path / name))
             if image is None:
                 raise ValueError(f"打不开图片 {name}")
             yield image
@@ -60,6 +75,7 @@ def rows_and_stats_from_frames(
     on_frame=None,
     frame_count: int | None = None,
     include_hands: bool = True,
+    should_stop=None,
 ) -> tuple[np.ndarray, dict]:
     """抽特征，并统计没检出手、没检出零件的帧数。零件判空直接看特征行，不另写一套阈值。"""
     rows = []
@@ -72,6 +88,11 @@ def rows_and_stats_from_frames(
         except TypeError:
             total = 0
     for frame in frames:
+        # 逐帧检查停止：以前只在片子之间检查，长视频点了停止要等整条抽完。
+        if should_stop is not None and should_stop():
+            from .feature_store import Stopped
+
+            raise Stopped("已停止抽特征")
         height, width = frame.shape[:2]
         detections = detect(frame)
         hand_points = hands(frame) if include_hands else []
@@ -116,13 +137,13 @@ def probe_media(path: Path) -> dict:
         )
         if not names:
             raise ValueError(f"{path.name} 里没有连续图")
-        image = cv2.imread(str(path / names[0]))
+        image = read_image(str(path / names[0]))
         if image is None:
             raise ValueError(f"打不开图片 {names[0]}")
         height, width = image.shape[:2]
         return {"frame_count": len(names), "fps": 0.0, "width": int(width), "height": int(height), "kind": "images"}
     if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
-        image = cv2.imread(str(path))
+        image = read_image(str(path))
         if image is None:
             raise ValueError(f"打不开图片 {path.name}")
         height, width = image.shape[:2]
@@ -150,7 +171,7 @@ def read_frames(path: Path) -> list[np.ndarray]:
             raise ValueError(f"{path} 里没有连续图")
         frames = []
         for name in names:
-            image = cv2.imread(str(path / name))
+            image = read_image(str(path / name))
             if image is None:
                 raise ValueError(f"打不开图片 {name}")
             frames.append(image)

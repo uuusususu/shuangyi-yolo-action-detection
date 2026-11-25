@@ -160,8 +160,9 @@ def test_network_and_whole_clip_holdout_are_saved():
         "network": "lstm",
     })
     old["split_for"] = "kept"
+    # MS-TCN 已移除：旧页面交来 mstcn 也按 LSTM 存。
     got = settings.clean({"network": "mstcn", "split_mode": "clip", "val_clip_ids": ["c2"]}, old)
-    assert got["network"] == "mstcn"
+    assert got["network"] == "lstm"
     assert got["split_mode"] == "clip"
     assert got["val_clip_ids"] == ["c2"]
     assert got["split_train"] == []

@@ -15,6 +15,8 @@
   var afterLog = null;   /* 跑完之后继续显示这一轮的日志 */
   var liveRun = null;    /* 正在跑的这一轮：契约是真的，曲线随着 progress.json 长 */
   var liveRecipe = null; /* 训练台回报的这一轮五项参数和设备；没回报之前用已保存的设置 */
+  var selectedClips = {}, participationSaving = false;
+  var closeRoleMenu = null;
 
   /* 一轮都没跑过时用它顶着：结构参数全部来自真实 settings 与 constants，没有一个是编的。 */
   function draftRun() {
@@ -92,6 +94,7 @@
   /* ---------- 视图 ---------- */
 
   function render() {
+    dismissRoleMenu();
     global.OD.charts.reset();
     refs = {};
     var run = baseRun();
@@ -102,7 +105,12 @@
         el('h1', { text: '训练' }),
         el('p', { text: windowLine() + '训练看整条片子里的连续画面。验证必须留一整条没参与训练的片子，页上的分数就是这条片子切出来的结果。' })
       ]),
+      el('section', { class: 'card train-progress', 'aria-label': '训练进度' }, [
+        el('header', null, el('h2', { text: '训练进度' })),
+        el('div', { id: 'train-jobbar', class: 'train-job-panel' })
+      ]),
       run.draft && !training ? draftCallout() : null,
+      global.OD.preparation.render(),
       participantCard(),
       splitCard(),
       controlCard(run),
@@ -110,7 +118,7 @@
       chartsCard(run),
       logCard(run)
     ]));
-    requestAnimationFrame(paint);
+    requestAnimationFrame(function () { paint(); paintSelection(); });
     return host;
   }
 
@@ -161,79 +169,261 @@
     var held = {};
     (settings.train_excluded || []).forEach(function (id) { excluded[id] = true; });
     (settings.val_clip_ids || []).forEach(function (id) { held[id] = true; });
-    var network = settings.network === 'mstcn' ? 'mstcn' : 'lstm';
+    selectedClips = Object.create(null);
+    clips.forEach(function (clip) { if (!excluded[clip.id]) selectedClips[clip.id] = true; });
     var tails = ((global.OD.data.split || {}).tails) || [];
     return el('section', { class: 'card' }, [
       el('header', null, el('h2', { text: '这次训练用哪套' })),
-      el('label', { class: 'field sp-mt-3' }, [
-        el('span', { class: 'tc sp-meta', text: '网络' }),
-        el('select', {
-          class: 'form-control', id: 'f-network', disabled: !!S.state.job, onchange: saveParticipation
-        }, [
-          el('option', { value: 'lstm', selected: network === 'lstm', text: 'LSTM' }),
-          el('option', { value: 'mstcn', selected: network === 'mstcn', text: '因果 MS-TCN' })
-        ])
-      ]),
-      el('p', { class: 'hint sp-mt-3', text: networkHint(network) }),
+      el('p', { class: 'hint sp-mt-3', text: networkHint() }),
       tails.length ? el('div', { class: 'callout warn sp-mt-3' }, [
         icon('alert', 15),
         el('div', { text: tails.map(function (tail) {
           return tail.clip_id + ' 最后 ' + tail.seconds + ' 秒没涂，会当空闲学；没标完请用「不训练」剪掉。';
         }).join(' ') })
       ]) : null,
-      clips.length ? el('div', { class: 'sp-mt-3' }, clips.map(function (clip) {
-        var role = excluded[clip.id] ? 'out' : (held[clip.id] ? 'val' : 'train');
-        return el('div', { class: 'row tight sp-mt-2' }, [
-          el('span', { class: 'mono', text: clip.file || clip.id }),
-          el('span', { class: 'sp-meta', text: (clip.segments ? clip.segments.length : 0) + ' 段' }),
-          el('span', { class: 'spread' }),
-          el('select', {
-            class: 'form-control',
-            'data-clip-role': clip.id,
-            disabled: !!S.state.job,
-            onchange: saveParticipation
+      clips.length ? roleSummary(clips, excluded, held) : null,
+      clips.length ? el('div', { class: 'role-toolbar sp-mt-3' }, [
+        el('span', { id: 'role-selection-count', text: selectionLabel() }),
+        el('button', { class: 'btn btn-secondary btn-sm', type: 'button', id: 'role-move',
+          disabled: participationLocked() || !Object.keys(selectedClips).length,
+          'aria-haspopup': 'menu', onclick: function (evt) {
+            var rect = evt.currentTarget.getBoundingClientRect();
+            showRoleMenu(rect.left, rect.bottom + 4);
+          }
+        }, '批量设置勾选视频…'),
+        el('span', { class: 'help', text: '勾选即参与，取消勾选即排除；右键单条视频切换训练集或验证集。' })
+      ]) : null,
+      clips.length ? el('div', { class: 'tbl-wrap role-list sp-mt-3' }, el('table', { class: 'tbl' }, [
+        el('thead', null, el('tr', null, [
+          el('th', { class: 'role-check' }, el('input', { type: 'checkbox', class: 'form-check-input',
+            'aria-label': '全选视频', id: 'role-select-all', disabled: participationLocked(),
+            checked: clips.length > 0 && Object.keys(selectedClips).length === clips.length,
+            onchange: function (evt) {
+              selectedClips = Object.create(null);
+              if (evt.target.checked) clips.forEach(function (clip) { selectedClips[clip.id] = true; });
+              saveParticipation();
+            }
+          })),
+          el('th', { text: '视频' }), el('th', { class: 'n', text: '标注段' }), el('th', { class: 'n opt', text: '帧数' }), el('th', { text: '用途' }), el('th', { text: '特征' })
+        ])),
+        el('tbody', null, clips.map(function (clip) {
+          var role = excluded[clip.id] ? 'out' : (held[clip.id] ? 'val' : 'train');
+          return el('tr', { 'data-role': role, 'data-role-row': clip.id,
+            class: selectedClips[clip.id] ? 'is-selected' : '', tabindex: 0,
+            oncontextmenu: function (evt) {
+              evt.preventDefault();
+              if (participationLocked()) return;
+              var rect = evt.currentTarget.getBoundingClientRect();
+              showRoleMenu(evt.clientX || rect.left, evt.clientY || rect.bottom, clip.id);
+            },
+            onkeydown: function (evt) {
+              if (evt.key !== 'ContextMenu' && !(evt.shiftKey && evt.key === 'F10')) return;
+              evt.preventDefault();
+              if (participationLocked()) return;
+              var rect = evt.currentTarget.getBoundingClientRect();
+              showRoleMenu(rect.left, rect.bottom, clip.id);
+            }
           }, [
-            el('option', { value: 'train', selected: role === 'train', text: '参加训练' }),
-            el('option', { value: 'val', selected: role === 'val', text: '只做验证' }),
-            el('option', { value: 'out', selected: role === 'out', text: '不参加' })
-          ])
-        ]);
-      })) : el('p', { class: 'help', text: '还没有片子。' })
+            el('td', { class: 'role-check' }, el('input', { type: 'checkbox', class: 'form-check-input',
+              'data-clip-select': clip.id, 'aria-label': '选择视频 ' + (clip.file || clip.id),
+              checked: !!selectedClips[clip.id], disabled: participationLocked(),
+              onchange: function (evt) {
+                if (evt.target.checked) selectedClips[clip.id] = true;
+                else delete selectedClips[clip.id];
+                saveParticipation();
+              }
+            })),
+            el('td', null, el('span', { class: 'mono', text: clip.file || clip.id })),
+            el('td', { class: 'n', text: clip.segments ? clip.segments.length : 0 }),
+            el('td', { class: 'n opt', text: D.fmtInt(clip.frame_count) }),
+            el('td', { class: 'role-cell' }, el('span', {
+              class: 'badge ' + (role === 'val' ? 'busy' : (role === 'out' ? 'plain' : 'ok')),
+              text: role === 'val' ? '验证集' : (role === 'out' ? '未勾选' : '训练集')
+            })),
+            el('td', null, global.OD.preparation.cell(clip.id))
+          ]);
+        }))
+      ])) : el('p', { class: 'help', text: '还没有片子。' })
     ]);
   }
 
-  function networkHint(network) {
-    var net = network === 'mstcn'
-      ? '因果 MS-TCN 只看已经发生的帧，往回看大约三十秒，并带相邻帧平滑。'
-      : 'LSTM 只看已经发生的帧，没有相邻帧平滑。';
-    return net + '每次截一整段连续画面来学，每一帧都带上文。至少把一条完整片子设成「只做验证」。';
+  /* 一眼看出训练和验证各几条；未勾选的视频自动排除。 */
+  function roleSummary(clips, excluded, held) {
+    var n = { train: 0, val: 0 };
+    clips.forEach(function (clip) { if (!excluded[clip.id]) n[held[clip.id] ? 'val' : 'train'] += 1; });
+    return el('div', { class: 'stat-row sp-mt-3' }, [
+      el('div', { class: 'stat' }, [el('div', { class: 'stat-v', text: n.train }), el('div', { class: 'stat-k', text: '参加训练' })]),
+      el('div', { class: 'stat' + (n.val ? '' : ' is-bad') }, [el('div', { class: 'stat-v', text: n.val }), el('div', { class: 'stat-k', text: n.val ? '只做验证' : '只做验证 · 至少要 1 条' })])
+    ]);
   }
 
-  function saveParticipation(evt) {
+  function networkHint() {
+    return 'LSTM 只看已经发生的帧。每次截一整段连续画面来学，每一帧都带上文。至少把一条完整片子设成「只做验证」。';
+  }
+
+  function participationLocked() { return participationSaving || !!S.state.job; }
+
+  function selectionLabel() {
+    return participationSaving ? '正在保存用途…' : '已勾选 ' + Object.keys(selectedClips).length + ' 条视频';
+  }
+
+  function paintSelection() {
+    var boxes = document.querySelectorAll('[data-clip-select]');
+    boxes.forEach(function (box) {
+      box.checked = !!selectedClips[box.getAttribute('data-clip-select')];
+      box.disabled = participationLocked();
+      box.closest('tr').classList.toggle('is-selected', box.checked);
+    });
+    var count = Object.keys(selectedClips).length;
+    var all = document.getElementById('role-select-all');
+    if (all) {
+      all.checked = boxes.length > 0 && count === boxes.length;
+      all.indeterminate = count > 0 && count < boxes.length;
+      all.disabled = participationLocked();
+    }
+    var label = document.getElementById('role-selection-count');
+    if (label) label.textContent = selectionLabel();
+    var move = document.getElementById('role-move');
+    if (move) move.disabled = participationLocked() || !count;
+  }
+
+  function dismissRoleMenu() {
+    if (closeRoleMenu) closeRoleMenu();
+  }
+
+  function showRoleMenu(x, y, clipId) {
+    dismissRoleMenu();
+    if (participationLocked() || (!clipId && !Object.keys(selectedClips).length)) return;
+    var trigger = document.activeElement;
+    var menu = el('div', { class: 'role-menu', role: 'menu', 'aria-label': '移动所选视频' }, [
+      ['train', '移到训练集'], ['val', '移到验证集']
+    ].map(function (choice) {
+      return el('button', { type: 'button', role: 'menuitem', onclick: function () {
+        dismissRoleMenu();
+        saveParticipation(choice[0], clipId ? [clipId] : Object.keys(selectedClips));
+      } }, choice[1]);
+    }));
+    menu.style.left = Math.max(8, x) + 'px';
+    menu.style.top = Math.max(8, y) + 'px';
+    document.body.appendChild(menu);
+    var rect = menu.getBoundingClientRect();
+    menu.style.left = Math.max(8, Math.min(x, global.innerWidth - rect.width - 8)) + 'px';
+    menu.style.top = Math.max(8, Math.min(y, global.innerHeight - rect.height - 8)) + 'px';
+    var scrollPositions = ['#view-host .scroll', '.role-list'].map(function (selector) {
+      var node = document.querySelector(selector);
+      return node ? { node: node, top: node.scrollTop, left: node.scrollLeft } : null;
+    });
+    function scrolled() {
+      if (scrollPositions.some(function (position) {
+        return position && (position.node.scrollTop !== position.top || position.node.scrollLeft !== position.left);
+      })) dismissRoleMenu();
+    }
+    function outside(evt) { if (!menu.contains(evt.target)) dismissRoleMenu(); }
+    function keydown(evt) {
+      var buttons = Array.prototype.slice.call(menu.querySelectorAll('button'));
+      if (evt.key === 'Escape' || evt.key === 'Tab') {
+        dismissRoleMenu();
+        if (trigger && trigger.isConnected) trigger.focus({ preventScroll: true });
+        return;
+      }
+      if (evt.key !== 'ArrowDown' && evt.key !== 'ArrowUp') return;
+      evt.preventDefault();
+      var index = buttons.indexOf(document.activeElement);
+      buttons[(index + (evt.key === 'ArrowDown' ? 1 : buttons.length - 1)) % buttons.length].focus({ preventScroll: true });
+    }
+    closeRoleMenu = function () {
+      menu.remove(); closeRoleMenu = null;
+      document.removeEventListener('pointerdown', outside, true);
+      document.removeEventListener('keydown', keydown, true);
+      document.removeEventListener('scroll', scrolled, true);
+    };
+    document.addEventListener('pointerdown', outside, true);
+    document.addEventListener('keydown', keydown, true);
+    document.addEventListener('scroll', scrolled, true);
+    menu.querySelector('button').focus({ preventScroll: true });
+  }
+
+  /* 保存用途只重读一次；保留整页和列表两层位置，以及尚未提交的训练参数。 */
+  function reloadParticipation(projectId) {
+    if (S.state.projectId !== projectId) return Promise.resolve();
+    var positions = ['#view-host .scroll', '.role-list'].map(function (selector) {
+      var node = document.querySelector(selector);
+      return { selector: selector, top: node ? node.scrollTop : 0, left: node ? node.scrollLeft : 0 };
+    });
+    var fields = Array.prototype.map.call(document.querySelectorAll('#view-host input[id^="f-train-"]'), function (input) {
+      return { id: input.id, value: input.value };
+    });
+    return global.OD.live.reload().then(function () {
+      if (S.state.projectId !== projectId || S.state.view !== 'train') return;
+      fields.forEach(function (field) {
+        var input = document.getElementById(field.id);
+        if (input) input.value = field.value;
+      });
+      positions.forEach(function (position) {
+        var node = document.querySelector(position.selector);
+        if (node) { node.scrollTop = position.top; node.scrollLeft = position.left; }
+      });
+    });
+  }
+
+  function saveParticipation(role, targets) {
+    if (participationLocked()) return;
     var api = global.OD.api;
     if (!api.available || !S.state.projectId) {
+      restoreParticipation();
+      paintSelection();
       S.toast('离线示例不写划分。', 'warn');
       return;
     }
-    var netEl = document.getElementById('f-network');
-    var mode = 'clip';
-    var network = netEl && netEl.value === 'mstcn' ? 'mstcn' : 'lstm';
-    var pickedVal = evt && evt.target && evt.target.getAttribute && evt.target.value === 'val';
-    if (pickedVal) mode = 'clip';
+    var projectId = S.state.projectId;
+    var settings = global.OD.data.settings || {};
     var excluded = [];
     var val = [];
-    document.querySelectorAll('[data-clip-role]').forEach(function (sel) {
-      var id = sel.getAttribute('data-clip-role');
-      if (sel.value === 'out') excluded.push(id);
-      else if (sel.value === 'val' && mode === 'clip') val.push(id);
+    var accepted = false;
+    targets = targets || [];
+    targets.forEach(function (id) { selectedClips[id] = true; });
+    global.OD.data.clips.forEach(function (clip) {
+      var next = !selectedClips[clip.id] ? 'out' :
+        (targets.indexOf(clip.id) >= 0 ? role :
+          ((settings.val_clip_ids || []).indexOf(clip.id) >= 0 ? 'val' : 'train'));
+      if (next === 'out') excluded.push(clip.id);
+      else if (next === 'val') val.push(clip.id);
     });
-    api.split(S.state.projectId, {
+    participationSaving = true;
+    paintSelection();
+    api.split(projectId, {
       action: 'participate',
-      split_mode: mode,
-      network: network,
+      split_mode: 'clip',
+      network: 'lstm',
       train_excluded: excluded,
       val_clip_ids: val
-    }).then(afterSplit).catch(splitFailed);
+    }).then(function (result) {
+      if (S.state.projectId !== projectId) return;
+      accepted = true;
+      settings.train_excluded = excluded;
+      settings.val_clip_ids = val;
+      S.toast('视频用途已保存。', 'ok');
+      if (result.preparation_error) S.toast('用途已保存，特征准备未排队：' + result.preparation_error, 'warn');
+      if (result.split && !result.split.ok) S.toast(result.split.reason || '还分不开', 'warn');
+      return reloadParticipation(projectId);
+    }).catch(function (err) {
+      if (S.state.projectId === projectId) {
+        restoreParticipation();
+        if (accepted) S.toast('视频用途已保存，但刷新失败：' + err.message, 'bad');
+        else splitFailed(err);
+      }
+    }).finally(function () {
+      participationSaving = false;
+      if (S.state.projectId === projectId && S.state.view === 'train') paintSelection();
+    });
+  }
+
+  function restoreParticipation() {
+    var excluded = ((global.OD.data.settings || {}).train_excluded) || [];
+    selectedClips = Object.create(null);
+    global.OD.data.clips.forEach(function (clip) {
+      if (excluded.indexOf(clip.id) < 0) selectedClips[clip.id] = true;
+    });
   }
 
   /* ---------- 验证集划分 ---------- */
@@ -519,9 +709,10 @@
       class: 'form-control', type: 'text', id: 'f-train-display-name', maxlength: '40',
       placeholder: '例如 包装-现场1', disabled: training, 'aria-label': '模型名字'
     });
+    refs.trainBtnText = el('span', { text: training ? '正在训练' : trainButtonLabel() });
     refs.trainBtn = el('button', {
       class: 'btn btn-primary train-launch', type: 'button', disabled: training, onclick: startTrain
-    }, [icon('zap', 14), training ? '正在训练' : '开始训练']);
+    }, [icon('zap', 14), refs.trainBtnText]);
     refs.deviceBadge = el('span', { class: 'badge plain', style: 'display:none' });
     var shown = training && liveRecipe ? liveRecipe : recipeFromSettings();
     refs.recipeLabel = el('div', { class: 'help sp-mt-3', text: training && liveRecipe ? '这一轮正在用' : '下一次开训，直接填' });
@@ -868,6 +1059,7 @@
   }
 
   function startTrain() {
+    if (participationSaving) { S.toast('正在保存视频用途，请稍候。', 'warn'); return; }
     if (S.state.job) { S.toast('已经有一个任务在跑了，先停掉它。', 'warn'); return; }
     var named = readDisplayName();
     if (named.bad) { S.toast('先给这一次训练起个名字，不能带路径，最多 40 个字', 'bad'); return; }
@@ -961,11 +1153,11 @@
           return api.progress(projectId).then(function (p) {
             p = p || {};
             var features = p.features || {};
-            if (p.status === 'extracting') {
+            if (p.status === 'extracting' || p.status === 'loading-features' || p.status === 'waiting-features') {
               return {
                 done: features.done || 0,
-                total: features.total || 0,
-                status: 'extracting',
+                total: p.status === 'waiting-features' ? 1 : (features.total || 0),
+                status: p.status,
                 history: [],
                 recipe: null
               };
@@ -990,18 +1182,18 @@
       },
       onTick: function (done, total, snapshot) {
         if (!snapshot) return;
-        if (snapshot.status === 'extracting') {
-          if (phase !== 'extracting') {
-            phase = 'extracting';
-            pushLog({ level: 'info', text: '正在抽取特征。这一步按帧走，抽完才进入训练。' });
+        if (snapshot.status === 'extracting' || snapshot.status === 'loading-features' || snapshot.status === 'waiting-features') {
+          if (phase !== snapshot.status) {
+            phase = snapshot.status;
+            pushLog({ level: 'info', text: snapshot.status === 'loading-features' ? '正在加载已准备的缓存，无需重新检测。' : snapshot.status === 'waiting-features' ? '等待当前后台准备结束，完成后自动接续训练。' : '正在补齐缺失特征，完成后进入训练。' });
           }
           if (S.state.job) {
-            S.state.job.label = '抽取特征';
-            S.state.job.unit = '帧';
+            S.state.job.label = snapshot.status === 'loading-features' ? '加载特征缓存' : snapshot.status === 'waiting-features' ? '等待后台准备完成' : '抽取特征';
+            S.state.job.unit = snapshot.status === 'waiting-features' ? '项' : '帧';
           }
           return;
         }
-        if (phase === 'extracting') {
+        if (phase && phase !== 'training') {
           phase = 'training';
           pushLog({ level: 'info', text: '特征已就绪，开始训练' });
         }
@@ -1076,7 +1268,7 @@
 
   function watch(initial) {
     if (!initial || S.state.job) return;
-    if (initial.status !== 'extracting' && initial.status !== 'training') return;
+    if (['extracting', 'training', 'loading-features', 'waiting-features'].indexOf(initial.status) < 0) return;
     var api = global.OD.api;
     var projectId = S.state.projectId;
     if (!api.available || !projectId) return;
@@ -1101,14 +1293,14 @@
         lastStamp = stamp;
         lastMove = Date.now();
       }
-      var busy = progress.status === 'extracting' || progress.status === 'training';
+      var busy = ['extracting', 'training', 'loading-features'].indexOf(progress.status) >= 0;
       var stale = busy && (Date.now() - lastMove > 45000);
       var features = progress.features || {};
-      if (progress.status === 'extracting') {
+      if (progress.status === 'extracting' || progress.status === 'loading-features' || progress.status === 'waiting-features') {
         return {
           done: features.done || 0,
-          total: features.total || 0,
-          status: 'extracting',
+          total: progress.status === 'waiting-features' ? 1 : (features.total || 0),
+          status: progress.status,
           history: [],
           recipe: null,
           stale: stale
@@ -1144,7 +1336,7 @@
     S.startJob({
       watch: true,
       kind: 'train',
-      label: extracting ? '抽取特征' : '训练',
+      label: extracting ? '抽取特征' : initial.status === 'loading-features' ? '加载特征缓存' : initial.status === 'waiting-features' ? '等待后台准备完成' : '训练',
       total: extracting ? ((initial.features && initial.features.total) || 1) : (liveRun.epochs || 1),
       unit: extracting ? '帧' : '轮',
       period: 1000,
@@ -1159,14 +1351,14 @@
           finishWatch(snapshot);
           return;
         }
-        if (snapshot.status === 'extracting') {
-          if (phase !== 'extracting') {
-            phase = 'extracting';
-            pushLog({ level: 'info', text: '正在抽取特征。抽完才进入训练。' });
+        if (snapshot.status === 'extracting' || snapshot.status === 'loading-features' || snapshot.status === 'waiting-features') {
+          if (phase !== snapshot.status) {
+            phase = snapshot.status;
+            pushLog({ level: 'info', text: snapshot.status === 'loading-features' ? '正在加载已准备的缓存。' : snapshot.status === 'waiting-features' ? '等待后台准备完成。' : '正在补齐特征。' });
           }
           if (S.state.job) {
-            S.state.job.label = '抽取特征';
-            S.state.job.unit = '帧';
+            S.state.job.label = snapshot.status === 'loading-features' ? '加载特征缓存' : snapshot.status === 'waiting-features' ? '等待后台准备完成' : '抽取特征';
+            S.state.job.unit = snapshot.status === 'waiting-features' ? '项' : '帧';
           }
           return;
         }
@@ -1208,7 +1400,17 @@
   }
 
   global.OD.views = global.OD.views || {};
-  global.OD.views.train = { render: render, inspector: inspector, watch: watch };
+  function trainButtonLabel() {
+    var p = global.OD.data.preparation;
+    var missing = p ? p.total - p.ready : 0;
+    return missing > 0 ? '准备剩余 ' + missing + ' 条并训练' : '开始训练';
+  }
+
+  function preparationUpdated() {
+    if (!training && refs.trainBtnText) refs.trainBtnText.textContent = trainButtonLabel();
+  }
+
+  global.OD.views.train = { render: render, inspector: inspector, watch: watch, preparationUpdated: preparationUpdated };
 
   function inspector() {
     var run = baseRun();
@@ -1230,9 +1432,9 @@
           '相邻窗口只差 8 帧，几乎一模一样。所以划分只能按整段切 —— 同一个段的窗口要么全进训练、要么全进验证，绝不能跨边，否则验证集里全是训练集的双胞胎，指标会虚高到 0.99 而工位上完全不能用。')
       ]),
       el('div', { class: 'inspect-block' }, [
-        el('h3', { text: '两套网络' }),
+        el('h3', { text: '网络' }),
         el('p', null,
-          'LSTM 是现在这套，每一帧一个类别，没有相邻帧平滑。因果 MS-TCN 只看已经发生的帧，后一阶段修边界，训练时加上相邻帧平滑，用来压类别来回跳、一段被切碎。选哪套就训哪套，各自存成一个模型。')
+          'LSTM，每一帧一个类别，只看已经发生的帧，和产线逐帧推理的方式一致。')
       ]),
       el('div', { class: 'inspect-block' }, [
         el('h3', { text: '同源验证意味着什么' }),

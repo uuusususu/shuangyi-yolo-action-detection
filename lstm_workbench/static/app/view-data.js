@@ -4,7 +4,8 @@
 
   var D = global.OD.dom, el = D.el, icon = D.icon;
   var S = global.OD.shell;
-  var view = 'cards';
+  var view = 'table';
+  var classesSaveInFlight = null;
 
   function render() {
     var data = global.OD.data;
@@ -15,6 +16,7 @@
         el('p', { text: '放入视频或一组按序号命名的连续图。点开一条片子，把画面停在动作开始那一帧，再点类别。段要装得下 ' + S.windowSeconds() + ' 秒的窗口才产得出训练样本。' })
       ]),
       uploadCard(),
+      global.OD.preparation.render(),
       el('section', { class: 'card' }, [
         el('header', null, [
           el('h2', { text: '片子' }),
@@ -48,7 +50,7 @@
       id: 'clip-file', onchange: function () { if (input.files.length) accept(input.files); }
     });
     var zone = el('label', {
-      class: 'empty drop', for: 'clip-file',
+      class: 'empty drop compact drop-row', for: 'clip-file',
       ondragover: function (e) { e.preventDefault(); zone.classList.add('is-over'); },
       ondragleave: function () { zone.classList.remove('is-over'); },
       ondrop: function (e) {
@@ -56,9 +58,11 @@
         if (e.dataTransfer && e.dataTransfer.files.length) accept(e.dataTransfer.files);
       }
     }, [
-      icon('upload', 28),
-      el('strong', { text: '把片子和连续图拖到这里' }),
-      el('p', { text: 'mp4 / mov 每条各自成一条片子，一次选多条也分开列。图片请按 0001.jpg、0002.jpg 这样连续命名，整组一起选。' }),
+      icon('upload', 22),
+      el('div', null, [
+        el('strong', { text: '拖入视频或连续图，或点这里选择文件' }),
+        el('p', { text: 'mp4 / mov 每条各自成一条片子。图片按 0001.jpg、0002.jpg 连续命名，整组一起选。' })
+      ]),
       input
     ]);
 
@@ -164,7 +168,8 @@
   }
 
   function clipState(clip) {
-    if (clip.segments.length === 0) return { cls: 'plain', text: '待标注' };
+    if (clip.annotation_complete !== true) return { cls: 'warn', text: '待确认标注完成' };
+    if (clip.segments.length === 0) return { cls: 'plain', text: '已确认空闲' };
     var issues = S.clipIssues(clip);
     if (issues.windows === 0) return { cls: 'bad', text: '标注过短' };
     if (issues.short.length || issues.narrow.length || issues.tail >= S.windowFrames(clip)) return { cls: 'warn', text: '有警告' };
@@ -219,6 +224,7 @@
             el('span', { class: 'badge ' + st.cls }, st.text)
           ])
         ]),
+        global.OD.preparation.cell(clip.id),
         el('dl', { class: 'keyval' }, clipMeta(clip).map(function (row) {
           return [el('dt', { text: row[0] }), el('dd', { text: row[1] })];
         }).reduce(function (a, b) { return a.concat(b); }, [])),
@@ -245,7 +251,7 @@
         el('th', { text: '片子' }), el('th', { class: 'n', text: '帧数' }), el('th', { class: 'n opt', text: '帧率' }),
         el('th', { class: 'opt', text: '分辨率' }), el('th', { class: 'n opt', text: '大小' }),
         el('th', { class: 'n', text: '标注段' }), el('th', { class: 'n', text: '可训练窗口' }),
-        el('th', { text: '状态' }), el('th', { text: '' })
+        el('th', { text: '状态' }), el('th', { text: '特征' }), el('th', { text: '' })
       ])),
       el('tbody', null, data.clips.map(function (clip) {
         var st = clipState(clip), issues = S.clipIssues(clip);
@@ -258,6 +264,7 @@
           el('td', { class: 'n', text: clip.segments.length }),
           el('td', { class: 'n', text: issues.windows }),
           el('td', null, el('span', { class: 'badge ' + st.cls }, st.text)),
+          el('td', null, global.OD.preparation.cell(clip.id)),
           el('td', null, el('div', { class: 'row' }, [
             el('button', {
               class: 'btn btn-ghost btn-sm', type: 'button', disabled: !clip.hasMedia,
@@ -354,10 +361,20 @@
   }
 
   function saveClasses(classes) {
+    if (classesSaveInFlight) {
+      S.toast('类别正在保存，请完成后再修改。', 'warn');
+      return classesSaveInFlight;
+    }
     var api = global.OD.api;
     if (!api.available || !S.state.projectId) {
       S.toast('离线原型没有后端，类别不会写盘。', 'warn');
       return;
+    }
+    var projectId = S.state.projectId, data = global.OD.data;
+    var baseline = JSON.stringify({classes:data.classes, clips:data.clips});
+    function canApply() {
+      return S.state.projectId === projectId && global.OD.data === data &&
+        JSON.stringify({classes:data.classes, clips:data.clips}) === baseline;
     }
     var ids = {};
     classes.forEach(function (c) { ids[c.id] = true; });
@@ -371,6 +388,7 @@
           fps: clip.fps,
           width: clip.width,
           height: clip.height,
+          annotation_complete: clip.annotation_complete === true,
           segments: (clip.segments || []).filter(function (s) { return ids[s.class_id]; }).map(function (s) {
             return { id: s.id, class_id: s.class_id, start: s.start, end: s.end };
           }),
@@ -380,13 +398,35 @@
         };
       })
     };
-    api.saveAnnotations(S.state.projectId, payload).then(function () {
-      return global.OD.live.reload();
+    classesSaveInFlight = api.saveAnnotations(projectId, payload).then(function () {
+      if (S.state.projectId !== projectId || global.OD.data !== data) return;
+      /* 盘上已经是新类别表了。保存期间又改过标注时下面的重载会跳过，
+         本地若还留着旧类别表，下一次整份保存就会把它写回去；所以先在本地接上新表，
+         并去掉已删类别的段，再按"期间没改过"决定要不要整份重载。 */
+      var changedMeanwhile = !canApply();
+      data.classes = payload.classes.map(function (c) { return { id: c.id, name: c.name }; });
+      data.clips.forEach(function (clip) {
+        clip.segments = (clip.segments || []).filter(function (s) { return ids[s.class_id]; });
+      });
+      if (changedMeanwhile) { S.render(); return; }
+      baseline = JSON.stringify({classes:data.classes, clips:data.clips});
+      return global.OD.live.reload({shouldApply:canApply});
     }).then(function () {
+      if (S.state.projectId !== projectId) return;
       S.toast('类别已保存', 'ok');
     }).catch(function (err) {
+      if (S.state.projectId !== projectId) return;
       S.toast('类别没保存：' + err.message, 'bad');
+    }).finally(function () {
+      classesSaveInFlight = null;
     });
+    return classesSaveInFlight;
+  }
+
+  function beforeLeave() {
+    if (!classesSaveInFlight) return true;
+    S.toast('类别正在保存，请完成后再离开。', 'warn');
+    return false;
   }
 
   function classEditor() {
@@ -451,6 +491,9 @@
   }
 
   global.OD.classEditor = classEditor;
+  global.addEventListener('beforeunload', function (event) {
+    if (classesSaveInFlight) { event.preventDefault(); event.returnValue = ''; }
+  });
   global.OD.views = global.OD.views || {};
-  global.OD.views.data = { render: render, inspector: inspector };
+  global.OD.views.data = { render: render, beforeLeave:beforeLeave, inspector: inspector };
 })(window);

@@ -2,3 +2,20 @@ projects/
 models/
 __pycache__/
 *.pyc
+# 便携用的 Python 安装包和本机虚拟环境，不进仓库
+python-*.exe
+.venv/
+yolo_env/
+runtime/
+runtime.building/
+# 后台准备的前端源码需要随项目交付。
+!static/app/transfer.js
+!static/app/preparation.js
+!static/app/obb-editor.js
+!static/app/view-parts.js
+!static/app/view-pvalidate.js
+!static/app/view-yolo.js
+!static/styles/parts.css
+!tests/test_obb_editor.js
+!tests/test_parts_flow.js
+!tests/test_annotation_save.js

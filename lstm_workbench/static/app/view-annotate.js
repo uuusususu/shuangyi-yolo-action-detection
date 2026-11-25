@@ -24,6 +24,9 @@
   /* 上一次写盘（或刚载入）时的标注快照。data 被换掉就重新起算，所以按对象身份认。 */
   var savedFor = null;
   var savedJson = '';
+  var seenContent = {};
+  var completionConfirmations = {};
+  var saveInFlight = null;
 
   var pickedRun = '';
 
@@ -194,8 +197,7 @@
 
   function canSave() { return !!(global.OD.api.available && S.state.projectId); }
 
-  /* annotations.json 的确切形状：顶层只有 classes 与 clips，
-     clip 七个键、segment 四个键。多写一个键就会被原样存进文件，所以一个都不多写。 */
+  /* 只传标注字段，整条审核状态随每条片子往返。完成确认动作只在保存请求中附加。 */
   function payloadOf() {
     var data = global.OD.data;
     return {
@@ -204,6 +206,7 @@
         return {
           id: c.id, file: c.file, frame_count: c.frame_count,
           fps: c.fps, width: c.width, height: c.height,
+          annotation_complete: c.annotation_complete === true,
           segments: c.segments.map(function (s) {
             return { id: s.id, class_id: s.class_id, start: s.start, end: s.end };
           }),
@@ -217,6 +220,23 @@
 
   function isDirty() { return JSON.stringify(payloadOf()) !== savedJson; }
 
+  function contentKey(c) {
+    return JSON.stringify({
+      file: c.file, frame_count: c.frame_count, fps: c.fps, width: c.width, height: c.height,
+      segments: c.segments.map(function (s) { return [s.class_id, s.start, s.end]; }).sort(),
+      excluded: (c.excluded || []).map(function (s) { return [s.start, s.end]; }).sort()
+    });
+  }
+
+  function updateCompletion(c) {
+    var key = contentKey(c);
+    if (seenContent[c.id] !== undefined && seenContent[c.id] !== key) {
+      c.annotation_complete = false;
+      delete completionConfirmations[c.id];
+    }
+    seenContent[c.id] = key;
+  }
+
   function paintSaveState() {
     if (!refs.saveBtn || !refs.saveHint) return;
     if (!canSave()) {
@@ -226,8 +246,8 @@
       return;
     }
     var dirty = isDirty();
-    refs.saveBtn.disabled = !dirty;
-    refs.saveHint.textContent = dirty ? '有改动还没写回' : '与磁盘一致';
+    refs.saveBtn.disabled = !!saveInFlight || !dirty;
+    refs.saveHint.textContent = saveInFlight ? '正在保存；此后新改动仍需再次保存' : (dirty ? '有改动还没写回' : '与磁盘一致');
     refs.saveHint.title = dirty
       ? '保存会把整个 annotations.json 覆盖写一遍，所有片子一起'
       : '当前页面上的标注与 annotations.json 一致';
@@ -235,26 +255,58 @@
 
   /* 保存是整体覆盖写：接口没有增量语义，改一条也要把全部片子一起交上去。 */
   function saveNow() {
+    if (saveInFlight) return saveInFlight;
     if (!canSave()) {
       S.toast('离线原型没有后端，标注不会写盘。起训练台之后从这个地址打开才能保存。', 'warn');
       return;
     }
     var payload = payloadOf();
+    var sentJson = JSON.stringify(payload);
+    var data = global.OD.data, projectId = S.state.projectId, clipId = S.state.clipId;
+    function currentContext() { return global.OD.data === data && S.state.projectId === projectId; }
+    payload.completion_confirmations = Object.keys(completionConfirmations).filter(function (id) {
+      return payload.clips.some(function (c) { return c.id === id && c.annotation_complete; });
+    });
     refs.saveBtn.disabled = true;
     refs.saveHint.textContent = '正在写 annotations.json…';
-    global.OD.api.saveAnnotations(S.state.projectId, payload).then(function () {
-      savedJson = JSON.stringify(payloadOf());
+    saveInFlight = global.OD.api.saveAnnotations(projectId, payload, clipId).then(function (result) {
+      if (!currentContext()) return false;
+      savedJson = sentJson;
+      payload.completion_confirmations.forEach(function (id) {
+        var sent = payload.clips.find(function (c) { return c.id === id; });
+        var latest = data.clips.find(function (c) { return c.id === id; });
+        if (sent && latest && contentKey(sent) === contentKey(latest)) delete completionConfirmations[id];
+      });
       S.toast('标注已写回 annotations.json', 'ok');
-      /* 标注一变，特征缓存的新旧、门禁、左侧状态点全都跟着变，按磁盘重画一遍。 */
-      global.OD.live.reload().catch(function (err) {
-        S.render();
+      if (result && result.preparation_error) S.toast('标注已保存，特征准备未排队：' + result.preparation_error, 'warn');
+      /* 保存后重读门禁与准备状态；特征缓存依据视频与模型，动作边界变化不重抽。 */
+      if (JSON.stringify(payloadOf()) !== sentJson) {
+        S.toast('本次提交已保存；保存期间的新改动已保留，请再保存一次。', 'warn');
+        return true;
+      }
+      return global.OD.live.reload({shouldApply: function () {
+        return currentContext() && JSON.stringify(payloadOf()) === sentJson;
+      }}).catch(function (err) {
+        if (!currentContext()) return;
         S.toast('保存成功，但重新读取工程失败：' + err.message, 'bad');
       });
     }).catch(function (err) {
-      refs.saveHint.textContent = '没写成功';
-      paintSaveState();
+      if (!currentContext()) return false;
       S.toast('保存标注失败：' + err.message, 'bad');
+      return false;
+    }).finally(function () {
+      saveInFlight = null;
+      if (currentContext()) paintSaveState();
     });
+    return saveInFlight;
+  }
+
+  function beforeLeave() {
+    if (saveInFlight || (savedFor === global.OD.data && isDirty())) {
+      S.toast(saveInFlight ? '正在保存标注，请保存完成后再离开。' : '有未保存的动作标注，请先保存后再离开。', 'warn');
+      return false;
+    }
+    return true;
   }
 
   /* ---------- 视图 ---------- */
@@ -265,7 +317,13 @@
     fpsEff = c.fps;
     /* 只有整份数据被重新读过（写盘后 reload 会换一个新对象）才重新起算基线。
        切片子、重绘都不动它，否则改到一半切走再切回来，"有改动"就被抹掉了。 */
-    if (savedFor !== global.OD.data) { savedFor = global.OD.data; savedJson = JSON.stringify(payloadOf()); }
+    if (savedFor !== global.OD.data) {
+      savedFor = global.OD.data;
+      savedJson = JSON.stringify(payloadOf());
+      seenContent = {};
+      completionConfirmations = {};
+      global.OD.data.clips.forEach(function (item) { seenContent[item.id] = contentKey(item); });
+    }
     /* 从结果页点"看画面"过来时带一个起始帧，用完就清掉，免得每次重绘都跳回去。 */
     var startFrame = S.state.seekFrame || 0;
     S.state.seekFrame = 0;
@@ -435,6 +493,7 @@
   function repaint() {
     if (!refs.canvas) return;
     var c = clip(), zoom = S.state.zoom;
+    updateCompletion(c);
     var width = Math.max(1, Math.round(c.frame_count * zoom));
     refs.canvasWidth = width;
     refs.canvas.style.width = width + 'px';
@@ -812,7 +871,24 @@
     var c = clip();
     D.clear(refs.side);
 
+    var completionCheck = el('input', {
+      type: 'checkbox', checked: c.annotation_complete === true,
+      'aria-label': '已检查整条视频，未涂区间确认为空闲',
+      onchange: function () {
+        c.annotation_complete = completionCheck.checked;
+        if (completionCheck.checked) completionConfirmations[c.id] = true;
+        else delete completionConfirmations[c.id];
+        paintSaveState();
+      }
+    });
+    refs.side.appendChild(el('div', { class: 'inspect-block' }, [
+      el('h3', { text: '整条标注完成确认' }),
+      el('label', { class: 'row tight' }, [completionCheck, el('span', { text: '已检查整条视频，未涂区间确认为空闲' })]),
+      el('p', { class: 'sp-meta sp-mt-2', text: '勾选后点击“保存标注”才生效。训练和验证视频都需要确认；修改动作段或不训练区间会撤销确认。后台特征准备可提前进行。' })
+    ]));
+
     refs.side.appendChild(prelabelBlock());
+    refs.side.appendChild(global.OD.preparation.render());
 
     refs.side.appendChild(el('div', { class: 'inspect-block' }, [
       el('h3', { text: '类别' }),
@@ -911,5 +987,10 @@
   }
 
   global.OD.views = global.OD.views || {};
-  global.OD.views.annotate = { render: render, inspector: function () { return null; } };
+  global.addEventListener('beforeunload', function (event) {
+    if (saveInFlight || (savedFor === global.OD.data && isDirty())) {
+      event.preventDefault(); event.returnValue = '';
+    }
+  });
+  global.OD.views.annotate = { render: render, beforeLeave: beforeLeave, inspector: function () { return null; } };
 })(window);

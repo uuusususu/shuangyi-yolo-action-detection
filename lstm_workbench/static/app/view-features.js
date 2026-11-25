@@ -133,7 +133,17 @@
           S.toast('离线原型没有后端，打不开文件夹。', 'warn');
           return;
         }
-        api.revealFeature(S.state.projectId, row.clip_id).catch(function (err) {
+        api.revealFeature(S.state.projectId, row.clip_id).then(function (res) {
+          if (res && res.remote && res.download) {
+            var a = document.createElement('a');
+            a.href = res.download;
+            a.download = row.file || (row.clip_id + '.npy');
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            S.toast('当前为内网远端访问，已开始下载特征文件 ' + (row.file || ''), 'info');
+          }
+        }).catch(function (err) {
           S.toast('打不开文件夹：' + err.message, 'bad');
         });
       }

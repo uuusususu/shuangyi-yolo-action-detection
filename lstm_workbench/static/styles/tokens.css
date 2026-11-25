@@ -3,49 +3,59 @@
    主操作走 accent，类别色只在标注时间轴出现，两者都不参与状态语义。 */
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 
-  --bg: #0e1114;
-  --surface: #16191d;
-  --surface-2: #1d2126;
-  --surface-3: #252b31;
-  --line: #2b3138;
-  --line-2: #3a424b;
-  --stage: #080a0c;
+  /* 浅色、留白、细边框：参照 Ultralytics HUB 的控制台风格。 */
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #f6f7f9;
+  --surface-3: #eceef2;
+  --line: #e7e9ee;
+  --line-2: #d5d9e0;
+  --stage: #0f1115;           /* 视频画面底色：画面区仍然是黑底 */
+  --side: #fafafa;            /* 左侧导航底色 */
 
-  --ink: #e9ecef;
-  --ink-2: #c2c9d1;
-  --muted: #8b959f;
+  --ink: #111827;
+  --ink-2: #374151;
+  --muted: #6b7280;
 
-  --ok: #34c08b;
-  --warn: #e0a33a;
-  --bad: #e0574b;
-  --busy: #38bdf8;
-  --ok-bg: rgba(52, 192, 139, .14);
-  --warn-bg: rgba(224, 163, 58, .14);
-  --bad-bg: rgba(224, 87, 75, .14);
-  --busy-bg: rgba(56, 189, 248, .14);
+  --ok: #16a34a;
+  --warn: #d97706;
+  --bad: #dc2626;
+  --busy: #2563eb;
+  --ok-bg: #ecfdf3;
+  --warn-bg: #fffbeb;
+  --bad-bg: #fef2f2;
+  --busy-bg: #eff6ff;
 
-  --accent: #2563eb;
-  --accent-2: #1d4ed8;
+  --accent: #111827;          /* 主按钮：黑底白字 */
+  --accent-2: #000000;
   --accent-ink: #fff;
-  --accent-bg: rgba(37, 99, 235, .16);
+  --accent-bg: #f1f2f5;       /* 选中行、当前导航项 */
+  --link: #2563eb;
 
-  --cat-1: #5b9cf8;
-  --cat-2: #c084fc;
-  --cat-3: #f0a04b;
-  --cat-4: #4fd1c5;
-  --cat-5: #f472b6;
-  --cat-6: #a3e635;
-  --on-cat: #0b0d0f;          /* 落在类别色块上的文字 */
-  --heat-0: #151a1f;          /* 混淆矩阵色阶：冷端 */
-  --heat-1: #1f5c46;          /* 混淆矩阵色阶：中间 */
+  --cat-1: #3b82f6;
+  --cat-2: #a855f7;
+  --cat-3: #f59e0b;
+  --cat-4: #14b8a6;
+  --cat-5: #ec4899;
+  --cat-6: #84cc16;
+  --on-cat: #ffffff;          /* 落在类别色块上的文字 */
+  /* 模块识别色：零件模型（YOLO）橙、动作模型（LSTM）蓝。只做小面积标识，不当状态色用。 */
+  --mod-yolo: #ea7a10;
+  --mod-yolo-bg: #fff4e8;
+  --mod-action: #2563eb;
+  --mod-action-bg: #eff4ff;
+  --heat-0: #f6f7f9;          /* 混淆矩阵色阶：冷端 */
+  --heat-1: #a7e3c0;          /* 混淆矩阵色阶：中间 */
 
-  --shade: rgba(0, 0, 0, .22);
-  --shade-strong: rgba(0, 0, 0, .38);
-  --overlay: rgba(233, 236, 239, .1);
+  --shade: rgba(0, 0, 0, .14);
+  --shade-strong: rgba(0, 0, 0, .25);
+  --overlay: rgba(17, 24, 39, .06);
+  --shadow-1: 0 1px 2px rgba(16, 24, 40, .05);
+  --shadow-2: 0 8px 24px rgba(16, 24, 40, .12);
 
-  --font-ui: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  --font-ui: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
   --font-mono: "Cascadia Mono", Consolas, "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
   --fs-11: 11px;
@@ -66,9 +76,9 @@
   --s-8: 32px;
   --s-10: 40px;
 
-  --r-1: 4px;
-  --r-2: 6px;
-  --r-3: 8px;
+  --r-1: 6px;
+  --r-2: 8px;
+  --r-3: 12px;
   --r-pill: 999px;
 
   --t-fast: 120ms;
@@ -76,13 +86,13 @@
   --t-slow: 220ms;
   --ease: cubic-bezier(.2, .7, .3, 1);
 
-  --h-top: 52px;
-  --w-rail: 224px;
-  --w-inspect: 320px;
+  --h-top: 56px;
+  --w-rail: 248px;
+  --w-inspect: 300px;
 }
 
-/* Bootstrap 5.3 暗色基座的变量改写：库只当结构底座，取值全部由上面接管。 */
-[data-bs-theme="dark"] {
+/* Bootstrap 5.3 基座的变量改写：库只当结构底座，取值全部由上面接管。 */
+[data-bs-theme="light"] {
   --bs-body-bg: var(--bg);
   --bs-body-color: var(--ink);
   --bs-body-font-family: var(--font-ui);
@@ -93,10 +103,10 @@
   --bs-border-color: var(--line);
   --bs-border-color-translucent: var(--line);
   --bs-primary: var(--accent);
-  --bs-primary-rgb: 37, 99, 235;
-  --bs-link-color: var(--busy);
-  --bs-link-hover-color: var(--accent);
-  --bs-focus-ring-color: rgba(37, 99, 235, .45);
+  --bs-primary-rgb: 17, 24, 39;
+  --bs-link-color: var(--link);
+  --bs-link-hover-color: var(--ink);
+  --bs-focus-ring-color: rgba(37, 99, 235, .35);
   --bs-focus-ring-width: 2px;
   --bs-border-radius: var(--r-2);
   --bs-border-radius-sm: var(--r-1);

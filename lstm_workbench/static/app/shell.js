@@ -7,12 +7,27 @@
   var D = global.OD.dom;
   var el = D.el, clear = D.clear, icon = D.icon, qs = D.qs;
 
-  var STEPS = [
-    { key: 'model', name: '模型与工位', idx: '1' },
-    { key: 'data', name: '数据与标注', idx: '2' },
-    { key: 'train', name: '训练', idx: '3' },
-    { key: 'runs', name: '结果', idx: '4' }
+  /* 两组步骤：零件模型（YOLO）在前，动作模型（LSTM）在后。模型库是两组之间的交接点：
+     零件训完导出进库，动作训练从库里选零件模型。 */
+  var GROUPS = [
+    { key: 'yolo', name: '零件模型', steps: [
+      { key: 'pdata', name: '零件数据', icon: 'db' },
+      { key: 'palabel', name: '零件标注', icon: 'box' },
+      { key: 'ptrain', name: '零件训练', icon: 'cpu' },
+      { key: 'pvalidate', name: '零件验证', icon: 'chart' },
+      { key: 'library', name: '模型库', icon: 'box' }
+    ] },
+    { key: 'action', name: '动作模型', steps: [
+      { key: 'model', name: '模型与工位', icon: 'rocket' },
+      { key: 'data', name: '数据与标注', icon: 'film' },
+      { key: 'train', name: '动作训练', icon: 'cpu' },
+      { key: 'runs', name: '结果', icon: 'chart' }
+    ] }
   ];
+  var STEPS = GROUPS.reduce(function (all, g) { return all.concat(g.steps); }, []);
+  var YOLO_STEPS = { pdata: true, palabel: true, ptrain: true, pvalidate: true, library: true };
+  /* 说明栏收起与否按用户上次的选择记住。 */
+  var INSPECT_KEY = 'od.inspector.collapsed';
 
   /* source 决定这个页面是"离线示例"还是"连着真实训练台"。
      live 时 projectId 就是接口路径里的工程名；bootError 留着服务没起时的原因。 */
@@ -23,6 +38,7 @@
   var subs = [];
   var host, railHost, jobHost, crumbsHost, inspectHost, shellEl, srcTag;
   var tickTimer = null, pollTimer = null, jobStart = 0;
+  var renderedView = null, renderedHash = '';
 
   function on(fn) { subs.push(fn); }
   function emit() { subs.forEach(function (fn) { fn(state); }); }
@@ -135,6 +151,7 @@
   }
 
   function stepState(key) {
+    if (YOLO_STEPS[key]) return global.OD.yolo ? global.OD.yolo.stepState(key) : 'none';
     var data = global.OD.data;
     var job = state.job;
     if (job) {
@@ -167,6 +184,7 @@
   }
 
   function stepSub(key) {
+    if (YOLO_STEPS[key]) return global.OD.yolo ? global.OD.yolo.stepSub(key) : '';
     var data = global.OD.data;
     if (key === 'model') return data.probe.yolo.ok ? data.probe.yolo.classes.length + ' 个零件类别' : '还没检查';
     if (key === 'data') {
@@ -296,31 +314,83 @@
     });
   }
 
+  function fmtClock(seconds) {
+    seconds = Math.max(0, Math.round(seconds));
+    var m = Math.floor(seconds / 60), s = seconds % 60;
+    if (m >= 60) return Math.floor(m / 60) + ' 时 ' + (m % 60) + ' 分';
+    return m ? m + ' 分 ' + s + ' 秒' : s + ' 秒';
+  }
+
+  /* 训练页在内容区内显示任务面板，其他页面使用底部任务栏。
+     动作训练、抽特征走 state.job；零件训练由零件模块报上来，复用同一套进度与停止入口。 */
   function renderJob() {
     if (!jobHost) return;
     clear(jobHost);
+    var inline = state.view === 'train' ? document.getElementById('train-jobbar') : null;
+    if (inline) clear(inline);
     var job = state.job;
-    jobHost.className = 'jobbar ' + (job ? 'is-busy' : 'is-idle');
-    jobHost.appendChild(el('span', { class: 'dot ' + (job ? 'busy' : 'ok') }));
-    if (!job) {
-      jobHost.appendChild(el('span', { class: 'label', text: '空闲' }));
+    var yolo = !job && global.OD.yolo && global.OD.yolo.activeJob ? global.OD.yolo.activeJob() : null;
+    if (!job && !yolo && global.OD.parts) yolo = global.OD.parts.activeJob();
+    if (!job && !yolo && global.OD.pvalidate) yolo = global.OD.pvalidate.activeJob();
+    if (!job && !yolo && global.OD.transfer && global.OD.transfer.activeJob) yolo = global.OD.transfer.activeJob();
+    var target = inline || jobHost;
+    jobHost.className = 'dock ' + (!inline && (job || yolo) ? 'is-busy' : 'is-idle');
+    if (inline) {
+      inline.className = 'train-job-panel ' + (job || yolo ? 'is-busy' : 'is-idle');
+      inline.parentNode.classList.toggle('is-running', !!(job || yolo));
+    }
+    if (!job && !yolo) {
+      if (inline) inline.appendChild(el('p', { class: 'help',
+        text: '当前没有正在运行的任务。开始训练后，这里会显示抽特征和训练的实时进度；训练结果和日志在下方查看。' }));
       return;
     }
-    var pct = job.total > 0 ? Math.max(0, Math.min(100, Math.round((job.done / job.total) * 100))) : 0;
-    jobHost.appendChild(el('span', { class: 'label', text: job.stale ? '训练台已断开' : job.label }));
-    jobHost.appendChild(el('div', { class: 'progress bar', role: 'progressbar', 'aria-valuenow': pct, 'aria-valuemin': 0, 'aria-valuemax': 100 },
-      el('div', { class: 'progress-bar busy', style: 'width:' + pct + '%' })));
-    jobHost.appendChild(el('span', { class: 'label mono', text: job.done + '/' + job.total + ' ' + job.unit }));
-    jobHost.appendChild(el('span', { class: 'label mono', text: ((Date.now() - jobStart) / 1000).toFixed(0) + 's' }));
-    jobHost.appendChild(el('button', { class: 'btn btn-danger btn-sm', type: 'button', onclick: requestStop },
-      [icon('stop', 13), '停止']));
+
+    var label, done, total, unit, elapsed, onStop, onOpen;
+    if (job) {
+      label = job.stale ? '训练台已断开' : job.label;
+      done = job.done; total = job.total; unit = job.unit;
+      elapsed = (Date.now() - jobStart) / 1000;
+      onStop = requestStop;
+      onOpen = job.kind === 'train' ? function () { go('train'); } : (job.kind === 'check' ? function () { go('runs'); } : null);
+    } else {
+      label = (yolo.label || '零件训练') + ' · ' + yolo.name;
+      done = yolo.done; total = yolo.total; unit = yolo.unit || '轮';
+      elapsed = yolo.elapsed;
+      onStop = yolo.stop;
+      onOpen = yolo.open || function () { go('ptrain'); };
+    }
+    var pct = total > 0 ? Math.max(0, Math.min(100, (done / total) * 100)) : 0;
+    /* 剩余时间按已用时间线性外推；进度太少时估不准，干脆不写。 */
+    var eta = elapsed && done > 0 && total > done && pct >= 3 ? elapsed * (total - done) / done : null;
+
+    target.appendChild(el('div', { class: 'dock-row' }, [
+      el('span', { class: 'dock-spin', 'aria-hidden': 'true' }),
+      el('div', { class: 'dock-main' }, [
+        el('div', { class: 'dock-head' }, [
+          el('strong', { text: label }),
+          el('span', { class: 'dock-num', text: done + ' / ' + (total || '—') + ' ' + unit }),
+          el('span', { class: 'dock-pct', text: Math.floor(pct) + '%' })
+        ]),
+        el('div', { class: 'dock-track', role: 'progressbar', 'aria-valuenow': Math.round(pct), 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-label': label },
+          el('div', { class: 'dock-fill', style: 'width:' + pct.toFixed(1) + '%' }))
+      ]),
+      el('div', { class: 'dock-meta' }, [
+        el('span', null, ['已用 ', el('b', { text: elapsed ? fmtClock(elapsed) : '—' })]),
+        el('span', null, ['剩余 ', el('b', { text: eta === null ? '估算中' : '约 ' + fmtClock(eta) })])
+      ]),
+      el('div', { class: 'dock-acts' }, [
+        onOpen ? el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: onOpen }, '查看详情') : null,
+        el('button', { class: 'btn btn-danger btn-sm', type: 'button', onclick: onStop }, [icon('stop', 13), '停止'])
+      ])
+    ]));
   }
 
   /* ---------- 顶部与导航 ---------- */
 
   var VIEW_TITLE = {
     home: '全部工程', model: '模型与工位', data: '数据与标注', features: '特征',
-    train: '训练', runs: '结果', annotate: '标注工作台'
+    train: '动作训练', runs: '结果', annotate: '标注工作台',
+    pdata: '零件数据', palabel: '零件标注', ptrain: '零件训练', pvalidate: '零件验证', library: '模型库'
   };
 
   /* 数据源徽标：这个页面到底是"连着训练台"还是"离线示例"，必须一眼看得出来，
@@ -343,6 +413,10 @@
     clear(crumbsHost);
     renderSource();
     var clip = clipById(state.clipId);
+    if (state.view === 'home') {
+      crumbsHost.appendChild(el('span', { class: 'here', text: '全部工程' }));
+      return;
+    }
     crumbsHost.appendChild(el('a', { href: '#/home', text: '全部工程' }));
     crumbsHost.appendChild(el('span', { class: 'sep', text: '/' }));
     crumbsHost.appendChild(el('span', { class: 'mid' }, [
@@ -360,46 +434,66 @@
     }
   }
 
+  var partsPrefetchedProject = null;
   function renderRail() {
     if (!railHost) return;
     clear(railHost);
-    railHost.appendChild(el('div', { class: 'rail-title', text: '工程' }));
-    STEPS.forEach(function (step) {
-      var st = stepState(step.key);
-      var current = state.view === step.key || (step.key === 'data' && state.view === 'annotate');
-      railHost.appendChild(el('button', {
-        class: 'step', type: 'button', 'data-state': st || 'none',
-        'aria-current': current ? 'true' : 'false',
-        onclick: function () { go(step.key); }
-      }, [
-        el('span', { class: 'idx', text: st === 'ok' ? '✓' : (st === 'bad' ? '!' : step.idx) }),
-        el('span', { class: 'name', text: step.name }),
-        el('span', { class: 'sr', text: '状态：' + stateLabel(st) }),
-        el('span', { class: 'sub', text: stepSub(step.key) })
-      ]));
+    if (global.OD.yolo) global.OD.yolo.prefetch();
+    if (global.OD.parts && state.projectId && partsPrefetchedProject !== state.projectId) {
+      partsPrefetchedProject = state.projectId;
+      global.OD.parts.prefetch().then(function () {
+      renderJob();
+      if (state.view === 'pdata' || state.view === 'palabel') render();
+      });
+    }
+    /* 当前工程：点一下回到全部工程，在那里切换或新建。 */
+    railHost.appendChild(el('button', {
+      class: 'project-pick', type: 'button', title: '切换工程',
+      'aria-current': state.view === 'home' ? 'true' : 'false',
+      onclick: function () { go('home'); }
+    }, [
+      el('span', { class: 'project-avatar', text: (global.OD.data.project.id || '?').slice(0, 1).toUpperCase() }),
+      el('span', { class: 'project-text' }, [
+        el('span', { class: 'project-label', text: '当前工程' }),
+        el('span', { class: 'project-name', text: global.OD.data.project.id })
+      ]),
+      icon('chev-right', 14)
+    ]));
+
+    GROUPS.forEach(function (group) {
+      railHost.appendChild(el('div', { class: 'rail-title rail-group', 'data-mod': group.key, text: group.name }));
+      group.steps.forEach(function (step) {
+        var st = stepState(step.key);
+        var current = state.view === step.key || (step.key === 'data' && state.view === 'annotate');
+        var sub = stepSub(step.key);
+        railHost.appendChild(el('button', {
+          class: 'step', type: 'button', 'data-state': st || 'none',
+          'aria-current': current ? 'true' : 'false', title: step.name + (sub ? '：' + sub : ''),
+          onclick: function () { go(step.key); }
+        }, [
+          el('span', { class: 'idx' }, icon(step.icon, 16)),
+          el('span', { class: 'name', text: step.name }),
+          el('span', { class: 'sr', text: '状态：' + stateLabel(st) }),
+          st === 'bad' || st === 'warn' || st === 'busy' ? el('span', { class: 'state-dot ' + st, 'aria-hidden': 'true' }) : null
+        ]));
+      });
     });
 
-    railHost.appendChild(el('div', { class: 'rail-sep' }));
-    railHost.appendChild(el('div', { class: 'rail-title', text: '片子' }));
-    global.OD.data.clips.forEach(function (clip) {
-      var st = clip.segments.length ? 'ok' : 'none';
-      railHost.appendChild(el('button', {
-        class: 'step flat', type: 'button', 'data-state': st,
+    /* 视频列表：直接点进标注。和 HUB 侧栏里的数据集清单一样，只放名字和数量。 */
+    var clips = global.OD.data.clips;
+    railHost.appendChild(el('div', { class: 'rail-title', text: '视频 · ' + clips.length }));
+    var list = el('div', { class: 'clip-nav' });
+    clips.forEach(function (clip) {
+      list.appendChild(el('button', {
+        class: 'clip-link', type: 'button',
         'aria-current': state.view === 'annotate' && state.clipId === clip.id ? 'true' : 'false',
         onclick: function () { go('annotate', { clipId: clip.id }); }
       }, [
-        el('span', { class: 'idx' }, icon('film', 13)),
-        el('span', { class: 'name', text: clip.file }),
-        el('span', { class: 'sub', text: clip.segments.length + ' 段 · ' + clip.frame_count + ' 帧' })
+        el('span', { class: 'clip-name', text: clip.file }),
+        el('sup', { class: clip.segments.length ? '' : 'is-empty', text: String(clip.segments.length) })
       ]));
     });
-
-    var s = global.OD.data.settings;
-    railHost.appendChild(el('div', { class: 'rail-foot' }, el('dl', null, [
-      el('dt', { text: '时间基' }), el('dd', { text: timeBase().text }),
-      el('dt', { text: '零件类别' }), el('dd', { text: (s.yolo_classes || []).length + ' 个' }),
-      el('dt', { text: '特征长度' }), el('dd', { text: global.OD.data.features.length })
-    ])));
+    railHost.appendChild(list);
   }
 
   function stateLabel(st) {
@@ -409,6 +503,7 @@
   /* ---------- 路由 ---------- */
 
   function go(view, params) {
+    if (view !== renderedView && !canLeaveView()) return;
     if (params && params.clipId) state.clipId = params.clipId;
     state.seekFrame = params && params.frame !== undefined ? params.frame : 0;
     state.view = view;
@@ -430,22 +525,57 @@
 
   function render() {
     var route = parseHash();
+    if (renderedView && route.view !== renderedView && !canLeaveView()) {
+      state.view = renderedView;
+      if (global.location.hash !== renderedHash) global.location.replace(renderedHash);
+      return;
+    }
     state.view = route.view;
     if (route.clipId) state.clipId = route.clipId;
 
     renderTop();
     renderRail();
-    renderJob();
 
     var view = global.OD.views[state.view] || global.OD.views.home;
     clear(host);
     var node = view.render();
     if (node) host.appendChild(node);
+    renderedView = state.view;
+    renderedHash = global.location.hash;
+    renderJob();
 
     clear(inspectHost);
     var side = view.inspector ? view.inspector() : null;
-    shellEl.classList.toggle('has-inspect', !!side);
+    var collapsed = inspectorCollapsed();
+    shellEl.classList.toggle('has-inspect', !!side && !collapsed);
     if (side) inspectHost.appendChild(side);
+    renderInspectToggle(!!side, collapsed);
+  }
+
+  function canLeaveView() {
+    var previous = renderedView && global.OD.views[renderedView];
+    return !previous || !previous.beforeLeave || previous.beforeLeave() !== false;
+  }
+
+  /* ---------- 说明栏收起 ---------- */
+
+  function inspectorCollapsed() {
+    try { return global.localStorage.getItem(INSPECT_KEY) === '1'; } catch (e) { return false; }
+  }
+
+  function setInspectorCollapsed(value) {
+    try { global.localStorage.setItem(INSPECT_KEY, value ? '1' : '0'); } catch (e) { /* 隐私模式下存不了，就只在本次生效 */ }
+    render();
+  }
+
+  /* 顶栏右侧的开关：工作区要宽的时候（标注、曲线）把说明栏收起来。没有说明栏的页面不显示。 */
+  function renderInspectToggle(hasSide, collapsed) {
+    var btn = qs('#inspect-toggle');
+    if (!btn) return;
+    btn.hidden = !hasSide;
+    btn.setAttribute('aria-pressed', collapsed ? 'false' : 'true');
+    btn.title = collapsed ? '显示说明栏' : '收起说明栏';
+    btn.textContent = collapsed ? '说明 ›' : '‹ 收起说明';
   }
 
   /* ---------- 通知与确认 ---------- */
@@ -498,6 +628,276 @@
     dlg.showModal();
   }
 
+  /* 高清图表灯箱：支持上一张/下一张、缩放与原图下载。 */
+  function lightboxDialog(items, startIndex) {
+    if (!items || !items.length) return;
+    var index = Math.max(0, Math.min(items.length - 1, startIndex || 0));
+    var scale = 1;
+    var titleEl = el('strong', { class: 'lb-title' });
+    var countEl = el('span', { class: 'mono sp-fs-12 sp-dim' });
+    var zoomEl = el('span', { class: 'mono sp-fs-12', text: '100%' });
+    var img = el('img', { class: 'lb-img', alt: '' });
+    var dl = el('a', { class: 'btn btn-ghost btn-sm', download: '', text: '下载原图' });
+    var prevBtn = el('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: function () { step(-1); } }, '‹ 上一张');
+    var nextBtn = el('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: function () { step(1); } }, '下一张 ›');
+    var viewport = el('div', { class: 'lb-viewport', onwheel: function (e) {
+      e.preventDefault();
+      setScale(e.deltaY < 0 ? scale * 1.2 : scale / 1.2);
+    } }, img);
+
+    function setScale(next) {
+      scale = Math.max(0.25, Math.min(5, next));
+      img.style.transform = 'scale(' + scale.toFixed(3) + ')';
+      zoomEl.textContent = Math.round(scale * 100) + '%';
+    }
+    function sync() {
+      var cur = items[index];
+      scale = 1;
+      img.style.transform = 'scale(1)';
+      zoomEl.textContent = '100%';
+      titleEl.textContent = cur.label || cur.name || '图表预览';
+      countEl.textContent = (index + 1) + ' / ' + items.length;
+      img.src = cur.url;
+      dl.href = cur.url;
+      dl.setAttribute('download', cur.name || 'chart.png');
+      prevBtn.disabled = items.length <= 1;
+      nextBtn.disabled = items.length <= 1;
+    }
+    function step(delta) {
+      index = (index + delta + items.length) % items.length;
+      sync();
+    }
+    var dlg = el('dialog', { class: 'dlg lb-dlg', onclick: function (e) { if (e.target === dlg) dlg.close(); } }, el('div', { class: 'lb-shell' }, [
+      el('header', { class: 'lb-head' }, [
+        titleEl,
+        countEl,
+        el('div', { class: 'lb-tools' }, [
+          items.length > 1 ? prevBtn : null,
+          items.length > 1 ? nextBtn : null,
+          el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: function () { setScale(scale / 1.25); } }, '−'),
+          zoomEl,
+          el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: function () { setScale(scale * 1.25); } }, '＋'),
+          el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: function () { setScale(1); } }, '1:1'),
+          dl,
+          el('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: function () { dlg.close(); } }, '关闭')
+        ])
+      ]),
+      viewport
+    ]));
+    dlg.addEventListener('keydown', function (e) {
+      if (e.key === 'ArrowLeft') { e.preventDefault(); step(-1); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); step(1); }
+    });
+    dlg.addEventListener('close', function () { if (dlg.parentNode) dlg.parentNode.removeChild(dlg); });
+    document.body.appendChild(dlg);
+    sync();
+    dlg.showModal();
+  }
+
+  var serverInfoCache = null;
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { toast('已复制网址：' + text, 'ok'); })
+        .catch(function () { fallbackCopy(text); });
+    } else fallbackCopy(text);
+  }
+  function fallbackCopy(text) {
+    var ta = el('textarea', { value: text, style: 'position:fixed;left:-9999px' });
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); toast('已复制网址：' + text, 'ok'); } catch (e) { toast('请手动选中复制：' + text, 'info'); }
+    document.body.removeChild(ta);
+  }
+
+  var unlockDialogOpen = false;
+  function promptUnlock() {
+    if (unlockDialogOpen || !global.OD.api || !global.OD.api.authUnlock) return;
+    unlockDialogOpen = true;
+    var errNode = el('p', { class: 'help bad sp-mt-2', text: '' });
+    var pinInput = el('input', {
+      type: 'password', class: 'form-control mono', placeholder: '请输入本机设置的内网访问口令（PIN）',
+      autocomplete: 'current-password'
+    });
+    var submitBtn = el('button', { class: 'btn btn-primary', type: 'submit', text: '解锁进入' });
+    var form = el('form', {
+      class: 'dialog', style: 'max-width:440px',
+      onsubmit: function (e) {
+        e.preventDefault();
+        var pin = pinInput.value.trim();
+        if (!pin) { errNode.textContent = '请输入访问口令'; return; }
+        submitBtn.disabled = true;
+        errNode.textContent = '';
+        global.OD.api.authUnlock(pin).then(function () {
+          dlg.close();
+          toast('内网口令校验通过', 'ok');
+          loadServerInfo().then(function () {
+            if (global.OD.live && global.OD.live.boot) {
+              global.OD.live.boot().then(function () { render(); });
+            } else {
+              render();
+            }
+          });
+        }).catch(function (err) {
+          errNode.textContent = err.message || '口令不正确';
+          submitBtn.disabled = false;
+          pinInput.focus();
+        });
+      }
+    }, [
+      el('h2', { text: '内网访问口令验证' }),
+      el('p', { text: '训练台主机已启用内网访问保护，请输入主机设置的 PIN 口令继续访问（本机 127.0.0.1 免密）。' }),
+      el('div', { class: 'sp-mt-3' }, pinInput),
+      errNode,
+      el('div', { class: 'acts sp-mt-3' }, [
+        el('button', { class: 'btn btn-ghost', type: 'button', onclick: function () { dlg.close(); } }, '暂不解锁'),
+        submitBtn
+      ])
+    ]);
+    var dlg = el('dialog', { class: 'dlg' }, form);
+    dlg.addEventListener('close', function () {
+      unlockDialogOpen = false;
+      if (dlg.parentNode) dlg.parentNode.removeChild(dlg);
+    });
+    document.body.appendChild(dlg);
+    dlg.showModal();
+    pinInput.focus();
+  }
+
+  function randomPin() {
+    var out = '';
+    for (var i = 0; i < 6; i++) out += String(Math.floor(Math.random() * 10));
+    return out;
+  }
+
+  function showLanDialog() {
+    var info = serverInfoCache || {};
+    var urls = info.lan_urls || [];
+    var isLocal = info.is_local_client !== false;
+    var pinInput = el('input', {
+      type: 'text', class: 'form-control mono',
+      placeholder: info.pin_enabled ? '输入新口令可更换（4~32 位）' : '留空为免密；输入 4~32 位开启口令保护'
+    });
+    var roCheck = el('input', {
+      type: 'checkbox', checked: !!info.readonly,
+      onchange: function () {
+        global.OD.api.authConfig({ readonly: roCheck.checked }).then(function () {
+          toast(roCheck.checked ? '已开启内网只读模式：远端电脑仅可浏览与下载' : '已关闭内网只读模式：远端电脑可上传与操作', 'ok');
+          loadServerInfo();
+        }).catch(function (err) {
+          roCheck.checked = !roCheck.checked;
+          toast('保存失败：' + err.message, 'bad');
+        });
+      }
+    });
+
+    var securityBox = isLocal ? el('div', { class: 'lan-security-box sp-mt-3' }, [
+      el('div', { class: 'lan-sec-head' }, [
+        el('strong', { text: '内网安全保护（仅本机可配置）' }),
+        el('span', { class: 'badge ' + (info.pin_enabled ? 'ok' : 'plain'), text: info.pin_enabled ? '已开启 PIN 口令' : '未设口令' })
+      ]),
+      el('div', { class: 'lan-pin-row sp-mt-2' }, [
+        pinInput,
+        el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: function () { pinInput.value = randomPin(); } }, '随机 6 位'),
+        el('button', {
+          class: 'btn btn-primary btn-sm', type: 'button',
+          onclick: function () {
+            var val = pinInput.value.trim();
+            if (!val) { toast('先输入或随机生成 4~32 位口令', 'warn'); return; }
+            global.OD.api.authConfig({ pin: val }).then(function () {
+              toast('已启用内网访问口令（PIN）', 'ok');
+              dlg.close();
+              loadServerInfo().then(showLanDialog);
+            }).catch(function (err) { toast('设置失败：' + err.message, 'bad'); });
+          }
+        }, '启用/更换口令'),
+        info.pin_enabled ? el('button', {
+          class: 'btn btn-danger btn-sm', type: 'button',
+          onclick: function () {
+            global.OD.api.authConfig({ clear_pin: true }).then(function () {
+              toast('已清除内网访问口令', 'warn');
+              dlg.close();
+              loadServerInfo().then(showLanDialog);
+            }).catch(function (err) { toast('清除失败：' + err.message, 'bad'); });
+          }
+        }, '关闭口令') : null
+      ]),
+      el('label', { class: 'parts-inline sp-mt-2' }, [
+        roCheck,
+        '开启内网只读模式（远端电脑仅查看页面/图表与下载 ZIP，禁止修改数据、删除或启停训练）'
+      ])
+    ]) : el('div', { class: 'lan-security-box sp-mt-3' }, [
+      el('div', { class: 'lan-sec-head' }, [
+        el('strong', { text: '当前内网连接状态' }),
+        el('span', { class: 'badge ' + (info.readonly ? 'warn' : 'ok'), text: info.readonly ? '只读模式' : '完整读写' })
+      ]),
+      el('p', { class: 'help sp-mt-2', text: '安全策略仅支持在运行训练台的本机（127.0.0.1）修改。' }),
+      info.pin_enabled ? el('div', { class: 'row sp-mt-2' }, [
+        el('button', {
+          class: 'btn btn-ghost btn-sm', type: 'button',
+          onclick: function () {
+            global.OD.api.authLock().then(function () {
+              dlg.close();
+              toast('已退出当前内网授权会话', 'info');
+              loadServerInfo().then(promptUnlock);
+            });
+          }
+        }, '锁定并退出授权')
+      ]) : null
+    ]);
+
+    var dlg = el('dialog', { class: 'dlg', onclick: function (e) { if (e.target === dlg) dlg.close(); } }, el('div', { class: 'dialog', style: 'max-width:580px' }, [
+      el('h2', { text: '内网访问与跨机数据推送' }),
+      el('p', { text: info.lan_enabled
+        ? '训练台已开启内网监听。将采集电脑通过网线直连或接入同一局域网后，在浏览器打开下方任一网址，即可直接拖拽上传图片、视频或数据集 ZIP 压缩包：'
+        : '当前运行在仅本机回环模式（127.0.0.1）。使用默认启动脚本（不带 --local）即可开启内网访问。' }),
+      urls.length ? el('div', { class: 'lan-url-list sp-mt-3' }, urls.map(function (u) {
+        return el('div', { class: 'lan-url-row' }, [
+          el('code', { class: 'mono', text: u }),
+          el('button', { class: 'btn btn-primary btn-sm', type: 'button', onclick: function () { copyText(u); } }, '复制网址')
+        ]);
+      })) : (info.lan_enabled ? el('div', { class: 'callout warn sp-mt-3' }, [
+        icon('info', 15),
+        el('div', { text: '暂未检测到活动局域网网卡 IP。插上网线或连接路由器后点击“刷新检测”即可看到内网 IP。' })
+      ]) : null),
+      securityBox,
+      el('div', { class: 'callout info sp-mt-3' }, [
+        icon('info', 15),
+        el('div', { text: '若另一台电脑打不开网址，请在运行训练台的电脑上双击运行「放行内网端口.bat」（放行 Windows 防火墙 TCP ' + (info.port || 8771) + ' 入站端口）。' })
+      ]),
+      el('div', { class: 'acts sp-mt-3' }, [
+        el('button', { class: 'btn btn-ghost', type: 'button', onclick: function () { dlg.close(); loadServerInfo(true).then(showLanDialog); } }, '刷新检测'),
+        el('button', { class: 'btn btn-primary', type: 'button', onclick: function () { dlg.close(); } }, '知道了')
+      ])
+    ]));
+    dlg.addEventListener('close', function () { if (dlg.parentNode) dlg.parentNode.removeChild(dlg); });
+    document.body.appendChild(dlg);
+    dlg.showModal();
+  }
+
+  function loadServerInfo() {
+    var btn = qs('#lan-btn');
+    if (!btn || !global.OD.api || !global.OD.api.available || !global.OD.api.serverInfo) return Promise.resolve(null);
+    return global.OD.api.serverInfo().then(function (info) {
+      serverInfoCache = info;
+      btn.hidden = false;
+      var urls = (info && info.lan_urls) || [];
+      var tags = [];
+      if (info && info.pin_enabled) tags.push('PIN');
+      if (info && info.readonly) tags.push('只读');
+      var suffix = tags.length ? (' · ' + tags.join('/')) : '';
+      if (info && info.lan_enabled && urls.length) {
+        var shortHost = urls[0].replace(/^https?:\/\//, '').replace(/\/$/, '');
+        btn.textContent = '内网 · ' + shortHost + suffix;
+        btn.title = '点击查看并复制内网访问网址与安全设置';
+      } else if (info && info.lan_enabled) {
+        btn.textContent = '内网已开' + suffix;
+      } else {
+        btn.textContent = '仅本机';
+      }
+      if (info && info.auth_required) promptUnlock();
+      return info;
+    }).catch(function () { return null; });
+  }
+
   /* 示例数据标记：非真实数值的地方必须挂上它。 */
   function sampleTag(text) {
     return el('span', { class: 'sample', title: '示例数据，不是真实训练结果' }, [icon('flask', 11), text || '示例']);
@@ -513,13 +913,38 @@
     crumbsHost = qs('#crumbs');
     inspectHost = qs('#inspector');
     srcTag = qs('#src-tag');
+    var toggle = qs('#inspect-toggle');
+    if (toggle) toggle.addEventListener('click', function () { setInspectorCollapsed(!inspectorCollapsed()); });
+    var lanBtn = qs('#lan-btn');
+    if (lanBtn) lanBtn.addEventListener('click', showLanDialog);
+    loadServerInfo();
     global.addEventListener('hashchange', render);
+    /* 已用时间每秒走一格；没有任务时什么也不画。 */
+    setInterval(function () { if (state.job) renderJob(); }, 1000);
     render();
   }
 
+  /* 切到另一个工程时调用。上一个工程的进度轮询还在问旧工程，选中的片子 id、
+     选中的段在新工程里不存在，留着会让标注页指错片子、把旧工程的进度显示到新工程上。 */
+  function resetForProject() {
+    stopJobSilently();
+    renderJob();
+    var clips = (global.OD.data && global.OD.data.clips) || [];
+    state.clipId = clips.length ? clips[0].id : '';
+    state.segSel = null;
+    state.seekFrame = 0;
+    state.paintClass = null;
+    if (global.OD.yolo) global.OD.yolo.reset();
+    if (global.OD.parts) global.OD.parts.reset();
+    if (global.OD.pvalidate) global.OD.pvalidate.reset();
+    if (global.OD.transfer && global.OD.transfer.reset) global.OD.transfer.reset();
+  }
+
   global.OD.shell = {
+    resetForProject: resetForProject, renderRail: renderRail, renderJob: renderJob,
     mount: mount, go: go, on: on, emit: emit, render: render,
-    toast: toast, confirm: confirmDialog, sampleTag: sampleTag,
+    toast: toast, confirm: confirmDialog, lightbox: lightboxDialog, showLan: showLanDialog, promptUnlock: promptUnlock,
+    serverInfo: function () { return serverInfoCache; }, sampleTag: sampleTag,
     startJob: startJob, endJob: endJob, state: state,
     clipById: clipById, clipIssues: clipIssues, gateOf: gateOf,
     windowSeconds: windowSeconds, windowFrames: windowFrames, timeBase: timeBase,
