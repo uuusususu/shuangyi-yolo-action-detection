@@ -20,7 +20,7 @@ ENV/
 *.swp
 *.swo
 
-# Logs
+# Logs & runtime outputs
 logs/
 *.log
 yolo_action_detection/logs/coordinate_sessions/
@@ -41,19 +41,34 @@ yolo_action_detection/outputs/
 # Data and datasets
 data/
 datasets/
+新建文件夹/
 
 # Agent and tool directories
 .agent/
+.agents/
+.claude/
 .zcode/
 .dotnet/
 .superpowers/
 graphify-out/
+.pytest_cache/
+.coverage
 
-# Google/MediaPipe legacy (not on this branch)
+# Development process drafts (excluded from public repo)
+openspec/
+docs/superpowers/
+
+# Legacy & vendor SDK directories
 opencv/
 python_demo/
+models/
+mediapipe-master/
+mediapipe-samples-main/
+mediapipe_object_detection_test/
+mediapipe_quick_task/
+mediapipe_runtime_test/
 
-# Legacy files (not on this branch)
+# Legacy root files
 progress.md
 task_plan.md
 findings.md
@@ -65,16 +80,6 @@ ultralytics_importtime.txt
 pencil-new.pen
 .graphify_detect.json
 
-# Models (kept in yolo_action_detection/config/)
-models/
-
-# Third-party source
-mediapipe-master/
-mediapipe-samples-main/
-mediapipe_object_detection_test/
-mediapipe_quick_task/
-mediapipe_runtime_test/
-
 # Preview/temp files
 *.html
 *.css
@@ -82,12 +87,14 @@ mediapipe_runtime_test/
 _bl.txt
 !docs/**/*.html
 
-# PyInstaller output
+# PyInstaller output & backups
 *.spec.bak
+*.bak
 
 # OS
 Thumbs.db
 Desktop.ini
 
-# YOLO runtime config (not example)
+# Local machine runtime config & private models (keep config.example.json and demo weights)
 yolo_action_detection/config/config.json
+yolo_action_detection/config/daoredian.onnx
